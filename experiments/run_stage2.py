@@ -1,9 +1,14 @@
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from get import ETComplete, ETLocal, FullGET, PairwiseGET
 from stage1_common import mean_std, parse_seeds, set_seed

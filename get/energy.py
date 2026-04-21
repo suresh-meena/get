@@ -90,7 +90,7 @@ def compute_motif_energy(G, c_3, u_3, v_3, t_tau, params, projections, num_nodes
 
     T_tau = params['T_tau'][t_tau]
     Phi_3 = K3[u_3] * K3[v_3] + T_tau
-    ell_3 = (Q3[c_3] * Phi_3).sum(dim=(1, 2)) / (d ** 0.5)
+    ell_3 = (Q3[c_3] * Phi_3).sum(dim=(1, 2)) / ((R * d) ** 0.5)
 
     beta_3 = inverse_temperature(params, 'beta_3', beta_max=beta_max)
     lse_3 = segment_logsumexp(beta_3 * ell_3, c_3, num_nodes)

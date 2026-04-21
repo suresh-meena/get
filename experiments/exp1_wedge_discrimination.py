@@ -51,7 +51,17 @@ def generate_matched_dataset(n_nodes=20, num_pairs=500, degree=3, nswap=40, max_
     return dataset
 
 
-def run_fullget_sweep(dataset, epochs, batch_size, device, seed, compile_model=False, num_workers=8):
+def run_fullget_sweep(
+    dataset,
+    epochs,
+    batch_size,
+    device,
+    seed,
+    compile_model=False,
+    num_workers=8,
+    margin_loss_weight=0.05,
+    logit_margin=1.0,
+):
     sweep = [
         {
             "name": "FullGET-R1",
@@ -122,6 +132,8 @@ def run_fullget_sweep(dataset, epochs, batch_size, device, seed, compile_model=F
             track_grad_norm=True,
             num_workers=num_workers,
             use_amp=False,
+            margin_loss_weight=margin_loss_weight,
+            logit_margin=logit_margin,
         )
         bad_total = int(sum(hist["bad_batches"]))
         result = {"name": cfg["name"], "auc": float(auc), "bad_total": bad_total, "history": hist, "model": trained_model}
@@ -160,6 +172,8 @@ def run_single_seed(seed, args, device):
         seed=seed,
         compile_model=args.compile,
         num_workers=args.num_workers,
+        margin_loss_weight=args.margin_loss_weight,
+        logit_margin=args.logit_margin,
     )
 
     from get import GINBaseline
@@ -178,6 +192,8 @@ def run_single_seed(seed, args, device):
         seed=seed + 1,
         compile_model=args.compile,
         num_workers=args.num_workers,
+        margin_loss_weight=args.margin_loss_weight,
+        logit_margin=args.logit_margin,
     )
 
     if args.no_sweep:
@@ -216,6 +232,8 @@ def run_single_seed(seed, args, device):
             track_grad_norm=True,
             num_workers=args.num_workers,
             use_amp=False,
+            margin_loss_weight=args.margin_loss_weight,
+            logit_margin=args.logit_margin,
         )
         sweep_results = [{"name": "single", "auc": auc_full, "bad_total": int(sum(hist_full["bad_batches"]))}]
     else:
@@ -227,6 +245,8 @@ def run_single_seed(seed, args, device):
             seed=seed + 2,
             compile_model=args.compile,
             num_workers=args.num_workers,
+            margin_loss_weight=args.margin_loss_weight,
+            logit_margin=args.logit_margin,
         )
         auc_full = best["auc"]
         hist_full = best["history"]
@@ -249,6 +269,8 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=None, help="Single-seed fallback when --seeds is empty.")
     parser.add_argument("--no_sweep", action="store_true")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile for all models during training.")
+    parser.add_argument("--margin_loss_weight", type=float, default=0.05)
+    parser.add_argument("--logit_margin", type=float, default=1.0)
     args = parser.parse_args()
 
     if args.seeds.strip():
@@ -282,9 +304,9 @@ if __name__ == "__main__":
     print("\n========================================")
     print("RESULTS: WEDGE DISCRIMINATION (MULTI-SEED)")
     print("========================================")
-    print(f"PairwiseGET -> AUC: {pairwise_mean:.4f} ± {pairwise_std:.4f}")
-    print(f"GIN Baseline -> AUC: {gin_mean:.4f} ± {gin_std:.4f}")
-    print(f"FullGET     -> AUC: {full_mean:.4f} ± {full_std:.4f}")
+    print(f"PairwiseGET -> selected test AUC: {pairwise_mean:.4f} ± {pairwise_std:.4f}")
+    print(f"GIN Baseline -> selected test AUC: {gin_mean:.4f} ± {gin_std:.4f}")
+    print(f"FullGET     -> selected test AUC: {full_mean:.4f} ± {full_std:.4f}")
     print("========================================")
 
     if not args.no_sweep:
@@ -323,9 +345,15 @@ if __name__ == "__main__":
     colors = {"pairwise": "#1f77b4", "gin": "#ff7f0e", "fullget": "#2ca02c"}
     labels = {"pairwise": "PairwiseGET", "gin": "GIN (1-WL)", "fullget": "FullGET"}
 
-    plt.figure(figsize=(12, 5))
-    for subplot_idx, key, title in [(1, "train_loss", "Training Loss"), (2, "test_auc", "Test AUC (Higher is better)")]:
-        ax = plt.subplot(1, 2, subplot_idx)
+    plot_specs = [
+        (1, "train_bce_loss", "Training BCE"),
+        (2, "val_loss", "Validation BCE"),
+        (3, "val_auc", "Validation AUC"),
+        (4, "val_logit_margin", "Validation Logit Margin"),
+    ]
+    plt.figure(figsize=(16, 8))
+    for subplot_idx, key, title in plot_specs:
+        ax = plt.subplot(2, 2, subplot_idx)
         for model_key in ["pairwise", "gin", "fullget"]:
             model_hists = [r["histories"][model_key] for r in runs]
             for h in model_hists:

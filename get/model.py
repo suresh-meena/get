@@ -136,22 +136,34 @@ class GETLayer(nn.Module):
             
     def _build_projections(self, G, static_projections=None):
         static_projections = static_projections or {}
-        W_fused = torch.cat([self.W_Q2, self.W_K2, self.W_Q3, self.W_K3], dim=1)
-        if self.K > 0:
-            W_fused = torch.cat([W_fused, self.W_Qm], dim=1)
+        include_motif = torch.nn.functional.softplus(self.lambda_3).detach().item() > 1e-6
 
-        Z_all = G @ W_fused
+        weights = [self.W_Q2, self.W_K2]
+        if include_motif:
+            weights.extend([self.W_Q3, self.W_K3])
+        if self.K > 0:
+            weights.append(self.W_Qm)
+
+        Z_all = G @ torch.cat(weights, dim=1)
         d, R = self.d, self.R
 
+        offset = 0
         projections = {
-            'Q2': Z_all[:, :d],
-            'K2': Z_all[:, d:2 * d],
-            'Q3': Z_all[:, 2 * d : 2 * d + R * d].view(-1, R, d),
-            'K3': Z_all[:, 2 * d + R * d : 2 * d + 2 * R * d].view(-1, R, d),
+            'Q2': Z_all[:, offset : offset + d],
             'a_2': static_projections.get('a_2'),
         }
+        offset += d
+        projections['K2'] = Z_all[:, offset : offset + d]
+        offset += d
+
+        if include_motif:
+            projections['Q3'] = Z_all[:, offset : offset + R * d].view(-1, R, d)
+            offset += R * d
+            projections['K3'] = Z_all[:, offset : offset + R * d].view(-1, R, d)
+            offset += R * d
+
         if self.K > 0:
-            projections['Qm'] = Z_all[:, 2 * d + 2 * R * d :]
+            projections['Qm'] = Z_all[:, offset:]
             projections['Km'] = static_projections['Km']
         return projections
 
