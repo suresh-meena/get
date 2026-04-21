@@ -79,7 +79,7 @@ def generate_degree_controlled_triangle_dataset(
     return dataset
 
 
-def run_fullget_sweep(dataset, epochs, batch_size, device, seed, compile_model=False):
+def run_fullget_sweep(dataset, epochs, batch_size, device, seed, compile_model=False, num_workers=8):
     sweep = [
         {
             "name": "FullGET-R1",
@@ -165,6 +165,7 @@ def run_fullget_sweep(dataset, epochs, batch_size, device, seed, compile_model=F
             compile_model=compile_model,
             apply_sigmoid_eval=True,
             track_grad_norm=False,
+            num_workers=num_workers,
         )
         bad_total = int(sum(hist["bad_batches"]))
         result = {"name": cfg["name"], "auc": float(auc), "bad_total": bad_total, "history": hist, "model": trained_model}
@@ -209,6 +210,7 @@ def run_single_seed(seed, args, device):
         compile_model=args.compile,
         apply_sigmoid_eval=True,
         track_grad_norm=False,
+        num_workers=args.num_workers,
     )
 
     from get import GINBaseline
@@ -228,6 +230,7 @@ def run_single_seed(seed, args, device):
         compile_model=args.compile,
         apply_sigmoid_eval=True,
         track_grad_norm=False,
+        num_workers=args.num_workers,
     )
 
     if args.no_sweep:
@@ -262,6 +265,7 @@ def run_single_seed(seed, args, device):
             compile_model=args.compile,
             apply_sigmoid_eval=True,
             track_grad_norm=False,
+            num_workers=args.num_workers,
         )
         sweep_results = [{"name": "single", "auc": auc_full, "bad_total": int(sum(hist_full["bad_batches"]))}]
     else:
@@ -272,6 +276,7 @@ def run_single_seed(seed, args, device):
             device=device,
             seed=seed + 2,
             compile_model=args.compile,
+            num_workers=args.num_workers,
         )
         auc_full = best["auc"]
         hist_full = best["history"]
@@ -288,7 +293,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_graphs", type=int, default=500)
     parser.add_argument("--epochs", type=int, default=60)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--n_nodes", type=int, default=24)
     parser.add_argument("--degree", type=int, default=4)
     parser.add_argument("--seeds", type=str, default="123,124,125", help="Comma-separated seeds for multi-run averaging.")
