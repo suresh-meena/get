@@ -256,7 +256,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_pairs", type=int, default=500)
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--seeds", type=str, default="123,124,125", help="Comma-separated seeds for multi-run averaging.")
     parser.add_argument("--seed", type=int, default=None, help="Single-seed fallback when --seeds is empty.")

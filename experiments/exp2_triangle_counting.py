@@ -293,7 +293,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_graphs", type=int, default=500)
     parser.add_argument("--epochs", type=int, default=60)
-    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--n_nodes", type=int, default=24)
     parser.add_argument("--degree", type=int, default=4)
