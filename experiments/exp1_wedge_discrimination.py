@@ -61,18 +61,20 @@ def run_fullget_sweep(dataset, epochs, batch_size, device, seed, compile_model=F
                 num_classes=1,
                 num_steps=8,
                 R=1,
-                lambda_3=0.5,
+                lambda_3=0.6,
                 lambda_m=0.0,
                 beta_2=1.0,
                 beta_3=1.0,
-                eta=0.01,
-                eta_max=0.05,
-                grad_clip_norm=0.5,
+                eta=0.006,
+                eta_max=0.03,
+                grad_clip_norm=0.3,
                 state_clip_norm=5.0,
                 beta_max=3.0,
+                update_damping=0.5,
+                dropout=0.0,
                 compile=False,
             ),
-            "train_kwargs": dict(lr=5e-5, max_grad_norm=0.5),
+            "train_kwargs": dict(lr=3e-5, max_grad_norm=0.3),
         },
         {
             "name": "FullGET-R2",
@@ -80,41 +82,22 @@ def run_fullget_sweep(dataset, epochs, batch_size, device, seed, compile_model=F
                 in_dim=1,
                 d=96,
                 num_classes=1,
-                num_steps=10,
+                num_steps=8,
                 R=2,
-                lambda_3=1.0,
+                lambda_3=0.8,
                 lambda_m=0.0,
                 beta_2=1.0,
-                beta_3=1.5,
-                eta=0.01,
-                eta_max=0.05,
-                grad_clip_norm=0.5,
-                state_clip_norm=5.0,
-                beta_max=3.0,
-                compile=False,
-            ),
-            "train_kwargs": dict(lr=5e-5, max_grad_norm=0.5),
-        },
-        {
-            "name": "FullGET-R2-strong",
-            "model_kwargs": dict(
-                in_dim=1,
-                d=96,
-                num_classes=1,
-                num_steps=12,
-                R=2,
-                lambda_3=2.0,
-                lambda_m=0.0,
-                beta_2=1.0,
-                beta_3=2.0,
+                beta_3=1.2,
                 eta=0.008,
                 eta_max=0.04,
-                grad_clip_norm=0.4,
-                state_clip_norm=4.0,
-                beta_max=2.5,
+                grad_clip_norm=0.3,
+                state_clip_norm=5.0,
+                beta_max=3.0,
+                update_damping=0.5,
+                dropout=0.0,
                 compile=False,
             ),
-            "train_kwargs": dict(lr=4e-5, max_grad_norm=0.4),
+            "train_kwargs": dict(lr=3e-5, max_grad_norm=0.3),
         },
     ]
 
@@ -138,6 +121,7 @@ def run_fullget_sweep(dataset, epochs, batch_size, device, seed, compile_model=F
             apply_sigmoid_eval=False,
             track_grad_norm=True,
             num_workers=num_workers,
+            use_amp=False,
         )
         bad_total = int(sum(hist["bad_batches"]))
         result = {"name": cfg["name"], "auc": float(auc), "bad_total": bad_total, "history": hist, "model": trained_model}
@@ -201,17 +185,19 @@ def run_single_seed(seed, args, device):
             in_dim=1,
             d=96,
             num_classes=1,
-            num_steps=10,
+            num_steps=8,
             R=2,
-            lambda_3=1.0,
+            lambda_3=0.8,
             lambda_m=0.0,
             beta_2=1.0,
-            beta_3=1.5,
-            eta=0.01,
-            eta_max=0.05,
-            grad_clip_norm=0.5,
+            beta_3=1.2,
+            eta=0.008,
+            eta_max=0.04,
+            grad_clip_norm=0.3,
             state_clip_norm=5.0,
             beta_max=3.0,
+            update_damping=0.5,
+            dropout=0.0,
             compile=False,
         )
         auc_full, hist_full, _ = train_and_eval_binary(
@@ -222,13 +208,14 @@ def run_single_seed(seed, args, device):
             epochs=args.epochs,
             batch_size=args.batch_size,
             device=device,
-            max_grad_norm=0.5,
-            lr=5e-5,
+            max_grad_norm=0.3,
+            lr=3e-5,
             seed=seed + 2,
             compile_model=args.compile,
             apply_sigmoid_eval=False,
             track_grad_norm=True,
             num_workers=args.num_workers,
+            use_amp=False,
         )
         sweep_results = [{"name": "single", "auc": auc_full, "bad_total": int(sum(hist_full["bad_batches"]))}]
     else:
@@ -254,9 +241,9 @@ def run_single_seed(seed, args, device):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num_pairs", type=int, default=500)
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--num_pairs", type=int, default=2000)
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--seeds", type=str, default="123,124,125", help="Comma-separated seeds for multi-run averaging.")
     parser.add_argument("--seed", type=int, default=None, help="Single-seed fallback when --seeds is empty.")
