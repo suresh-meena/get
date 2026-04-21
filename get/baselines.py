@@ -1,4 +1,5 @@
 from .model import GETModel
+from .et_faithful import ETFaithfulGraphModel
 from .data import GETBatch
 import torch
 import torch.nn as nn
@@ -161,3 +162,31 @@ def ETLocal(in_dim, d, num_classes, **kwargs):
 
 def ETComplete(in_dim, d, num_classes, **kwargs):
     return ETCompleteBaseline(in_dim, d, num_classes, **kwargs)
+
+
+def ETFaithful(in_dim, d, num_classes, **kwargs):
+    """Paper-inspired ET with CLS token, Laplacian PE, masked energy attention, and HN memory."""
+    return ETFaithfulGraphModel(in_dim, d, num_classes, **kwargs)
+
+
+def ETInspiredGET(in_dim, d, num_classes, **kwargs):
+    """
+    GET variant inspired by ET equations:
+    - symmetric pairwise energy term q_i*k_j + q_j*k_i
+    - keeps GET memory block energy active by default
+    - motif branch disabled to stay close to ET attention+memory design
+    """
+    beta_2 = kwargs.pop("beta_2", 1.0)
+    beta_m = kwargs.pop("beta_m", 1.0)
+    lambda_m = kwargs.pop("lambda_m", 1.0)
+    return GETModel(
+        in_dim,
+        d,
+        num_classes,
+        lambda_3=0.0,
+        lambda_m=lambda_m,
+        beta_2=beta_2,
+        beta_m=beta_m,
+        pairwise_symmetric=True,
+        **kwargs,
+    )

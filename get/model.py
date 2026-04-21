@@ -48,7 +48,8 @@ class GETLayer(nn.Module):
                  lambda_2=1.0, lambda_3=1.0, lambda_m=1.0, 
                  beta_2=1.0, beta_3=1.0, beta_m=1.0,
                  grad_clip_norm=1.0, beta_max=5.0, state_clip_norm=10.0,
-                 update_damping=1.0, learn_update_damping=False):
+                 update_damping=1.0, learn_update_damping=False,
+                 pairwise_symmetric=False):
         super().__init__()
         self.d = d
         self.R = R
@@ -57,6 +58,7 @@ class GETLayer(nn.Module):
         self.beta_max = beta_max
         self.state_clip_norm = state_clip_norm
         self.learn_update_damping = learn_update_damping
+        self.pairwise_symmetric = bool(pairwise_symmetric)
         update_damping = min(max(float(update_damping), 1e-4), 1.0 - 1e-4)
         if learn_update_damping:
             self.update_damping_logit = nn.Parameter(torch.logit(torch.tensor(update_damping)))
@@ -120,6 +122,7 @@ class GETLayer(nn.Module):
             'beta_3': self.beta_3,
             'beta_m': self.beta_m,
             'beta_max': self.beta_max,
+            'pairwise_symmetric': self.pairwise_symmetric,
             
             'W_Q2': self.W_Q2,
             'W_K2': self.W_K2,

@@ -24,6 +24,8 @@ def _extract_pairwise_indices(adj):
 def _apply_motif_budget_with_ties(node_motifs, max_motifs_per_node):
     if max_motifs_per_node is None or len(node_motifs) <= max_motifs_per_node:
         return node_motifs
+    if max_motifs_per_node <= 0:
+        return []
     threshold_score = node_motifs[max_motifs_per_node - 1][3]
     return [m for m in node_motifs if m[3] >= threshold_score]
 

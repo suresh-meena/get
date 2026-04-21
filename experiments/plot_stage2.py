@@ -7,19 +7,19 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-MODEL_ORDER = ["pairwise", "fullget", "et_local", "et_complete", "gin"]
+MODEL_ORDER = ["pairwise", "fullget", "et_get", "et_faithful", "gin"]
 MODEL_LABEL = {
     "pairwise": "PairwiseGET",
     "fullget": "FullGET",
-    "et_local": "ET-Local",
-    "et_complete": "ET-Complete",
+    "et_get": "ETInspiredGET",
+    "et_faithful": "ETFaithful",
     "gin": "GIN",
 }
 MODEL_COLOR = {
     "pairwise": "#1f77b4",
     "fullget": "#2ca02c",
-    "et_local": "#9467bd",
-    "et_complete": "#8c564b",
+    "et_get": "#9467bd",
+    "et_faithful": "#8c564b",
     "gin": "#ff7f0e",
 }
 
@@ -107,8 +107,8 @@ def plot_stage2_graph_anomaly(json_path: Path, output_path: Path | None = None) 
     model_offsets = {
         "pairwise": -1.5 * width,
         "fullget": -0.5 * width,
-        "et_local": 0.5 * width,
-        "et_complete": 1.5 * width,
+        "et_get": 0.5 * width,
+        "et_faithful": 1.5 * width,
     }
 
     plt.figure(figsize=(10, 5))

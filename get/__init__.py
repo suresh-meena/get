@@ -8,6 +8,8 @@ from .baselines import (
 	GINBaseline,
 	ETLocal,
 	ETComplete,
+	ETFaithful,
+	ETInspiredGET,
 	ETLocalBaseline,
 	ETCompleteBaseline,
 )

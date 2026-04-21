@@ -64,6 +64,8 @@ def compute_pairwise_energy(G, c_2, u_2, params, projections, num_nodes):
         K2 = G @ params['W_K2']
 
     ell_2 = (Q2[c_2] * K2[u_2]).sum(dim=-1) / (d ** 0.5)
+    if params.get("pairwise_symmetric", False):
+        ell_2 = ell_2 + (Q2[u_2] * K2[c_2]).sum(dim=-1) / (d ** 0.5)
 
     a_2 = projections.get('a_2') if projections else params.get('a_2')
     if a_2 is not None:

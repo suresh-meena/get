@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from get import ETComplete, ETLocal, FullGET, PairwiseGET
+from get import ETFaithful, ETInspiredGET, FullGET, PairwiseGET
 from stage1_common import mean_std, parse_seeds, set_seed
 from stage2_common import (
     build_anomaly_protocol_split,
@@ -57,6 +57,8 @@ def run_stage2_graph_classification(args, device):
 
     seeds = parse_seeds(args.seeds)
     results = []
+    motif_budget_other = args.max_motifs_other
+    motif_budget_full = args.max_motifs_full
 
     for seed in seeds:
         set_seed(seed)
@@ -77,6 +79,7 @@ def run_stage2_graph_classification(args, device):
             amp_dtype=args.amp_dtype,
             num_workers=args.num_workers,
             pin_memory=args.pin_memory,
+            max_motifs=motif_budget_other,
         )
 
         fg = FullGET(
@@ -104,12 +107,13 @@ def run_stage2_graph_classification(args, device):
             amp_dtype=args.amp_dtype,
             num_workers=args.num_workers,
             pin_memory=args.pin_memory,
+            max_motifs=motif_budget_full,
         )
 
-        et_local = ETLocal(in_dim=in_dim, d=args.hidden_dim, num_classes=num_classes, num_steps=args.num_steps)
-        et_local_acc, et_local_hist = train_eval_graph_classification(
-            "ET-Local",
-            et_local,
+        et_get = ETInspiredGET(in_dim=in_dim, d=args.hidden_dim, num_classes=num_classes, num_steps=args.num_steps)
+        et_get_acc, et_get_hist = train_eval_graph_classification(
+            "ETInspiredGET",
+            et_get,
             dataset,
             num_classes=num_classes,
             epochs=args.epochs,
@@ -123,18 +127,28 @@ def run_stage2_graph_classification(args, device):
             amp_dtype=args.amp_dtype,
             num_workers=args.num_workers,
             pin_memory=args.pin_memory,
+            max_motifs=motif_budget_other,
         )
 
-        et_complete = ETComplete(in_dim=in_dim, d=args.hidden_dim, num_classes=num_classes, num_steps=args.num_steps)
-        et_complete_acc, et_complete_hist = train_eval_graph_classification(
-            "ET-Complete",
-            et_complete,
+        et_faithful = ETFaithful(
+            in_dim=in_dim,
+            d=args.hidden_dim,
+            num_classes=num_classes,
+            num_steps=args.num_steps,
+            num_heads=args.et_num_heads,
+            head_dim=args.et_head_dim,
+            pe_k=args.et_pe_k,
+            K=args.et_memory_slots,
+        )
+        et_faithful_acc, et_faithful_hist = train_eval_graph_classification(
+            "ETFaithful",
+            et_faithful,
             dataset,
             num_classes=num_classes,
             epochs=args.epochs,
             batch_size=args.batch_size,
             device=device,
-            lr=args.lr_pairwise,
+            lr=args.lr_et_faithful,
             max_grad_norm=0.5,
             seed=seed + 11,
             compile_model=args.compile,
@@ -142,6 +156,7 @@ def run_stage2_graph_classification(args, device):
             amp_dtype=args.amp_dtype,
             num_workers=args.num_workers,
             pin_memory=args.pin_memory,
+            max_motifs=motif_budget_other,
         )
 
         gin = _try_build_gin(in_dim=in_dim, d=args.hidden_dim, num_classes=num_classes)
@@ -162,6 +177,7 @@ def run_stage2_graph_classification(args, device):
                 amp_dtype=args.amp_dtype,
                 num_workers=args.num_workers,
                 pin_memory=args.pin_memory,
+                max_motifs=motif_budget_other,
             )
         else:
             gin_acc, gin_hist = None, None
@@ -172,22 +188,22 @@ def run_stage2_graph_classification(args, device):
                 "pairwise_acc": float(pw_acc),
                 "fullget_acc": float(fg_acc),
                 "gin_acc": None if gin_acc is None else float(gin_acc),
-                "et_local_acc": float(et_local_acc),
-                "et_complete_acc": float(et_complete_acc),
+                "et_get_acc": float(et_get_acc),
+                "et_faithful_acc": float(et_faithful_acc),
                 "histories": {
                     "pairwise": pw_hist,
                     "fullget": fg_hist,
                     "gin": gin_hist,
-                    "et_local": et_local_hist,
-                    "et_complete": et_complete_hist,
+                    "et_get": et_get_hist,
+                    "et_faithful": et_faithful_hist,
                 },
             }
         )
 
     pw_vals = [r["pairwise_acc"] for r in results]
     fg_vals = [r["fullget_acc"] for r in results]
-    et_local_vals = [r["et_local_acc"] for r in results]
-    et_complete_vals = [r["et_complete_acc"] for r in results]
+    et_get_vals = [r["et_get_acc"] for r in results]
+    et_faithful_vals = [r["et_faithful_acc"] for r in results]
     out = {
         "task": "graph_classification",
         "dataset": args.dataset,
@@ -196,10 +212,10 @@ def run_stage2_graph_classification(args, device):
             "pairwise_std": mean_std(pw_vals)[1],
             "fullget_mean": mean_std(fg_vals)[0],
             "fullget_std": mean_std(fg_vals)[1],
-            "et_local_mean": mean_std(et_local_vals)[0],
-            "et_local_std": mean_std(et_local_vals)[1],
-            "et_complete_mean": mean_std(et_complete_vals)[0],
-            "et_complete_std": mean_std(et_complete_vals)[1],
+            "et_get_mean": mean_std(et_get_vals)[0],
+            "et_get_std": mean_std(et_get_vals)[1],
+            "et_faithful_mean": mean_std(et_faithful_vals)[0],
+            "et_faithful_std": mean_std(et_faithful_vals)[1],
         },
         "runs": results,
     }
@@ -213,8 +229,8 @@ def run_stage2_graph_classification(args, device):
     print(
         f"Pairwise acc: {out['summary']['pairwise_mean']:.4f} ± {out['summary']['pairwise_std']:.4f} | "
         f"FullGET acc: {out['summary']['fullget_mean']:.4f} ± {out['summary']['fullget_std']:.4f} | "
-        f"ET-Local acc: {out['summary']['et_local_mean']:.4f} ± {out['summary']['et_local_std']:.4f} | "
-        f"ET-Complete acc: {out['summary']['et_complete_mean']:.4f} ± {out['summary']['et_complete_std']:.4f}"
+        f"ETInspiredGET acc: {out['summary']['et_get_mean']:.4f} ± {out['summary']['et_get_std']:.4f} | "
+        f"ETFaithful acc: {out['summary']['et_faithful_mean']:.4f} ± {out['summary']['et_faithful_std']:.4f}"
     )
 
 
@@ -222,16 +238,25 @@ def run_stage2_graph_anomaly(args, device):
     if args.dataset == "synth":
         dataset = generate_synth_graph_anomaly(num_graphs=args.num_graphs, n_nodes=args.n_nodes, seed=args.seed)
     else:
+        effective_limit = args.limit
+        if effective_limit is None and args.dataset.lower() in {"yelp", "amazon", "amazonproducts", "amazon_products"}:
+            effective_limit = 5000
+            print(
+                "No --limit provided for a large node dataset. "
+                f"Using default --limit={effective_limit} for tractable ego-graph conversion."
+            )
         dataset = load_node_anomaly_dataset(
             dataset_name=args.dataset,
             root=args.data_root,
             num_hops=args.ego_hops,
-            limit=args.limit,
+            limit=effective_limit,
         )
     in_dim = int(dataset[0]["x"].size(1))
     seeds = parse_seeds(args.seeds)
     label_rates = [float(x.strip()) for x in args.anomaly_label_rates.split(",") if x.strip()]
     results = {rate: [] for rate in label_rates}
+    motif_budget_other = args.max_motifs_other
+    motif_budget_full = args.max_motifs_full
 
     for rate in label_rates:
         for seed in seeds:
@@ -260,6 +285,7 @@ def run_stage2_graph_anomaly(args, device):
                 amp_dtype=args.amp_dtype,
                 num_workers=args.num_workers,
                 pin_memory=args.pin_memory,
+                max_motifs=motif_budget_other,
             )
 
             fg = FullGET(
@@ -287,12 +313,13 @@ def run_stage2_graph_anomaly(args, device):
                 amp_dtype=args.amp_dtype,
                 num_workers=args.num_workers,
                 pin_memory=args.pin_memory,
+                max_motifs=motif_budget_full,
             )
 
-            et_local = ETLocal(in_dim=in_dim, d=args.hidden_dim, num_classes=1, num_steps=args.num_steps)
-            et_local_auc, et_local_hist = train_eval_graph_anomaly(
-                "ET-Local",
-                et_local,
+            et_get = ETInspiredGET(in_dim=in_dim, d=args.hidden_dim, num_classes=1, num_steps=args.num_steps)
+            et_get_auc, et_get_hist = train_eval_graph_anomaly(
+                "ETInspiredGET",
+                et_get,
                 dataset,
                 epochs=args.epochs,
                 batch_size=args.batch_size,
@@ -306,17 +333,27 @@ def run_stage2_graph_anomaly(args, device):
                 amp_dtype=args.amp_dtype,
                 num_workers=args.num_workers,
                 pin_memory=args.pin_memory,
+                max_motifs=motif_budget_other,
             )
 
-            et_complete = ETComplete(in_dim=in_dim, d=args.hidden_dim, num_classes=1, num_steps=args.num_steps)
-            et_complete_auc, et_complete_hist = train_eval_graph_anomaly(
-                "ET-Complete",
-                et_complete,
+            et_faithful = ETFaithful(
+                in_dim=in_dim,
+                d=args.hidden_dim,
+                num_classes=1,
+                num_steps=args.num_steps,
+                num_heads=args.et_num_heads,
+                head_dim=args.et_head_dim,
+                pe_k=args.et_pe_k,
+                K=args.et_memory_slots,
+            )
+            et_faithful_auc, et_faithful_hist = train_eval_graph_anomaly(
+                "ETFaithful",
+                et_faithful,
                 dataset,
                 epochs=args.epochs,
                 batch_size=args.batch_size,
                 device=device,
-                lr=args.lr_pairwise,
+                lr=args.lr_et_faithful,
                 max_grad_norm=0.5,
                 seed=seed + 11,
                 compile_model=args.compile,
@@ -325,6 +362,7 @@ def run_stage2_graph_anomaly(args, device):
                 amp_dtype=args.amp_dtype,
                 num_workers=args.num_workers,
                 pin_memory=args.pin_memory,
+                max_motifs=motif_budget_other,
             )
 
             gin = _try_build_gin(in_dim=in_dim, d=args.hidden_dim, num_classes=1)
@@ -345,6 +383,7 @@ def run_stage2_graph_anomaly(args, device):
                     amp_dtype=args.amp_dtype,
                     num_workers=args.num_workers,
                     pin_memory=args.pin_memory,
+                    max_motifs=motif_budget_other,
                 )
             else:
                 gin_auc, gin_hist = None, None
@@ -355,14 +394,14 @@ def run_stage2_graph_anomaly(args, device):
                     "pairwise_auc": float(pw_auc),
                     "fullget_auc": float(fg_auc),
                     "gin_auc": None if gin_auc is None else float(gin_auc),
-                    "et_local_auc": float(et_local_auc),
-                    "et_complete_auc": float(et_complete_auc),
+                    "et_get_auc": float(et_get_auc),
+                    "et_faithful_auc": float(et_faithful_auc),
                     "histories": {
                         "pairwise": pw_hist,
                         "fullget": fg_hist,
                         "gin": gin_hist,
-                        "et_local": et_local_hist,
-                        "et_complete": et_complete_hist,
+                        "et_get": et_get_hist,
+                        "et_faithful": et_faithful_hist,
                     },
                 }
             )
@@ -372,17 +411,17 @@ def run_stage2_graph_anomaly(args, device):
         runs = results[rate]
         pw_vals = [r["pairwise_auc"] for r in runs]
         fg_vals = [r["fullget_auc"] for r in runs]
-        et_local_vals = [r["et_local_auc"] for r in runs]
-        et_complete_vals = [r["et_complete_auc"] for r in runs]
+        et_get_vals = [r["et_get_auc"] for r in runs]
+        et_faithful_vals = [r["et_faithful_auc"] for r in runs]
         summary[str(rate)] = {
             "pairwise_mean": mean_std(pw_vals)[0],
             "pairwise_std": mean_std(pw_vals)[1],
             "fullget_mean": mean_std(fg_vals)[0],
             "fullget_std": mean_std(fg_vals)[1],
-            "et_local_mean": mean_std(et_local_vals)[0],
-            "et_local_std": mean_std(et_local_vals)[1],
-            "et_complete_mean": mean_std(et_complete_vals)[0],
-            "et_complete_std": mean_std(et_complete_vals)[1],
+            "et_get_mean": mean_std(et_get_vals)[0],
+            "et_get_std": mean_std(et_get_vals)[1],
+            "et_faithful_mean": mean_std(et_faithful_vals)[0],
+            "et_faithful_std": mean_std(et_faithful_vals)[1],
         }
 
     out = {
@@ -403,8 +442,8 @@ def run_stage2_graph_anomaly(args, device):
         print(
             f"label_rate={rate:.2f} | Pairwise AUC: {s['pairwise_mean']:.4f} ± {s['pairwise_std']:.4f} | "
             f"FullGET AUC: {s['fullget_mean']:.4f} ± {s['fullget_std']:.4f} | "
-            f"ET-Local AUC: {s['et_local_mean']:.4f} ± {s['et_local_std']:.4f} | "
-            f"ET-Complete AUC: {s['et_complete_mean']:.4f} ± {s['et_complete_std']:.4f}"
+            f"ETInspiredGET AUC: {s['et_get_mean']:.4f} ± {s['et_get_std']:.4f} | "
+            f"ETFaithful AUC: {s['et_faithful_mean']:.4f} ± {s['et_faithful_std']:.4f}"
         )
 
 
@@ -429,7 +468,15 @@ def main():
     )
     parser.add_argument("--anomaly_val_ratio", type=int, default=1)
     parser.add_argument("--anomaly_test_ratio", type=int, default=2)
-    parser.add_argument("--limit", type=int, default=None, help="Optional dataset size limit for TU datasets.")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help=(
+            "Optional dataset size limit. For yelp/amazon anomaly tasks, "
+            "if unset, a default of 5000 centers is applied."
+        ),
+    )
     parser.add_argument("--num_graphs", type=int, default=200)
     parser.add_argument("--n_nodes", type=int, default=24)
     parser.add_argument("--num_classes", type=int, default=3)
@@ -441,7 +488,24 @@ def main():
     parser.add_argument("--lambda3", type=float, default=1.0)
     parser.add_argument("--lr_pairwise", type=float, default=1e-4)
     parser.add_argument("--lr_full", type=float, default=5e-5)
+    parser.add_argument("--lr_et_faithful", type=float, default=1e-4)
     parser.add_argument("--lr_gin", type=float, default=2e-4)
+    parser.add_argument("--et_num_heads", type=int, default=2)
+    parser.add_argument("--et_head_dim", type=int, default=None)
+    parser.add_argument("--et_pe_k", type=int, default=16)
+    parser.add_argument("--et_memory_slots", type=int, default=32)
+    parser.add_argument(
+        "--max_motifs_full",
+        type=int,
+        default=32,
+        help="Maximum anchored motifs per node for FullGET batching; lower is faster/cheaper.",
+    )
+    parser.add_argument(
+        "--max_motifs_other",
+        type=int,
+        default=0,
+        help="Motif budget for non-motif baselines (0 disables motif extraction).",
+    )
     parser.add_argument("--seeds", type=str, default="123,124,125")
     parser.add_argument("--seed", type=int, default=123, help="Generator seed for synthetic datasets.")
     parser.add_argument("--compile", action="store_true")

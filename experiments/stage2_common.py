@@ -1,6 +1,7 @@
 import random
 import tempfile
 from collections import deque
+from functools import partial
 
 import networkx as nx
 import numpy as np
@@ -16,14 +17,14 @@ from get.compile_utils import maybe_compile_model
 from get.data import collate_get_batch
 
 
-def _make_loader(data, batch_size, shuffle, num_workers, pin_memory):
+def _make_loader(data, batch_size, shuffle, num_workers, pin_memory, max_motifs=None):
     kwargs = {
         "dataset": data,
         "batch_size": batch_size,
         "shuffle": shuffle,
         "num_workers": num_workers,
         "pin_memory": pin_memory,
-        "collate_fn": collate_get_batch,
+        "collate_fn": partial(collate_get_batch, max_motifs=max_motifs),
     }
     if num_workers > 0:
         kwargs["persistent_workers"] = True
@@ -47,6 +48,7 @@ def train_eval_graph_classification(
     amp_dtype="float16",
     num_workers=0,
     pin_memory=None,
+    max_motifs=None,
 ):
     model = model.to(device)
     model = maybe_compile_model(model, compile_model, model_name=model_name)
@@ -74,8 +76,8 @@ def train_eval_graph_classification(
 
     with tempfile.TemporaryDirectory() as tmpdir:
         best_ckpt_path = f"{tmpdir}/best_{model_name.replace('/', '_')}.pt"
-        train_loader = _make_loader(train_data, batch_size, True, num_workers, pin_memory)
-        test_loader = _make_loader(test_data, batch_size, False, num_workers, pin_memory)
+        train_loader = _make_loader(train_data, batch_size, True, num_workers, pin_memory, max_motifs=max_motifs)
+        test_loader = _make_loader(test_data, batch_size, False, num_workers, pin_memory, max_motifs=max_motifs)
         pbar = tqdm(range(epochs), desc=f"Training {model_name}")
         for _ in pbar:
             model.train()
@@ -165,6 +167,7 @@ def train_eval_graph_anomaly(
     amp_dtype="float16",
     num_workers=0,
     pin_memory=None,
+    max_motifs=None,
 ):
     model = model.to(device)
     model = maybe_compile_model(model, compile_model, model_name=model_name)
@@ -198,9 +201,13 @@ def train_eval_graph_anomaly(
 
     with tempfile.TemporaryDirectory() as tmpdir:
         best_ckpt_path = f"{tmpdir}/best_{model_name.replace('/', '_')}.pt"
-        train_loader = _make_loader(train_data, batch_size, True, num_workers, pin_memory)
-        val_loader = _make_loader(val_data, batch_size, False, num_workers, pin_memory) if len(val_data) > 0 else None
-        test_loader = _make_loader(test_data, batch_size, False, num_workers, pin_memory)
+        train_loader = _make_loader(train_data, batch_size, True, num_workers, pin_memory, max_motifs=max_motifs)
+        val_loader = (
+            _make_loader(val_data, batch_size, False, num_workers, pin_memory, max_motifs=max_motifs)
+            if len(val_data) > 0
+            else None
+        )
+        test_loader = _make_loader(test_data, batch_size, False, num_workers, pin_memory, max_motifs=max_motifs)
         pbar = tqdm(range(epochs), desc=f"Training {model_name}")
         for _ in pbar:
             model.train()
@@ -369,6 +376,65 @@ def _k_hop_nodes(center, adj, num_hops):
     return sorted(seen)
 
 
+def _to_binary_node_labels(data):
+    """
+    Normalize dataset-specific node labels to a binary anomaly target vector.
+
+    Supported cases:
+    - shape [N] integer/float labels
+    - shape [N, 1]
+    - shape [N, C] one-hot / multi-label
+    """
+    num_nodes = int(data.num_nodes)
+    y = getattr(data, "y", None)
+    if y is None:
+        raise ValueError("Dataset does not provide `data.y`; cannot derive node-level labels.")
+
+    y = y.detach().cpu()
+    if y.dim() == 0:
+        raise ValueError("Expected node-level labels, got scalar label.")
+    if y.dim() > 2:
+        raise ValueError(f"Unsupported label rank {y.dim()} for node anomaly conversion.")
+
+    # [N]
+    if y.dim() == 1:
+        if y.numel() != num_nodes:
+            raise ValueError(
+                f"Expected node-level labels of length {num_nodes}, got {y.numel()}."
+            )
+        y_vec = y
+    # [N, 1] or [N, C]
+    else:
+        if y.size(0) != num_nodes:
+            raise ValueError(
+                f"Expected first label dimension to equal num_nodes={num_nodes}, got {y.size(0)}."
+            )
+        if y.size(1) == 1:
+            y_vec = y[:, 0]
+        else:
+            # For one-hot / multi-label matrices, collapse to a class-id proxy.
+            # This gives deterministic behavior across PyG dataset variants.
+            y_vec = y.to(torch.float32).argmax(dim=1)
+
+    # If already binary in {0,1}, preserve semantics.
+    uniques = torch.unique(y_vec)
+    if uniques.numel() <= 2 and bool(torch.all((uniques == 0) | (uniques == 1))):
+        return y_vec.to(torch.long)
+
+    # Multiclass / continuous fallback:
+    # mark the least frequent class/bin as anomalies (minority-class heuristic).
+    if torch.is_floating_point(y_vec):
+        y_work = y_vec.round().to(torch.long)
+    else:
+        y_work = y_vec.to(torch.long)
+
+    classes, counts = torch.unique(y_work, return_counts=True)
+    if classes.numel() <= 1:
+        return torch.zeros(num_nodes, dtype=torch.long)
+    anomaly_class = classes[torch.argmin(counts)]
+    return (y_work == anomaly_class).to(torch.long)
+
+
 def build_ego_graph_dataset(data, num_hops=2, limit=None):
     """Convert a single node-labeled graph into graph-level ego samples.
 
@@ -377,15 +443,20 @@ def build_ego_graph_dataset(data, num_hops=2, limit=None):
     """
     num_nodes = int(data.num_nodes)
     x_all = data.x.float() if data.x is not None else torch.ones(num_nodes, 1, dtype=torch.float32)
-    y_all = data.y.view(-1)
+    y_all = _to_binary_node_labels(data)
     if y_all.numel() != num_nodes:
-        raise ValueError("Expected node-level labels with length equal to num_nodes.")
+        raise ValueError(
+            f"Expected node-level labels with length equal to num_nodes={num_nodes}, got {y_all.numel()}."
+        )
 
     adj = _adj_from_edge_index(num_nodes, data.edge_index)
     samples = []
     total = num_nodes if limit is None else min(int(limit), num_nodes)
+    print(
+        f"Building ego-graph dataset: total_centers={total}, num_nodes={num_nodes}, num_hops={num_hops}"
+    )
 
-    for center in range(total):
+    for center in tqdm(range(total), desc="Ego graph conversion"):
         keep = _k_hop_nodes(center, adj, num_hops=num_hops)
         old_to_new = {old: new for new, old in enumerate(keep)}
 
