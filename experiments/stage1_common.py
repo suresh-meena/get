@@ -1,5 +1,6 @@
 import math
 import random
+import tempfile
 
 import numpy as np
 import torch
@@ -95,24 +96,18 @@ def train_and_eval_binary(
     if pin_memory is None:
         pin_memory = bool(device.type == "cuda")
 
-    amp_enabled = bool(use_amp and device.type in {"cuda", "cpu"})
+    amp_enabled = bool(use_amp and device.type == "cuda")
     amp_torch_dtype = torch.float16 if amp_dtype == "float16" else torch.bfloat16
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled and device.type == "cuda")
 
     best_auc = 0.0
-    best_state = None
+    best_ckpt_path = None
     history = {"train_loss": [], "test_auc": [], "bad_batches": []}
     if track_grad_norm:
         history["grad_norm"] = []
 
-    pbar = tqdm(range(epochs), desc=f"Training {model_name}")
-    for _ in pbar:
-        model.train()
-        total_loss = 0.0
-        total_grad_norm = 0.0
-        grad_steps = 0
-        bad_batches = 0
-
+    with tempfile.TemporaryDirectory() as tmpdir:
+        best_ckpt_path = f"{tmpdir}/best_{model_name.replace('/', '_')}.pt"
         train_loader = _make_loader(
             train_data,
             batch_size=batch_size,
@@ -128,104 +123,112 @@ def train_and_eval_binary(
             pin_memory=pin_memory,
         )
 
-        for batch in train_loader:
-            batch = batch.to(device, non_blocking=pin_memory)
-            optimizer.zero_grad()
+        pbar = tqdm(range(epochs), desc=f"Training {model_name}")
+        for _ in pbar:
+            model.train()
+            total_loss = 0.0
+            total_grad_norm = 0.0
+            grad_steps = 0
+            bad_batches = 0
 
-            with torch.autocast(
-                device_type=device.type,
-                dtype=amp_torch_dtype,
-                enabled=amp_enabled,
-            ):
-                out, _ = model(batch, task_level="graph")
-                out = out.reshape(-1)
-                target = batch.y.reshape(-1).float()
-                if not torch.isfinite(out).all():
-                    bad_batches += 1
-                    continue
-                loss = criterion(out, target)
-                if not torch.isfinite(loss):
-                    bad_batches += 1
-                    continue
-
-            if scaler.is_enabled():
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-            else:
-                loss.backward()
-
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            if not math.isfinite(float(grad_norm)):
-                optimizer.zero_grad(set_to_none=True)
-                if scaler.is_enabled():
-                    scaler.update()
-                bad_batches += 1
-                continue
-
-            if scaler.is_enabled():
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-            total_loss += float(loss.item())
-            total_grad_norm += float(grad_norm)
-            grad_steps += 1
-
-        model.eval()
-        all_preds = []
-        all_labels = []
-        with torch.no_grad():
-            for batch in test_loader:
+            for batch in train_loader:
                 batch = batch.to(device, non_blocking=pin_memory)
+                optimizer.zero_grad()
+
                 with torch.autocast(
                     device_type=device.type,
                     dtype=amp_torch_dtype,
                     enabled=amp_enabled,
                 ):
                     out, _ = model(batch, task_level="graph")
-                out = torch.nan_to_num(out.reshape(-1), nan=0.0, posinf=0.0, neginf=0.0)
-                if apply_sigmoid_eval:
-                    out = torch.sigmoid(out)
-                all_preds.extend(out.cpu().numpy().tolist())
-                all_labels.extend(batch.y.reshape(-1).cpu().numpy().tolist())
+                    out = out.reshape(-1)
+                    target = batch.y.reshape(-1).float()
+                    if not torch.isfinite(out).all():
+                        bad_batches += 1
+                        continue
+                    loss = criterion(out, target)
+                    if not torch.isfinite(loss):
+                        bad_batches += 1
+                        continue
 
-        try:
-            auc = float(roc_auc_score(all_labels, all_preds))
-        except ValueError:
-            auc = 0.5
+                if scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                else:
+                    loss.backward()
 
-        scheduler.step(auc)
-        if auc > best_auc:
-            best_auc = auc
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                if not math.isfinite(float(grad_norm)):
+                    optimizer.zero_grad(set_to_none=True)
+                    if scaler.is_enabled():
+                        scaler.update()
+                    bad_batches += 1
+                    continue
 
-        avg_loss = total_loss / max(grad_steps, 1)
-        history["train_loss"].append(avg_loss)
-        history["test_auc"].append(float(auc))
-        history["bad_batches"].append(int(bad_batches))
+                if scaler.is_enabled():
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                total_loss += float(loss.item())
+                total_grad_norm += float(grad_norm)
+                grad_steps += 1
 
-        if track_grad_norm:
-            avg_grad_norm = total_grad_norm / max(grad_steps, 1)
-            history["grad_norm"].append(avg_grad_norm)
-            pbar.set_postfix(
-                {
-                    "loss": avg_loss,
-                    "test_auc": auc,
-                    "grad": avg_grad_norm,
-                    "bad": bad_batches,
-                    "lr": optimizer.param_groups[0]["lr"],
-                }
-            )
-        else:
-            pbar.set_postfix(
-                {
-                    "loss": avg_loss,
-                    "test_auc": auc,
-                    "bad": bad_batches,
-                    "lr": optimizer.param_groups[0]["lr"],
-                }
-            )
+            model.eval()
+            all_preds = []
+            all_labels = []
+            with torch.no_grad():
+                for batch in test_loader:
+                    batch = batch.to(device, non_blocking=pin_memory)
+                    with torch.autocast(
+                        device_type=device.type,
+                        dtype=amp_torch_dtype,
+                        enabled=amp_enabled,
+                    ):
+                        out, _ = model(batch, task_level="graph")
+                    out = torch.nan_to_num(out.reshape(-1), nan=0.0, posinf=0.0, neginf=0.0)
+                    if apply_sigmoid_eval:
+                        out = torch.sigmoid(out)
+                    all_preds.extend(out.cpu().numpy().tolist())
+                    all_labels.extend(batch.y.reshape(-1).cpu().numpy().tolist())
 
-    if best_state is not None:
-        model.load_state_dict(best_state)
+            try:
+                auc = float(roc_auc_score(all_labels, all_preds))
+            except ValueError:
+                auc = 0.5
+
+            scheduler.step(auc)
+            if auc > best_auc:
+                best_auc = auc
+                torch.save(model.state_dict(), best_ckpt_path)
+
+            avg_loss = total_loss / max(grad_steps, 1)
+            history["train_loss"].append(avg_loss)
+            history["test_auc"].append(float(auc))
+            history["bad_batches"].append(int(bad_batches))
+
+            if track_grad_norm:
+                avg_grad_norm = total_grad_norm / max(grad_steps, 1)
+                history["grad_norm"].append(avg_grad_norm)
+                pbar.set_postfix(
+                    {
+                        "loss": avg_loss,
+                        "test_auc": auc,
+                        "grad": avg_grad_norm,
+                        "bad": bad_batches,
+                        "lr": optimizer.param_groups[0]["lr"],
+                    }
+                )
+            else:
+                pbar.set_postfix(
+                    {
+                        "loss": avg_loss,
+                        "test_auc": auc,
+                        "bad": bad_batches,
+                        "lr": optimizer.param_groups[0]["lr"],
+                    }
+                )
+
+        if best_auc > 0.0:
+            model.load_state_dict(torch.load(best_ckpt_path, map_location="cpu"))
     return best_auc, history, model

@@ -147,10 +147,10 @@ def plot_stage2_graph_anomaly(json_path: Path, output_path: Path | None = None) 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate Stage-2 plots from JSON outputs.")
     parser.add_argument("--task", choices=["graph_classification", "graph_anomaly", "all"], default="all")
-    parser.add_argument("--classification_json", default="code/outputs/stage2_graph_classification.json")
-    parser.add_argument("--anomaly_json", default="code/outputs/stage2_graph_anomaly.json")
-    parser.add_argument("--classification_out", default="code/outputs/stage2_graph_classification.png")
-    parser.add_argument("--anomaly_out", default="code/outputs/stage2_graph_anomaly.png")
+    parser.add_argument("--classification_json", default="outputs/stage2_graph_classification.json")
+    parser.add_argument("--anomaly_json", default="outputs/stage2_graph_anomaly.json")
+    parser.add_argument("--classification_out", default="outputs/stage2_graph_classification.png")
+    parser.add_argument("--anomaly_out", default="outputs/stage2_graph_anomaly.png")
     args = parser.parse_args()
 
     if args.task in ("graph_classification", "all"):

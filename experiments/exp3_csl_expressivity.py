@@ -321,7 +321,7 @@ def main():
             f"val_acc={summary['mean_val_acc']:.4f} ± {summary['std_val_acc']:.4f}"
         )
 
-    output_dir = Path("code/outputs")
+    output_dir = Path("outputs")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     results_path = output_dir / "exp3_csl_expressivity_cv.json"

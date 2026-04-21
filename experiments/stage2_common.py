@@ -1,4 +1,5 @@
 import random
+import tempfile
 from collections import deque
 
 import networkx as nx
@@ -63,86 +64,87 @@ def train_eval_graph_classification(
 
     if pin_memory is None:
         pin_memory = bool(device.type == "cuda")
-    amp_enabled = bool(use_amp and device.type in {"cuda", "cpu"})
+    amp_enabled = bool(use_amp and device.type == "cuda")
     amp_torch_dtype = torch.float16 if amp_dtype == "float16" else torch.bfloat16
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled and device.type == "cuda")
 
     best_acc = 0.0
-    best_state = None
+    best_ckpt_path = None
     history = {"train_loss": [], "test_acc": [], "bad_batches": []}
 
-    pbar = tqdm(range(epochs), desc=f"Training {model_name}")
-    for _ in pbar:
-        model.train()
-        total_loss = 0.0
-        grad_steps = 0
-        bad_batches = 0
-
+    with tempfile.TemporaryDirectory() as tmpdir:
+        best_ckpt_path = f"{tmpdir}/best_{model_name.replace('/', '_')}.pt"
         train_loader = _make_loader(train_data, batch_size, True, num_workers, pin_memory)
         test_loader = _make_loader(test_data, batch_size, False, num_workers, pin_memory)
+        pbar = tqdm(range(epochs), desc=f"Training {model_name}")
+        for _ in pbar:
+            model.train()
+            total_loss = 0.0
+            grad_steps = 0
+            bad_batches = 0
 
-        for batch in train_loader:
-            batch = batch.to(device, non_blocking=pin_memory)
-            optimizer.zero_grad()
-
-            with torch.autocast(device_type=device.type, dtype=amp_torch_dtype, enabled=amp_enabled):
-                out, _ = model(batch, task_level="graph")
-                y = batch.y.reshape(-1).long()
-                if not torch.isfinite(out).all():
-                    bad_batches += 1
-                    continue
-                loss = criterion(out, y)
-                if not torch.isfinite(loss):
-                    bad_batches += 1
-                    continue
-
-            if scaler.is_enabled():
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-            else:
-                loss.backward()
-
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            if not np.isfinite(float(grad_norm)):
-                optimizer.zero_grad(set_to_none=True)
-                if scaler.is_enabled():
-                    scaler.update()
-                bad_batches += 1
-                continue
-            if scaler.is_enabled():
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-            total_loss += float(loss.item())
-            grad_steps += 1
-
-        model.eval()
-        all_pred = []
-        all_y = []
-        with torch.no_grad():
-            for batch in test_loader:
+            for batch in train_loader:
                 batch = batch.to(device, non_blocking=pin_memory)
+                optimizer.zero_grad()
+
                 with torch.autocast(device_type=device.type, dtype=amp_torch_dtype, enabled=amp_enabled):
                     out, _ = model(batch, task_level="graph")
-                pred = out.argmax(dim=-1)
-                all_pred.extend(pred.cpu().numpy().tolist())
-                all_y.extend(batch.y.reshape(-1).cpu().numpy().tolist())
+                    y = batch.y.reshape(-1).long()
+                    if not torch.isfinite(out).all():
+                        bad_batches += 1
+                        continue
+                    loss = criterion(out, y)
+                    if not torch.isfinite(loss):
+                        bad_batches += 1
+                        continue
 
-        acc = float(accuracy_score(all_y, all_pred)) if all_y else 0.0
-        scheduler.step(acc)
-        if acc > best_acc:
-            best_acc = acc
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                if scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                else:
+                    loss.backward()
 
-        avg_loss = total_loss / max(grad_steps, 1)
-        history["train_loss"].append(avg_loss)
-        history["test_acc"].append(acc)
-        history["bad_batches"].append(int(bad_batches))
-        pbar.set_postfix({"loss": avg_loss, "test_acc": acc, "bad": bad_batches})
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                if not np.isfinite(float(grad_norm)):
+                    optimizer.zero_grad(set_to_none=True)
+                    if scaler.is_enabled():
+                        scaler.update()
+                    bad_batches += 1
+                    continue
+                if scaler.is_enabled():
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                total_loss += float(loss.item())
+                grad_steps += 1
 
-    if best_state is not None:
-        model.load_state_dict(best_state)
+            model.eval()
+            all_pred = []
+            all_y = []
+            with torch.no_grad():
+                for batch in test_loader:
+                    batch = batch.to(device, non_blocking=pin_memory)
+                    with torch.autocast(device_type=device.type, dtype=amp_torch_dtype, enabled=amp_enabled):
+                        out, _ = model(batch, task_level="graph")
+                    pred = out.argmax(dim=-1)
+                    all_pred.extend(pred.cpu().numpy().tolist())
+                    all_y.extend(batch.y.reshape(-1).cpu().numpy().tolist())
+
+            acc = float(accuracy_score(all_y, all_pred)) if all_y else 0.0
+            scheduler.step(acc)
+            if acc > best_acc:
+                best_acc = acc
+                torch.save(model.state_dict(), best_ckpt_path)
+
+            avg_loss = total_loss / max(grad_steps, 1)
+            history["train_loss"].append(avg_loss)
+            history["test_acc"].append(acc)
+            history["bad_batches"].append(int(bad_batches))
+            pbar.set_postfix({"loss": avg_loss, "test_acc": acc, "bad": bad_batches})
+
+        if best_acc > 0.0:
+            model.load_state_dict(torch.load(best_ckpt_path, map_location="cpu"))
     return best_acc, history
 
 
@@ -186,97 +188,98 @@ def train_eval_graph_anomaly(
 
     if pin_memory is None:
         pin_memory = bool(device.type == "cuda")
-    amp_enabled = bool(use_amp and device.type in {"cuda", "cpu"})
+    amp_enabled = bool(use_amp and device.type == "cuda")
     amp_torch_dtype = torch.float16 if amp_dtype == "float16" else torch.bfloat16
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled and device.type == "cuda")
 
     best_auc = 0.0
-    best_state = None
+    best_ckpt_path = None
     history = {"train_loss": [], "val_auc": [], "test_auc": [], "bad_batches": []}
 
-    pbar = tqdm(range(epochs), desc=f"Training {model_name}")
-    for _ in pbar:
-        model.train()
-        total_loss = 0.0
-        grad_steps = 0
-        bad_batches = 0
-
+    with tempfile.TemporaryDirectory() as tmpdir:
+        best_ckpt_path = f"{tmpdir}/best_{model_name.replace('/', '_')}.pt"
         train_loader = _make_loader(train_data, batch_size, True, num_workers, pin_memory)
         val_loader = _make_loader(val_data, batch_size, False, num_workers, pin_memory) if len(val_data) > 0 else None
         test_loader = _make_loader(test_data, batch_size, False, num_workers, pin_memory)
+        pbar = tqdm(range(epochs), desc=f"Training {model_name}")
+        for _ in pbar:
+            model.train()
+            total_loss = 0.0
+            grad_steps = 0
+            bad_batches = 0
 
-        for batch in train_loader:
-            batch = batch.to(device, non_blocking=pin_memory)
-            optimizer.zero_grad()
-            with torch.autocast(device_type=device.type, dtype=amp_torch_dtype, enabled=amp_enabled):
-                out, _ = model(batch, task_level="graph")
-                out = out.reshape(-1)
-                y = batch.y.reshape(-1).float()
-                if not torch.isfinite(out).all():
-                    bad_batches += 1
-                    continue
-                loss = criterion(out, y)
-                if not torch.isfinite(loss):
-                    bad_batches += 1
-                    continue
+            for batch in train_loader:
+                batch = batch.to(device, non_blocking=pin_memory)
+                optimizer.zero_grad()
+                with torch.autocast(device_type=device.type, dtype=amp_torch_dtype, enabled=amp_enabled):
+                    out, _ = model(batch, task_level="graph")
+                    out = out.reshape(-1)
+                    y = batch.y.reshape(-1).float()
+                    if not torch.isfinite(out).all():
+                        bad_batches += 1
+                        continue
+                    loss = criterion(out, y)
+                    if not torch.isfinite(loss):
+                        bad_batches += 1
+                        continue
 
-            if scaler.is_enabled():
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-            else:
-                loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            if not np.isfinite(float(grad_norm)):
-                optimizer.zero_grad(set_to_none=True)
                 if scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                else:
+                    loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                if not np.isfinite(float(grad_norm)):
+                    optimizer.zero_grad(set_to_none=True)
+                    if scaler.is_enabled():
+                        scaler.update()
+                    bad_batches += 1
+                    continue
+                if scaler.is_enabled():
+                    scaler.step(optimizer)
                     scaler.update()
-                bad_batches += 1
-                continue
-            if scaler.is_enabled():
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-            total_loss += float(loss.item())
-            grad_steps += 1
+                else:
+                    optimizer.step()
+                total_loss += float(loss.item())
+                grad_steps += 1
 
-        model.eval()
+            model.eval()
 
-        def eval_auc(eval_loader):
-            all_score = []
-            all_y = []
-            if eval_loader is None:
-                return 0.5
-            with torch.no_grad():
-                for batch in eval_loader:
-                    batch = batch.to(device, non_blocking=pin_memory)
-                    with torch.autocast(device_type=device.type, dtype=amp_torch_dtype, enabled=amp_enabled):
-                        out, _ = model(batch, task_level="graph")
-                    out = torch.nan_to_num(out.reshape(-1), nan=0.0, posinf=0.0, neginf=0.0)
-                    all_score.extend(torch.sigmoid(out).cpu().numpy().tolist())
-                    all_y.extend(batch.y.reshape(-1).cpu().numpy().tolist())
-            try:
-                return float(roc_auc_score(all_y, all_score))
-            except ValueError:
-                return 0.5
+            def eval_auc(eval_loader):
+                all_score = []
+                all_y = []
+                if eval_loader is None:
+                    return 0.5
+                with torch.no_grad():
+                    for batch in eval_loader:
+                        batch = batch.to(device, non_blocking=pin_memory)
+                        with torch.autocast(device_type=device.type, dtype=amp_torch_dtype, enabled=amp_enabled):
+                            out, _ = model(batch, task_level="graph")
+                        out = torch.nan_to_num(out.reshape(-1), nan=0.0, posinf=0.0, neginf=0.0)
+                        all_score.extend(torch.sigmoid(out).cpu().numpy().tolist())
+                        all_y.extend(batch.y.reshape(-1).cpu().numpy().tolist())
+                try:
+                    return float(roc_auc_score(all_y, all_score))
+                except ValueError:
+                    return 0.5
 
-        val_auc = eval_auc(val_loader) if val_loader is not None else eval_auc(test_loader)
-        test_auc = eval_auc(test_loader)
+            val_auc = eval_auc(val_loader) if val_loader is not None else eval_auc(test_loader)
+            test_auc = eval_auc(test_loader)
 
-        scheduler.step(val_auc)
-        if val_auc > best_auc:
-            best_auc = val_auc
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            scheduler.step(val_auc)
+            if val_auc > best_auc:
+                best_auc = val_auc
+                torch.save(model.state_dict(), best_ckpt_path)
 
-        avg_loss = total_loss / max(grad_steps, 1)
-        history["train_loss"].append(avg_loss)
-        history["val_auc"].append(val_auc)
-        history["test_auc"].append(test_auc)
-        history["bad_batches"].append(int(bad_batches))
-        pbar.set_postfix({"loss": avg_loss, "val_auc": val_auc, "test_auc": test_auc, "bad": bad_batches})
+            avg_loss = total_loss / max(grad_steps, 1)
+            history["train_loss"].append(avg_loss)
+            history["val_auc"].append(val_auc)
+            history["test_auc"].append(test_auc)
+            history["bad_batches"].append(int(bad_batches))
+            pbar.set_postfix({"loss": avg_loss, "val_auc": val_auc, "test_auc": test_auc, "bad": bad_batches})
 
-    if best_state is not None:
-        model.load_state_dict(best_state)
+        if best_auc > 0.0:
+            model.load_state_dict(torch.load(best_ckpt_path, map_location="cpu"))
     final_test_auc = history["test_auc"][-1] if history["test_auc"] else 0.5
     return final_test_auc, history
 

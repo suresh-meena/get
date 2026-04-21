@@ -256,12 +256,6 @@ class GETModel(nn.Module):
             nn.Linear(d, num_classes)
         )
         
-        if compile:
-            try:
-                self.forward = torch.compile(self.forward)
-            except Exception as e:
-                print(f"Warning: torch.compile failed: {e}")
-
     @property
     def eta(self):
         return self.eta_max * torch.sigmoid(self.eta_logit)

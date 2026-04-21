@@ -346,7 +346,7 @@ if __name__ == "__main__":
             m, s = mean_std(vals)
             print(f"  {cfg_name}: AUC={m:.4f} ± {s:.4f}, bad_batches_total={bad}")
 
-    os.makedirs("code/outputs", exist_ok=True)
+    os.makedirs("outputs", exist_ok=True)
     raw_out = {
         "args": vars(args),
         "seeds": seeds,
@@ -360,9 +360,9 @@ if __name__ == "__main__":
             "fullget_auc_std": full_std,
         },
     }
-    with open("code/outputs/exp2_triangle_counting_raw.json", "w", encoding="utf-8") as f:
+    with open("outputs/exp2_triangle_counting_raw.json", "w", encoding="utf-8") as f:
         json.dump(raw_out, f, indent=2)
-    print("Raw logs saved to code/outputs/exp2_triangle_counting_raw.json")
+    print("Raw logs saved to outputs/exp2_triangle_counting_raw.json")
 
     import matplotlib.pyplot as plt
 
@@ -391,5 +391,5 @@ if __name__ == "__main__":
         ax.legend()
 
     plt.tight_layout()
-    plt.savefig("code/outputs/exp2_triangle_counting.png")
-    print("Plot saved to code/outputs/exp2_triangle_counting.png")
+    plt.savefig("outputs/exp2_triangle_counting.png")
+    print("Plot saved to outputs/exp2_triangle_counting.png")

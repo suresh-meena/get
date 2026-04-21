@@ -33,14 +33,31 @@ def _extract_motif_indices(adj, max_motifs_per_node=None):
     u_3 = []
     v_3 = []
     t_tau = []
+    num_nodes = len(adj)
+    adj_dense = torch.zeros((num_nodes, num_nodes), dtype=torch.bool)
+    for src, neighbors in enumerate(adj):
+        if neighbors:
+            nbr_idx = torch.tensor(sorted(neighbors), dtype=torch.long)
+            adj_dense[src, nbr_idx] = True
 
     for center, neighbors_set in enumerate(adj):
         neighbors = sorted(neighbors_set)
-        node_motifs = []
-        for idx1, left in enumerate(neighbors):
-            for right in neighbors[idx1 + 1 :]:
-                is_closed = 1 if right in adj[left] else 0
-                node_motifs.append((center, left, right, is_closed))
+        if len(neighbors) < 2:
+            continue
+        neighbors_t = torch.tensor(neighbors, dtype=torch.long)
+        pair_idx = torch.triu_indices(neighbors_t.numel(), neighbors_t.numel(), offset=1)
+        left = neighbors_t[pair_idx[0]]
+        right = neighbors_t[pair_idx[1]]
+        closed = adj_dense[left, right].to(dtype=torch.long)
+
+        node_motifs = list(
+            zip(
+                [center] * left.numel(),
+                left.tolist(),
+                right.tolist(),
+                closed.tolist(),
+            )
+        )
 
         node_motifs.sort(key=lambda x: (-x[3], x[1], x[2]))
         node_motifs = _apply_motif_budget_with_ties(node_motifs, max_motifs_per_node)
@@ -97,22 +114,43 @@ def align_pairwise_edge_attr(edges_list, edge_attr, c_2, u_2):
             f"{len(edges_list)} edges and {c_2.numel()} incidences."
         )
 
-    edge_lookup = {}
-    for idx, (src, dst) in enumerate(edges_list):
-        src = int(src)
-        dst = int(dst)
-        edge_lookup[(src, dst)] = edge_attr[idx]
-        edge_lookup[(dst, src)] = edge_attr[idx]
-
-    aligned = []
-    for src, dst in zip(c_2.tolist(), u_2.tolist()):
-        try:
-            aligned.append(edge_lookup[(int(src), int(dst))])
-        except KeyError as exc:
-            raise ValueError(f"Missing edge_attr for directed edge ({src}, {dst}).") from exc
-    if not aligned:
+    if c_2.numel() == 0:
         return edge_attr.new_empty((0, *edge_attr.shape[1:]))
-    return torch.stack(aligned, dim=0)
+
+    max_node_id = -1
+    for src, dst in edges_list:
+        src_i = int(src)
+        dst_i = int(dst)
+        if src_i > max_node_id:
+            max_node_id = src_i
+        if dst_i > max_node_id:
+            max_node_id = dst_i
+    if c_2.numel() > 0:
+        max_node_id = max(max_node_id, int(torch.max(c_2).item()), int(torch.max(u_2).item()))
+    stride = max_node_id + 1
+
+    undirected_key = torch.empty((len(edges_list),), dtype=torch.long)
+    for idx, (src, dst) in enumerate(edges_list):
+        src_i = int(src)
+        dst_i = int(dst)
+        undirected_key[idx] = src_i * stride + dst_i
+    directed_key = torch.cat([undirected_key, (undirected_key % stride) * stride + (undirected_key // stride)], dim=0)
+    directed_attr = torch.cat([edge_attr, edge_attr], dim=0)
+
+    sort_idx = torch.argsort(directed_key)
+    sorted_key = directed_key[sort_idx]
+    sorted_attr = directed_attr[sort_idx]
+
+    query_key = c_2.to(dtype=torch.long) * stride + u_2.to(dtype=torch.long)
+    pos = torch.searchsorted(sorted_key, query_key)
+    safe_pos = pos.clamp(max=max(sorted_key.numel() - 1, 0))
+    invalid = (pos >= sorted_key.numel()) | (sorted_key[safe_pos] != query_key)
+    if bool(invalid.any()):
+        missing_idx = int(torch.nonzero(invalid, as_tuple=False)[0].item())
+        src = int(c_2[missing_idx].item())
+        dst = int(u_2[missing_idx].item())
+        raise ValueError(f"Missing edge_attr for directed edge ({src}, {dst}).")
+    return sorted_attr[pos]
 
 
 def add_structural_node_features(

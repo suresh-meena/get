@@ -198,7 +198,7 @@ def run_stage2_graph_classification(args, device):
         },
         "runs": results,
     }
-    out_path = Path("code/outputs/stage2_graph_classification.json")
+    out_path = Path("outputs/stage2_graph_classification.json")
     _save_json(out_path, out)
     print(f"Saved {out_path}")
     if args.plot:
@@ -386,7 +386,7 @@ def run_stage2_graph_anomaly(args, device):
         "summary": summary,
         "runs": results,
     }
-    out_path = Path("code/outputs/stage2_graph_anomaly.json")
+    out_path = Path("outputs/stage2_graph_anomaly.json")
     _save_json(out_path, out)
     print(f"Saved {out_path}")
     if args.plot:
@@ -445,8 +445,8 @@ def main():
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--pin_memory", action="store_true")
     parser.add_argument("--plot", action="store_true", help="Generate PNG plots after writing JSON outputs.")
-    parser.add_argument("--classification_plot_path", default="code/outputs/stage2_graph_classification.png")
-    parser.add_argument("--anomaly_plot_path", default="code/outputs/stage2_graph_anomaly.png")
+    parser.add_argument("--classification_plot_path", default="outputs/stage2_graph_classification.png")
+    parser.add_argument("--anomaly_plot_path", default="outputs/stage2_graph_anomaly.png")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
