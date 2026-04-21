@@ -1,20 +1,8 @@
 import torch
 import torch.nn as nn
 
-from .energy import positive_param, inverse_temperature
+from .energy import positive_param, inverse_temperature, segment_logsumexp
 from .model import StableMLP
-
-
-def _segment_logsumexp(x, segment_ids, num_segments):
-    max_val = torch.full((num_segments,), float("-inf"), dtype=x.dtype, device=x.device)
-    max_val.scatter_reduce_(0, segment_ids, x, reduce="amax", include_self=False)
-    max_val = torch.where(max_val == float("-inf"), torch.zeros_like(max_val), max_val)
-    x_centered = x - max_val[segment_ids]
-    exp_x = torch.exp(x_centered)
-    sum_exp = torch.zeros(num_segments, dtype=x.dtype, device=x.device)
-    sum_exp.scatter_add_(0, segment_ids, exp_x)
-    is_empty = (sum_exp == 0).to(dtype=x.dtype)
-    return torch.log(sum_exp + is_empty) + max_val
 
 
 def _laplacian_positional_encoding(adj, k, training=False):
@@ -220,19 +208,25 @@ class ETFaithfulGraphModel(nn.Module):
         num_tokens = int(x_aug.size(0))
         e_att = x_aug.new_zeros(())
         for h in range(self.num_heads):
-            lse_h = _segment_logsumexp(beta_att * ell[:, h], c_aug, num_tokens)
+            lse_h = segment_logsumexp(beta_att * ell[:, h], c_aug, num_tokens)
             e_att = e_att + (lambda_att / beta_att) * lse_h.sum()
 
-        e_mem = x_aug.new_zeros(())
-        if self.K > 0 and positive_param({"lam": self.lambda_m}, "lam") > 1e-6:
-            q_m = g @ self.W_Qm
-            k_m = self.B_mem @ self.W_Km
-            logits_m = (q_m @ k_m.t()) / (self.d ** 0.5)
-            beta_m = inverse_temperature({"beta": self.beta_m}, "beta", beta_max=self.beta_max)
-            lambda_m = positive_param({"lam": self.lambda_m}, "lam")
-            e_mem = (lambda_m / beta_m) * torch.logsumexp(beta_m * logits_m, dim=1).sum()
-
-        e_quad = 0.5 * (x_aug ** 2).sum()
+        from .energy import compute_memory_energy, compute_quadratic_energy
+        params = {
+            'd': self.d,
+            'K': self.K,
+            'lambda_m': self.lambda_m,
+            'beta_m': self.beta_m,
+            'beta_max': self.beta_max,
+        }
+        if self.K > 0:
+            params['W_Qm'] = self.W_Qm
+            params['W_Km'] = self.W_Km
+            params['B_mem'] = self.B_mem
+            
+        e_mem = compute_memory_energy(g, params, None)
+        e_quad = compute_quadratic_energy(x_aug)
+        
         return e_quad - e_att - e_mem
 
     def _solve_dynamics(self, x_aug, c_aug, u_aug):

@@ -13,8 +13,7 @@ from sklearn.metrics import accuracy_score
 from sklearn.model_selection import StratifiedKFold
 from tqdm.auto import tqdm
 
-from get import FullGET, GINBaseline, PairwiseGET, build_adamw_optimizer
-from get.compile_utils import maybe_compile_model
+from get import FullGET, GINBaseline, PairwiseGET, build_adamw_optimizer, maybe_compile_model
 from get.data import collate_get_batch
 
 

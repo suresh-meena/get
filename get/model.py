@@ -49,11 +49,12 @@ class GETLayer(nn.Module):
                  beta_2=1.0, beta_3=1.0, beta_m=1.0,
                  grad_clip_norm=1.0, beta_max=5.0, state_clip_norm=10.0,
                  update_damping=1.0, learn_update_damping=False,
-                 pairwise_symmetric=False):
+                 pairwise_symmetric=False, noise_std=0.0):
         super().__init__()
         self.d = d
         self.R = R
         self.K = K
+        self.noise_std = float(noise_std)
         self.grad_clip_norm = grad_clip_norm
         self.beta_max = beta_max
         self.state_clip_norm = state_clip_norm
@@ -222,6 +223,8 @@ class GETLayer(nn.Module):
                 grad_norm = grad_X.norm(dim=-1, keepdim=True).clamp_min(1e-6)
                 grad_scale = (self.grad_clip_norm / grad_norm).clamp(max=1.0)
                 grad_X = grad_X * grad_scale
+            if is_training and self.noise_std > 0.0:
+                grad_X = grad_X + torch.randn_like(grad_X) * self.noise_std
             
         X_next = X - (step_size * self.update_damping) * grad_X
         if apply_state_clipping and self.state_clip_norm is not None:
@@ -233,12 +236,16 @@ class GETLayer(nn.Module):
 class GETModel(nn.Module):
     def __init__(self, in_dim, d, num_classes, num_steps=8, compile=False,
                  eta=0.05, eta_max=0.25, dropout=0.1,
-                 encoder_hidden_mult=2, readout_hidden_mult=2, **layer_kwargs):
+                 encoder_hidden_mult=2, readout_hidden_mult=2, pe_k=0, **layer_kwargs):
         super().__init__()
         self.d = d
         self.num_steps = num_steps
         self.eta_max = eta_max
+        self.pe_k = pe_k
         
+        if self.pe_k > 0:
+            self.pe_proj = nn.Linear(pe_k, d)
+
         self.node_encoder = StableMLP(
             in_dim,
             d,
@@ -437,6 +444,15 @@ class GETModel(nn.Module):
             x = x.view(-1, 1).float()
             
         X = self.node_encoder(x)
+        
+        if self.pe_k > 0 and hasattr(batch_data, 'pe') and batch_data.pe is not None:
+            pe = batch_data.pe
+            if self.training and pe.numel() > 0:
+                signs = torch.randint(0, 2, (pe.size(1),), device=pe.device, dtype=torch.long)
+                signs = (2 * signs - 1).to(dtype=pe.dtype)
+                pe = pe * signs[None, :]
+            X = X + self.pe_proj(pe)
+            
         static_projections = self._build_static_projections(batch_data)
 
         if inference_mode == 'fixed':

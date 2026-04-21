@@ -10,8 +10,7 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import roc_auc_score
 from tqdm.auto import tqdm
 
-from get import build_adamw_optimizer
-from get.compile_utils import maybe_compile_model
+from get import build_adamw_optimizer, maybe_compile_model
 from get.data import collate_get_batch
 
 

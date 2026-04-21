@@ -1,4 +1,7 @@
 import torch
+import os
+import hashlib
+from tqdm.auto import tqdm
 
 
 def _build_undirected_adjacency(num_nodes, edges_list):
@@ -75,6 +78,32 @@ def _extract_motif_indices(adj, max_motifs_per_node=None):
 
 def _to_long_tensor(values):
     return torch.tensor(values, dtype=torch.long)
+
+def get_laplacian_pe(num_nodes, edges_list, k=16):
+    if k <= 0:
+        return torch.zeros((num_nodes, 0), dtype=torch.float32)
+    if num_nodes <= 1:
+        return torch.zeros((num_nodes, k), dtype=torch.float32)
+
+    adj = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
+    for u, v in edges_list:
+        adj[int(u), int(v)] = 1.0
+        adj[int(v), int(u)] = 1.0
+
+    deg = adj.sum(dim=1)
+    inv_sqrt_deg = torch.zeros_like(deg)
+    valid = deg > 0
+    inv_sqrt_deg[valid] = deg[valid].pow(-0.5)
+    l = torch.eye(num_nodes, dtype=torch.float32) - (inv_sqrt_deg[:, None] * adj * inv_sqrt_deg[None, :])
+
+    evals, evecs = torch.linalg.eigh(l)
+    order = torch.argsort(evals)
+    evecs = evecs[:, order]
+    use = evecs[:, 1 : 1 + k]
+    if use.size(1) < k:
+        use = torch.cat([use, torch.zeros((num_nodes, k - use.size(1)), dtype=use.dtype)], dim=1)
+
+    return use
 
 def get_incidence_matrices(num_nodes, edges_list, max_motifs_per_node=None):
     """
@@ -209,9 +238,60 @@ def add_structural_node_features(
     return enriched
 
 
+class CachedGraphDataset:
+    """Wrapper to compute and cache motif incidence matrices to disk."""
+    def __init__(self, dataset, cache_dir=".cache/get_data", name="dataset", max_motifs=None, pe_k=0):
+        self.dataset = dataset
+        self.cache_dir = cache_dir
+        self.name = name
+        self.max_motifs = max_motifs
+        self.pe_k = pe_k
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        sample_str = str([g.get('edges', [])[:5] for g in dataset[:5]])
+        hash_val = hashlib.md5((name + str(max_motifs) + str(pe_k) + sample_str + str(len(dataset))).encode()).hexdigest()[:8]
+        self.cache_path = os.path.join(cache_dir, f"{name}_{hash_val}.pt")
+        
+        if os.path.exists(self.cache_path):
+            print(f"Loading cached dataset from {self.cache_path}")
+            self.cached_data = torch.load(self.cache_path, weights_only=False)
+        else:
+            print(f"Processing and caching dataset to {self.cache_path}...")
+            self.cached_data = self._process_all()
+            torch.save(self.cached_data, self.cache_path)
+            
+    def _process_all(self):
+        processed = []
+        for g in tqdm(self.dataset, desc="Caching incidence matrices"):
+            num_nodes = g['x'].size(0)
+            c_2, u_2, c_3, u_3, v_3, t_tau = get_incidence_matrices(num_nodes, g['edges'], self.max_motifs)
+            
+            item = dict(g)
+            item['c_2'] = c_2
+            item['u_2'] = u_2
+            item['c_3'] = c_3
+            item['u_3'] = u_3
+            item['v_3'] = v_3
+            item['t_tau'] = t_tau
+            if self.pe_k > 0:
+                item['pe'] = get_laplacian_pe(num_nodes, g['edges'], self.pe_k)
+            
+            if 'edge_attr' in g:
+                item['aligned_edge_attr'] = align_pairwise_edge_attr(g['edges'], g['edge_attr'], c_2, u_2)
+            
+            processed.append(item)
+        return processed
+        
+    def __len__(self):
+        return len(self.cached_data)
+        
+    def __getitem__(self, idx):
+        return self.cached_data[idx]
+
+
 class GETBatch:
     """A data class representing a batch of graphs for the GET model."""
-    def __init__(self, x, c_2, u_2, c_3, u_3, v_3, t_tau, batch, ptr, y=None, edge_attr=None):
+    def __init__(self, x, c_2, u_2, c_3, u_3, v_3, t_tau, batch, ptr, y=None, edge_attr=None, pe=None):
         self.x = x
         self.c_2 = c_2
         self.u_2 = u_2
@@ -223,6 +303,7 @@ class GETBatch:
         self.ptr = ptr
         self.y = y
         self.edge_attr = edge_attr
+        self.pe = pe
         self.num_nodes = x.size(0)
 
     def to(self, device, non_blocking=False):
@@ -239,6 +320,8 @@ class GETBatch:
             self.y = self.y.to(device, non_blocking=non_blocking)
         if self.edge_attr is not None:
             self.edge_attr = self.edge_attr.to(device, non_blocking=non_blocking)
+        if self.pe is not None:
+            self.pe = self.pe.to(device, non_blocking=non_blocking)
         return self
 
 def collate_get_batch(graph_list, max_motifs=None):
@@ -256,6 +339,7 @@ def collate_get_batch(graph_list, max_motifs=None):
     ptr_list = [0]
     y_list = []
     edge_attr_list = []
+    pe_list = []
     
     node_offset = 0
     
@@ -263,7 +347,11 @@ def collate_get_batch(graph_list, max_motifs=None):
         num_nodes = g['x'].size(0)
         x_list.append(g['x'])
         
-        c_2, u_2, c_3, u_3, v_3, t_tau = get_incidence_matrices(num_nodes, g['edges'], max_motifs)
+        if 'c_2' in g:
+            c_2, u_2 = g['c_2'], g['u_2']
+            c_3, u_3, v_3, t_tau = g['c_3'], g['u_3'], g['v_3'], g['t_tau']
+        else:
+            c_2, u_2, c_3, u_3, v_3, t_tau = get_incidence_matrices(num_nodes, g['edges'], max_motifs)
         
         c_2_list.append(c_2 + node_offset)
         u_2_list.append(u_2 + node_offset)
@@ -277,8 +365,13 @@ def collate_get_batch(graph_list, max_motifs=None):
         
         if 'y' in g:
             y_list.append(g['y'])
-        if 'edge_attr' in g:
+        if 'aligned_edge_attr' in g:
+            edge_attr_list.append(g['aligned_edge_attr'])
+        elif 'edge_attr' in g:
             edge_attr_list.append(align_pairwise_edge_attr(g['edges'], g['edge_attr'], c_2, u_2))
+        
+        if 'pe' in g:
+            pe_list.append(g['pe'])
             
         node_offset += num_nodes
         
@@ -293,5 +386,6 @@ def collate_get_batch(graph_list, max_motifs=None):
     ptr = torch.tensor(ptr_list, dtype=torch.long)
     y = torch.cat(y_list, dim=0) if y_list else None
     edge_attr = torch.cat(edge_attr_list, dim=0) if edge_attr_list else None
+    pe = torch.cat(pe_list, dim=0) if pe_list else None
     
-    return GETBatch(x, c_2, u_2, c_3, u_3, v_3, t_tau, batch, ptr, y, edge_attr)
+    return GETBatch(x, c_2, u_2, c_3, u_3, v_3, t_tau, batch, ptr, y, edge_attr, pe=pe)

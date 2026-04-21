@@ -12,8 +12,7 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import accuracy_score, roc_auc_score
 from tqdm.auto import tqdm
 
-from get import build_adamw_optimizer
-from get.compile_utils import maybe_compile_model
+from get import build_adamw_optimizer, maybe_compile_model
 from get.data import collate_get_batch
 
 
@@ -49,6 +48,7 @@ def train_eval_graph_classification(
     num_workers=0,
     pin_memory=None,
     max_motifs=None,
+    split_data=None,
 ):
     model = model.to(device)
     model = maybe_compile_model(model, compile_model, model_name=model_name)
@@ -56,13 +56,17 @@ def train_eval_graph_classification(
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=10)
     criterion = nn.CrossEntropyLoss()
 
-    indices = list(range(len(dataset)))
-    split_rng = random.Random(seed)
-    split_rng.shuffle(indices)
-    cut = int(0.8 * len(indices))
-    train_idx = set(indices[:cut])
-    train_data = [dataset[i] for i in range(len(dataset)) if i in train_idx]
-    test_data = [dataset[i] for i in range(len(dataset)) if i not in train_idx]
+    if split_data is None:
+        indices = list(range(len(dataset)))
+        split_rng = random.Random(seed)
+        split_rng.shuffle(indices)
+        cut = int(0.8 * len(indices))
+        train_idx = set(indices[:cut])
+        train_data = [dataset[i] for i in range(len(dataset)) if i in train_idx]
+        test_data = [dataset[i] for i in range(len(dataset)) if i not in train_idx]
+    else:
+        train_data = split_data["train"]
+        test_data = split_data["test"]
 
     if pin_memory is None:
         pin_memory = bool(device.type == "cuda")
@@ -173,7 +177,6 @@ def train_eval_graph_anomaly(
     model = maybe_compile_model(model, compile_model, model_name=model_name)
     optimizer = build_adamw_optimizer(model, lr=lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=10)
-    criterion = nn.BCEWithLogitsLoss()
 
     if split_data is None:
         indices = list(range(len(dataset)))
@@ -189,6 +192,11 @@ def train_eval_graph_anomaly(
         val_data = split_data["val"]
         test_data = split_data["test"]
 
+    num_pos = sum(float(g["y"].item()) > 0.0 for g in train_data)
+    num_neg = len(train_data) - num_pos
+    pos_weight = torch.tensor([num_neg / max(1.0, num_pos)], dtype=torch.float32, device=device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
     if pin_memory is None:
         pin_memory = bool(device.type == "cuda")
     amp_enabled = bool(use_amp and device.type == "cuda")
@@ -197,7 +205,7 @@ def train_eval_graph_anomaly(
 
     best_auc = 0.0
     best_ckpt_path = None
-    history = {"train_loss": [], "val_auc": [], "test_auc": [], "bad_batches": []}
+    history = {"train_loss": [], "val_auc": [], "val_f1": [], "test_auc": [], "test_f1": [], "bad_batches": []}
 
     with tempfile.TemporaryDirectory() as tmpdir:
         best_ckpt_path = f"{tmpdir}/best_{model_name.replace('/', '_')}.pt"
@@ -252,11 +260,11 @@ def train_eval_graph_anomaly(
 
             model.eval()
 
-            def eval_auc(eval_loader):
+            def eval_metrics(eval_loader):
                 all_score = []
                 all_y = []
                 if eval_loader is None:
-                    return 0.5
+                    return 0.5, 0.0
                 with torch.no_grad():
                     for batch in eval_loader:
                         batch = batch.to(device, non_blocking=pin_memory)
@@ -266,12 +274,19 @@ def train_eval_graph_anomaly(
                         all_score.extend(torch.sigmoid(out).cpu().numpy().tolist())
                         all_y.extend(batch.y.reshape(-1).cpu().numpy().tolist())
                 try:
-                    return float(roc_auc_score(all_y, all_score))
+                    auc = float(roc_auc_score(all_y, all_score))
                 except ValueError:
-                    return 0.5
+                    auc = 0.5
+                try:
+                    from sklearn.metrics import f1_score
+                    preds = [1.0 if s >= 0.5 else 0.0 for s in all_score]
+                    f1 = float(f1_score(all_y, preds, average='macro', zero_division=0))
+                except ValueError:
+                    f1 = 0.0
+                return auc, f1
 
-            val_auc = eval_auc(val_loader) if val_loader is not None else eval_auc(test_loader)
-            test_auc = eval_auc(test_loader)
+            val_auc, val_f1 = eval_metrics(val_loader) if val_loader is not None else eval_metrics(test_loader)
+            test_auc, test_f1 = eval_metrics(test_loader)
 
             scheduler.step(val_auc)
             if val_auc > best_auc:
@@ -281,14 +296,17 @@ def train_eval_graph_anomaly(
             avg_loss = total_loss / max(grad_steps, 1)
             history["train_loss"].append(avg_loss)
             history["val_auc"].append(val_auc)
+            history["val_f1"].append(val_f1)
             history["test_auc"].append(test_auc)
+            history["test_f1"].append(test_f1)
             history["bad_batches"].append(int(bad_batches))
             pbar.set_postfix({"loss": avg_loss, "val_auc": val_auc, "test_auc": test_auc, "bad": bad_batches})
 
         if best_auc > 0.0:
             model.load_state_dict(torch.load(best_ckpt_path, map_location="cpu"))
     final_test_auc = history["test_auc"][-1] if history["test_auc"] else 0.5
-    return final_test_auc, history
+    final_test_f1 = history["test_f1"][-1] if history["test_f1"] else 0.0
+    return final_test_auc, final_test_f1, history
 
 
 def generate_synth_graph_classification(num_graphs=300, n_nodes=24, seed=0, num_classes=3):
