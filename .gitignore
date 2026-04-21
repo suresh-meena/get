@@ -1,6 +1,8 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+**/__pycache__/
 *.py[codz]
+**/*.py[cod]
 *$py.class
 
 # C extensions
@@ -208,3 +210,8 @@ __marimo__/
 
 .codex
 .vscode
+
+# Byte-compiled / cache files
+*/__pycache__/
+*.pyc
+*.pyo
