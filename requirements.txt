@@ -1,0 +1,21 @@
+# Core numerical and ML stack
+numpy
+torch
+
+# Graph processing and utilities
+networkx
+
+# Metrics and progress
+scikit-learn
+tqdm
+
+# Plotting
+matplotlib
+
+# Test runner
+pytest
+
+# Optional: required for GIN baseline, TU datasets, and node anomaly datasets.
+# Install with compatible wheels for your torch/cuda version from:
+# https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html
+torch-geometric
