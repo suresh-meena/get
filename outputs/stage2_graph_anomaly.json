@@ -1,0 +1,100 @@
+{
+  "task": "graph_anomaly",
+  "dataset": "synth",
+  "summary": {
+    "0.4": {
+      "pairwise_mean": 0.375,
+      "pairwise_std": 0.0,
+      "fullget_mean": 0.9166666666666667,
+      "fullget_std": 0.0,
+      "et_local_mean": 0.875,
+      "et_local_std": 0.0,
+      "et_complete_mean": 0.5,
+      "et_complete_std": 0.0
+    }
+  },
+  "runs": {
+    "0.4": [
+      {
+        "seed": 123,
+        "pairwise_auc": 0.375,
+        "fullget_auc": 0.9166666666666667,
+        "gin_auc": 0.0,
+        "et_local_auc": 0.875,
+        "et_complete_auc": 0.5,
+        "histories": {
+          "pairwise": {
+            "train_loss": [
+              0.7532308101654053
+            ],
+            "val_auc": [
+              0.25
+            ],
+            "test_auc": [
+              0.375
+            ],
+            "bad_batches": [
+              1
+            ]
+          },
+          "fullget": {
+            "train_loss": [
+              0.5160205364227295
+            ],
+            "val_auc": [
+              0.5
+            ],
+            "test_auc": [
+              0.9166666666666667
+            ],
+            "bad_batches": [
+              1
+            ]
+          },
+          "gin": {
+            "train_loss": [
+              0.0
+            ],
+            "val_auc": [
+              0.0
+            ],
+            "test_auc": [
+              0.0
+            ],
+            "bad_batches": [
+              2
+            ]
+          },
+          "et_local": {
+            "train_loss": [
+              0.881909191608429
+            ],
+            "val_auc": [
+              0.75
+            ],
+            "test_auc": [
+              0.875
+            ],
+            "bad_batches": [
+              1
+            ]
+          },
+          "et_complete": {
+            "train_loss": [
+              0.6327877342700958
+            ],
+            "val_auc": [
+              0.5
+            ],
+            "test_auc": [
+              0.5
+            ],
+            "bad_batches": [
+              0
+            ]
+          }
+        }
+      }
+    ]
+  }
+}

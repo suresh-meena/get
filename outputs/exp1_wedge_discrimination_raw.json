@@ -1,0 +1,77 @@
+{
+  "args": {
+    "num_pairs": 20,
+    "epochs": 1,
+    "batch_size": 8,
+    "seeds": "123",
+    "seed": null,
+    "no_sweep": true,
+    "compile": false
+  },
+  "seeds": [
+    123
+  ],
+  "runs": [
+    {
+      "seed": 123,
+      "metrics": {
+        "pairwise_auc": 0.5,
+        "gin_auc": 0.5,
+        "fullget_auc": 0.9375
+      },
+      "histories": {
+        "pairwise": {
+          "train_loss": [
+            0.7606926560401917
+          ],
+          "test_auc": [
+            0.5
+          ],
+          "bad_batches": [
+            0
+          ]
+        },
+        "gin": {
+          "train_loss": [
+            0.70905601978302
+          ],
+          "test_auc": [
+            0.5
+          ],
+          "bad_batches": [
+            0
+          ]
+        },
+        "fullget": {
+          "train_loss": [
+            0.7051673233509064
+          ],
+          "test_auc": [
+            0.9375
+          ],
+          "bad_batches": [
+            0
+          ],
+          "grad_norm": [
+            5.840798795223236
+          ]
+        }
+      },
+      "sweep_results": [
+        {
+          "name": "single",
+          "auc": 0.9375,
+          "bad_total": 0
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "pairwise_auc_mean": 0.5,
+    "pairwise_auc_std": 0.0,
+    "gin_auc_mean": 0.5,
+    "gin_auc_std": 0.0,
+    "fullget_auc_mean": 0.9375,
+    "fullget_auc_std": 0.0
+  }
+}

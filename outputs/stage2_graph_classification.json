@@ -1,0 +1,81 @@
+{
+  "task": "graph_classification",
+  "dataset": "synth",
+  "summary": {
+    "pairwise_mean": 0.6,
+    "pairwise_std": 0.0,
+    "fullget_mean": 0.4,
+    "fullget_std": 0.0,
+    "et_local_mean": 0.6,
+    "et_local_std": 0.0,
+    "et_complete_mean": 0.6,
+    "et_complete_std": 0.0
+  },
+  "runs": [
+    {
+      "seed": 123,
+      "pairwise_acc": 0.6,
+      "fullget_acc": 0.4,
+      "gin_acc": 0.4,
+      "et_local_acc": 0.6,
+      "et_complete_acc": 0.6,
+      "histories": {
+        "pairwise": {
+          "train_loss": [
+            1.233019272486369
+          ],
+          "test_acc": [
+            0.6
+          ],
+          "bad_batches": [
+            0
+          ]
+        },
+        "fullget": {
+          "train_loss": [
+            0.9222248792648315
+          ],
+          "test_acc": [
+            0.4
+          ],
+          "bad_batches": [
+            0
+          ]
+        },
+        "gin": {
+          "train_loss": [
+            1.2294083833694458
+          ],
+          "test_acc": [
+            0.4
+          ],
+          "bad_batches": [
+            0
+          ]
+        },
+        "et_local": {
+          "train_loss": [
+            1.0045968890190125
+          ],
+          "test_acc": [
+            0.6
+          ],
+          "bad_batches": [
+            0
+          ]
+        },
+        "et_complete": {
+          "train_loss": [
+            1.0767764051755269
+          ],
+          "test_acc": [
+            0.6
+          ],
+          "bad_batches": [
+            0
+          ]
+        }
+      }
+    }
+  ]
+}
