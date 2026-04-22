@@ -27,6 +27,74 @@ def mean_std(xs):
     arr = np.array(xs, dtype=np.float64)
     return float(arr.mean()), float(arr.std())
 
+
+def _signed_margin_loss(logits, target, margin):
+    signed_target = torch.where(target.view(-1) >= 0.5, 1.0, -1.0)
+    return torch.relu(float(margin) - signed_target * logits.view(-1)).mean()
+
+
+def split_grouped_dataset(dataset, split_key, seed, train_ratio=0.70, val_ratio=0.15):
+    ids = sorted({g[split_key] for g in dataset})
+    if len(ids) == 0:
+        return [], [], []
+    if len(ids) == 1:
+        return list(dataset), list(dataset[:1]), list(dataset[:1])
+
+    labels_by_id = {}
+    for g in dataset:
+        if "y" not in g:
+            continue
+        labels_by_id.setdefault(g[split_key], set()).add(float(g["y"].reshape(-1)[0].item()))
+
+    homogeneous_binary = all(
+        len(labels_by_id.get(group_id, set())) == 1
+        and next(iter(labels_by_id[group_id])) in (0.0, 1.0)
+        for group_id in ids
+    )
+
+    rng = random.Random(int(seed))
+
+    def _partition_ids(pool, rng_obj, train_r, val_r):
+        pool = list(pool)
+        rng_obj.shuffle(pool)
+        if len(pool) < 3:
+            if len(pool) == 2:
+                return [pool[0]], [pool[1]], [pool[1]]
+            return pool, [], []
+
+        train_cut = max(1, int(train_r * len(pool)))
+        val_count = max(1, int(val_r * len(pool)))
+        if train_cut + val_count >= len(pool):
+            train_cut = max(1, len(pool) - 2)
+            val_count = 1
+        val_cut = train_cut + val_count
+        return pool[:train_cut], pool[train_cut:val_cut], pool[val_cut:]
+
+    if homogeneous_binary:
+        train_parts, val_parts, test_parts = [], [], []
+        for label in (0.0, 1.0):
+            class_ids = [group_id for group_id in ids if next(iter(labels_by_id[group_id])) == label]
+            train_i, val_i, test_i = _partition_ids(class_ids, rng, train_ratio, val_ratio)
+            train_parts.extend(train_i)
+            val_parts.extend(val_i)
+            test_parts.extend(test_i)
+        rng.shuffle(train_parts)
+        rng.shuffle(val_parts)
+        rng.shuffle(test_parts)
+        train_ids = set(train_parts)
+        val_ids = set(val_parts)
+        test_ids = set(test_parts)
+    else:
+        train_i, val_i, test_i = _partition_ids(ids, rng, train_ratio, val_ratio)
+        train_ids = set(train_i)
+        val_ids = set(val_i)
+        test_ids = set(test_i)
+
+    train_data = [g for g in dataset if g[split_key] in train_ids]
+    val_data = [g for g in dataset if g[split_key] in val_ids]
+    test_data = [g for g in dataset if g[split_key] in test_ids]
+    return train_data, val_data, test_data
+
 def save_results(name, payload):
     Path("outputs").mkdir(parents=True, exist_ok=True)
     path = Path("outputs") / f"{name}.json"
@@ -255,6 +323,8 @@ class GETTrainer:
         self.lr = kwargs.get('lr', 1e-4)
         self.weight_decay = kwargs.get('weight_decay', 1e-5)
         self.max_grad_norm = kwargs.get('max_grad_norm', 1.0)
+        self.margin_loss_weight = float(kwargs.get('margin_loss_weight', 0.0))
+        self.logit_margin = float(kwargs.get('logit_margin', 1.0))
         self.use_amp = (device == 'cuda' or 'cuda' in str(device))
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
         
@@ -277,6 +347,8 @@ class GETTrainer:
     def train_epoch(self, loader):
         self.model.train()
         total_loss = 0
+        if len(loader) == 0:
+            return 0.0
         for batch in loader:
             batch = batch.to(self.device)
             self.optimizer.zero_grad()
@@ -285,6 +357,8 @@ class GETTrainer:
                 # Align shapes
                 if self.task_type in ['binary', 'regression']:
                     loss = self.criterion(out.view(-1), batch.y.view(-1).float())
+                    if self.task_type == 'binary' and self.margin_loss_weight > 0.0:
+                        loss = loss + self.margin_loss_weight * _signed_margin_loss(out.view(-1), batch.y.view(-1).float(), self.logit_margin)
                 else:
                     loss = self.criterion(out, batch.y.view(-1).long())
             
@@ -299,13 +373,17 @@ class GETTrainer:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 self.optimizer.step()
             total_loss += loss.item()
-        return total_loss / len(loader)
+        return total_loss / max(len(loader), 1)
 
     @torch.no_grad()
     def evaluate(self, loader):
         self.model.eval()
         all_preds, all_y = [], []
         total_loss = 0
+        if len(loader) == 0:
+            metrics = {'loss': 0.0}
+            metrics['metric'] = 0.5 if self.task_type == 'binary' else 0.0
+            return metrics
         for batch in loader:
             batch = batch.to(self.device)
             with torch.autocast(device_type=torch.device(self.device).type, enabled=self.use_amp):
@@ -319,7 +397,7 @@ class GETTrainer:
             all_preds.extend(pred.cpu().numpy().tolist())
             all_y.extend(batch.y.view(-1).cpu().numpy().tolist())
         
-        metrics = {'loss': total_loss / len(loader)}
+        metrics = {'loss': total_loss / max(len(loader), 1)}
         if self.task_type == 'binary':
             metrics['metric'] = roc_auc_score(all_y, all_preds) if len(set(all_y)) > 1 else 0.5
         elif self.task_type == 'regression':

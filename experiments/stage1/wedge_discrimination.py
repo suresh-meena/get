@@ -2,10 +2,9 @@ import argparse
 import torch
 import networkx as nx
 from tqdm.auto import tqdm
-import numpy as np
 
-from get import FullGET, PairwiseGET, GINBaseline, ETFaithful
-from experiments.common import set_seed, GETTrainer, save_results, mean_std
+from get import FullGET, PairwiseGET, GINBaseline
+from experiments.common import set_seed, GETTrainer, save_results, split_grouped_dataset
 
 def generate_matched_dataset(n_nodes=20, num_pairs=500, degree=3, nswap=40):
     dataset = []
@@ -37,28 +36,26 @@ def main():
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dataset = generate_matched_dataset(num_pairs=args.num_pairs)
-    
-    # Split: 70/15/15 by pair_id
-    ids = sorted({g["pair_id"] for g in dataset})
-    train_ids, val_ids = ids[:int(0.7*len(ids))], ids[int(0.7*len(ids)):int(0.85*len(ids))]
-    test_ids = ids[int(0.85*len(ids)):]
-    
-    train_ds = [g for g in dataset if g["pair_id"] in train_ids]
-    val_ds = [g for g in dataset if g["pair_id"] in val_ids]
-    test_ds = [g for g in dataset if g["pair_id"] in test_ids]
+    train_ds, val_ds, test_ds = split_grouped_dataset(dataset, "pair_id", seed=args.seed)
 
     results = {}
     models = [
-        ("PairwiseGET", PairwiseGET(1, 64, 1)),
-        ("FullGET", FullGET(1, 64, 1, lambda_3=1.0)),
-        ("ETFaithful_sparse", ETFaithful(1, 64, 1, num_steps=6, pe_k=8, mask_mode="sparse")),
-        ("ETFaithful_dense", ETFaithful(1, 64, 1, num_steps=6, pe_k=8, mask_mode="official_dense", et_official_mode=True)),
-        ("GIN", GINBaseline(1, 64, 1))
+        ("PairwiseGET", PairwiseGET(1, 96, 1, num_steps=8, eta=0.01, eta_max=0.05, beta_2=1.0, grad_clip_norm=0.5, state_clip_norm=5.0, beta_max=3.0), 1e-4, 0.5),
+        ("FullGET", FullGET(1, 96, 1, num_steps=8, R=2, lambda_3=0.8, lambda_m=0.0, beta_2=1.0, beta_3=1.2, eta=0.008, eta_max=0.04, grad_clip_norm=0.3, state_clip_norm=5.0, beta_max=3.0, update_damping=0.5, dropout=0.0, compile=False), 3e-5, 0.3),
+        ("GIN", GINBaseline(1, 96, 1, num_layers=4), 2e-4, 1.0),
     ]
 
-    for name, model in models:
+    for name, model, lr, max_grad_norm in models:
         print(f"\n--- Training {name} ---")
-        trainer = GETTrainer(model, task_type='binary', device=device, lr=1e-4)
+        trainer = GETTrainer(
+            model,
+            task_type='binary',
+            device=device,
+            lr=lr,
+            max_grad_norm=max_grad_norm,
+            margin_loss_weight=0.05,
+            logit_margin=1.0,
+        )
         results[name] = trainer.run(train_ds, val_ds, test_ds, args.epochs, 32)
         print(f"{name} Test AUC: {results[name]['metric']:.4f}")
 
