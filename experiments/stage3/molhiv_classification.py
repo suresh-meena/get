@@ -14,7 +14,21 @@ def load_molhiv(root="data/OGB"):
     except Exception as e:
         raise RuntimeError("ogb is required for molhiv. Install `ogb`.") from e
 
-    ds = PygGraphPropPredDataset(name="ogbg-molhiv", root=root)
+    # PyTorch 2.6 defaults torch.load(weights_only=True), but OGB's cached
+    # processed dataset uses torch_geometric objects that require the legacy
+    # unpickling path. Temporarily force weights_only=False for this load.
+    original_torch_load = torch.load
+
+    def _torch_load_legacy(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return original_torch_load(*args, **kwargs)
+
+    torch.load = _torch_load_legacy
+    try:
+        ds = PygGraphPropPredDataset(name="ogbg-molhiv", root=root)
+    finally:
+        torch.load = original_torch_load
+
     split = ds.get_idx_split()
 
     def _convert(indices):
