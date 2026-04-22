@@ -1,40 +1,17 @@
 import torch
 import torch.nn as nn
 
-from .energy import positive_param, inverse_temperature, segment_logsumexp
+from .et_core import ETCoreBlock, ETGraphMaskModulator, EnergyLayerNorm
+from .utils import laplacian_pe_from_adjacency
 from .model import StableMLP
 
 
-def _laplacian_positional_encoding(adj, k, training=False):
-    n = int(adj.size(0))
-    if k <= 0:
-        return adj.new_zeros((n, 0), dtype=torch.float32)
-    if n <= 1:
-        return adj.new_zeros((n, k), dtype=torch.float32)
-
-    a = adj.to(dtype=torch.float32)
-    deg = a.sum(dim=1)
-    inv_sqrt_deg = torch.zeros_like(deg)
-    valid = deg > 0
-    inv_sqrt_deg[valid] = deg[valid].pow(-0.5)
-    l = torch.eye(n, device=adj.device, dtype=torch.float32) - (inv_sqrt_deg[:, None] * a * inv_sqrt_deg[None, :])
-
-    evals, evecs = torch.linalg.eigh(l)
-    order = torch.argsort(evals)
-    evecs = evecs[:, order]
-    use = evecs[:, 1 : 1 + k]
-    if use.size(1) < k:
-        use = torch.cat([use, torch.zeros((n, k - use.size(1)), device=adj.device, dtype=use.dtype)], dim=1)
-
-    if training and use.numel() > 0:
-        signs = torch.randint(0, 2, (use.size(1),), device=adj.device, dtype=torch.long)
-        signs = (2 * signs - 1).to(dtype=use.dtype)
-        use = use * signs[None, :]
-    return use
-
-
 class ETFaithfulGraphModel(nn.Module):
-    """Paper-inspired ET for graph tasks: CLS token + Laplacian PE + masked energy attention + HN memory."""
+    """
+    ET graph adapter built on modular ET core primitives:
+    - ET core (EnergyLayerNorm + attention energy + CHN-ReLU memory)
+    - graph adapter (CLS token + Laplacian PE + graph masking)
+    """
 
     def __init__(
         self,
@@ -47,23 +24,26 @@ class ETFaithfulGraphModel(nn.Module):
         pe_k=16,
         eta=0.05,
         eta_max=0.25,
-        lambda_att=1.0,
-        lambda_m=1.0,
-        beta_att=1.0,
-        beta_m=1.0,
         K=32,
         allow_self=False,
         noise_std=0.0,
         grad_clip_norm=1.0,
         state_clip_norm=10.0,
-        beta_max=5.0,
         dropout=0.1,
         encoder_hidden_mult=2,
         readout_hidden_mult=2,
+        et_official_mode=False,
+        num_blocks=1,
+        mask_mode="sparse",
+        node_cap=None,
+        dense_kernel_size=3,  # compatibility placeholder for CLI
+        share_block_weights=True,
     ):
         super().__init__()
-        self.d = d
+        del dense_kernel_size
+        self.d = int(d)
         self.num_steps = int(num_steps)
+        self.num_blocks = int(max(1, num_blocks))
         self.num_heads = int(num_heads)
         self.head_dim = int(head_dim or d)
         self.pe_k = int(pe_k)
@@ -71,7 +51,14 @@ class ETFaithfulGraphModel(nn.Module):
         self.noise_std = float(noise_std)
         self.grad_clip_norm = grad_clip_norm
         self.state_clip_norm = state_clip_norm
-        self.beta_max = float(beta_max)
+        self.node_cap = None if node_cap is None else int(node_cap)
+        self.share_block_weights = bool(share_block_weights)
+
+        self.mask_mode = str(mask_mode)
+        if et_official_mode and self.mask_mode == "sparse":
+            self.mask_mode = "official_dense"
+        if self.mask_mode not in {"sparse", "official_dense"}:
+            raise ValueError(f"Unsupported mask_mode: {self.mask_mode}")
 
         self.node_encoder = StableMLP(
             in_dim,
@@ -83,20 +70,22 @@ class ETFaithfulGraphModel(nn.Module):
         self.pe_proj = nn.Linear(self.pe_k, d)
         self.cls_token = nn.Parameter(torch.zeros(1, d))
 
-        self.layernorm = nn.LayerNorm(d, eps=1e-5)
-        self.W_Q = nn.Parameter(torch.empty(d, self.num_heads * self.head_dim))
-        self.W_K = nn.Parameter(torch.empty(d, self.num_heads * self.head_dim))
-
-        self.K = int(K)
-        if self.K > 0:
-            self.W_Qm = nn.Parameter(torch.empty(d, d))
-            self.W_Km = nn.Parameter(torch.empty(d, d))
-            self.B_mem = nn.Parameter(torch.empty(self.K, d))
-
-        self.lambda_att = nn.Parameter(torch.log(torch.expm1(torch.tensor(float(lambda_att)))))
-        self.lambda_m = nn.Parameter(torch.log(torch.expm1(torch.tensor(float(lambda_m)))))
-        self.beta_att = nn.Parameter(torch.log(torch.expm1(torch.tensor(float(beta_att)))))
-        self.beta_m = nn.Parameter(torch.log(torch.expm1(torch.tensor(float(beta_m)))))
+        self.norm_blocks = nn.ModuleList([EnergyLayerNorm(d, use_bias=True, eps=1e-5) for _ in range(self.num_blocks)])
+        self.mask_modulator = None
+        if self.mask_mode == "official_dense":
+            self.mask_modulator = ETGraphMaskModulator(
+                d=self.d,
+                num_heads=self.num_heads,
+                edge_feat_dim=None,
+                kernel_size=3,
+            )
+        if self.share_block_weights:
+            shared = ETCoreBlock(d=d, num_heads=self.num_heads, head_dim=self.head_dim, num_memories=K)
+            self.core_blocks = nn.ModuleList([shared for _ in range(self.num_blocks)])
+        else:
+            self.core_blocks = nn.ModuleList(
+                [ETCoreBlock(d=d, num_heads=self.num_heads, head_dim=self.head_dim, num_memories=K) for _ in range(self.num_blocks)]
+            )
 
         eta = min(max(float(eta), 1e-4), float(eta_max) - 1e-4)
         self.eta_max = float(eta_max)
@@ -121,20 +110,11 @@ class ETFaithfulGraphModel(nn.Module):
             nn.Linear(d, num_classes),
         )
 
-        self.reset_parameters()
+        nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
 
     @property
     def eta(self):
         return self.eta_max * torch.sigmoid(self.eta_logit)
-
-    def reset_parameters(self):
-        nn.init.xavier_uniform_(self.W_Q, gain=0.5)
-        nn.init.xavier_uniform_(self.W_K, gain=0.5)
-        nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
-        if self.K > 0:
-            nn.init.xavier_uniform_(self.W_Qm, gain=0.5)
-            nn.init.xavier_uniform_(self.W_Km, gain=0.5)
-            nn.init.normal_(self.B_mem, mean=0.0, std=1.0 / (self.d ** 0.5))
 
     def _build_augmented_graph(self, batch_data, z_nodes):
         ptr = batch_data.ptr
@@ -144,9 +124,9 @@ class ETFaithfulGraphModel(nn.Module):
         token_chunks = []
         center_ids = []
         nbr_ids = []
-        graph_id_of_token = []
         cls_positions = []
         node_positions = []
+        graph_chunks = []
 
         offset = 0
         for g_idx in range(ptr.numel() - 1):
@@ -155,14 +135,18 @@ class ETFaithfulGraphModel(nn.Module):
             n = end - start
             if n <= 0:
                 continue
+            if self.node_cap is not None and n > self.node_cap:
+                n = self.node_cap
 
-            z_g = z_nodes[start:end]
+            z_g = z_nodes[start : start + n]
             adj = torch.zeros((n, n), dtype=torch.bool, device=z_nodes.device)
             mask = (c2 >= start) & (c2 < end)
             if bool(mask.any()):
                 src = c2[mask] - start
                 dst = u2[mask] - start
-                adj[src, dst] = True
+                valid = (src < n) & (dst < n)
+                if bool(valid.any()):
+                    adj[src[valid], dst[valid]] = True
 
             adj_aug = torch.zeros((n + 1, n + 1), dtype=torch.bool, device=z_nodes.device)
             adj_aug[1:, 1:] = adj
@@ -171,7 +155,7 @@ class ETFaithfulGraphModel(nn.Module):
             if self.allow_self:
                 adj_aug.fill_diagonal_(True)
 
-            pe = _laplacian_positional_encoding(adj_aug, self.pe_k, training=self.training)
+            pe = laplacian_pe_from_adjacency(adj_aug, k=self.pe_k, training=self.training)
             z_cls = self.cls_token.expand(1, -1)
             z_aug = torch.cat([z_cls, z_g], dim=0) + self.pe_proj(pe.to(dtype=z_g.dtype))
             token_chunks.append(z_aug)
@@ -179,98 +163,183 @@ class ETFaithfulGraphModel(nn.Module):
             src_idx, dst_idx = torch.nonzero(adj_aug, as_tuple=True)
             center_ids.append(src_idx + offset)
             nbr_ids.append(dst_idx + offset)
-            graph_id_of_token.append(torch.full((n + 1,), g_idx, dtype=torch.long, device=z_nodes.device))
-
             cls_positions.append(offset)
             node_positions.append(torch.arange(offset + 1, offset + n + 1, device=z_nodes.device, dtype=torch.long))
+            graph_chunks.append({"start": offset, "size": n + 1, "adj": adj_aug, "orig_start": start})
             offset += n + 1
 
         x_aug = torch.cat(token_chunks, dim=0)
         c_aug = torch.cat(center_ids, dim=0)
         u_aug = torch.cat(nbr_ids, dim=0)
-        g_aug = torch.cat(graph_id_of_token, dim=0)
         cls_pos = torch.tensor(cls_positions, dtype=torch.long, device=z_nodes.device)
         node_pos = torch.cat(node_positions, dim=0)
-        return x_aug, c_aug, u_aug, g_aug, cls_pos, node_pos
+        return x_aug, c_aug, u_aug, cls_pos, node_pos, graph_chunks
 
-    def _compute_energy(self, x_aug, c_aug, u_aug):
-        g = self.layernorm(x_aug)
-        q = (g @ self.W_Q).view(-1, self.num_heads, self.head_dim)
-        k = (g @ self.W_K).view(-1, self.num_heads, self.head_dim)
-
-        scale = float(self.head_dim) ** 0.5
-        ell = (q[c_aug] * k[u_aug]).sum(dim=-1) / scale
-        ell = ell + (q[u_aug] * k[c_aug]).sum(dim=-1) / scale
-
-        beta_att = inverse_temperature({"beta": self.beta_att}, "beta", beta_max=self.beta_max)
-        lambda_att = positive_param({"lam": self.lambda_att}, "lam")
-
-        num_tokens = int(x_aug.size(0))
-        e_att = x_aug.new_zeros(())
-        for h in range(self.num_heads):
-            lse_h = segment_logsumexp(beta_att * ell[:, h], c_aug, num_tokens)
-            e_att = e_att + (lambda_att / beta_att) * lse_h.sum()
-
-        from .energy import compute_memory_energy, compute_quadratic_energy
-        params = {
-            'd': self.d,
-            'K': self.K,
-            'lambda_m': self.lambda_m,
-            'beta_m': self.beta_m,
-            'beta_max': self.beta_max,
-        }
-        if self.K > 0:
-            params['W_Qm'] = self.W_Qm
-            params['W_Km'] = self.W_Km
-            params['B_mem'] = self.B_mem
-            
-        e_mem = compute_memory_energy(g, params, None)
-        e_quad = compute_quadratic_energy(x_aug)
-        
-        return e_quad - e_att - e_mem
-
-    def _solve_dynamics(self, x_aug, c_aug, u_aug):
+    def _solve_dynamics(self, x_aug, c_aug, u_aug, graph_chunks, batch_data):
         energy_trace = []
         step = self.eta
+        x = x_aug
+        dense_cache = None
+
+        if self.mask_mode == "official_dense" and self.mask_modulator is not None:
+            edge_attr = getattr(batch_data, "edge_attr", None)
+            c2 = batch_data.c_2
+            u2 = batch_data.u_2
+            bsz = len(graph_chunks)
+            max_n = max(int(chunk["size"]) for chunk in graph_chunks)
+            feat_dim = int(edge_attr.size(-1)) if edge_attr is not None else 1
+
+            # Static plan for copying token states into padded dense tensors.
+            starts = torch.tensor([int(chunk["start"]) for chunk in graph_chunks], dtype=torch.long, device=x.device)
+            sizes = torch.tensor([int(chunk["size"]) for chunk in graph_chunks], dtype=torch.long, device=x.device)
+
+            if edge_attr is not None:
+                batch_ids = []
+                src_ids = []
+                dst_ids = []
+                edge_ids = []
+                for i, chunk in enumerate(graph_chunks):
+                    size = int(chunk["size"])
+                    n = size - 1
+                    orig_start = int(chunk["orig_start"])
+                    orig_end = orig_start + n
+                    mask = (c2 >= orig_start) & (c2 < orig_end) & (u2 >= orig_start) & (u2 < orig_end)
+                    if bool(mask.any()):
+                        local_src = ((c2[mask] - orig_start) + 1).to(dtype=torch.long, device=x.device)
+                        local_dst = ((u2[mask] - orig_start) + 1).to(dtype=torch.long, device=x.device)
+                        local_edge_ids = torch.nonzero(mask, as_tuple=False).reshape(-1).to(dtype=torch.long, device=x.device)
+                        local_batch = torch.full_like(local_src, i)
+                        batch_ids.append(local_batch)
+                        src_ids.append(local_src)
+                        dst_ids.append(local_dst)
+                        edge_ids.append(local_edge_ids)
+                if edge_ids:
+                    edge_batch_ids = torch.cat(batch_ids, dim=0)
+                    edge_src_ids = torch.cat(src_ids, dim=0)
+                    edge_dst_ids = torch.cat(dst_ids, dim=0)
+                    edge_global_ids = torch.cat(edge_ids, dim=0)
+                else:
+                    edge_batch_ids = torch.empty((0,), dtype=torch.long, device=x.device)
+                    edge_src_ids = torch.empty((0,), dtype=torch.long, device=x.device)
+                    edge_dst_ids = torch.empty((0,), dtype=torch.long, device=x.device)
+                    edge_global_ids = torch.empty((0,), dtype=torch.long, device=x.device)
+                edge_static_template = None
+            else:
+                edge_static_template = x.new_zeros((bsz, max_n, max_n, 1))
+                for i, chunk in enumerate(graph_chunks):
+                    size = int(chunk["size"])
+                    adj_local = chunk["adj"].to(dtype=x.dtype)
+                    edge_static_template[i, :size, :size, 0] = adj_local
+                edge_batch_ids = edge_src_ids = edge_dst_ids = edge_global_ids = None
+
+            dense_cache = {
+                "bsz": bsz,
+                "max_n": max_n,
+                "feat_dim": feat_dim,
+                "starts": starts,
+                "sizes": sizes,
+                "edge_attr": edge_attr,
+                "edge_batch_ids": edge_batch_ids,
+                "edge_src_ids": edge_src_ids,
+                "edge_dst_ids": edge_dst_ids,
+                "edge_global_ids": edge_global_ids,
+                "edge_static_template": edge_static_template,
+            }
+
         with torch.enable_grad():
-            for _ in range(self.num_steps):
-                if not self.training:
-                    x_aug = x_aug.detach()
-                if not x_aug.requires_grad:
-                    x_aug = x_aug.requires_grad_(True)
+            for block_idx in range(self.num_blocks):
+                norm = self.norm_blocks[block_idx]
+                core = self.core_blocks[block_idx]
+                for _ in range(self.num_steps):
+                    if not self.training:
+                        x = x.detach()
+                    if not x.requires_grad:
+                        x = x.requires_grad_(True)
 
-                e = self._compute_energy(x_aug, c_aug, u_aug)
-                grad = torch.autograd.grad(e, x_aug, create_graph=self.training)[0]
+                    # Official ET update uses grad wrt g, then updates x directly.
+                    g = norm(x)
+                    dense_modulation = None
+                    if dense_cache is not None:
+                        dense_modulation = []
+                        bsz = dense_cache["bsz"]
+                        max_n = dense_cache["max_n"]
+                        feat_dim = dense_cache["feat_dim"]
+                        starts = dense_cache["starts"]
+                        sizes = dense_cache["sizes"]
+                        edge_attr = dense_cache["edge_attr"]
+                        x_batch = x.new_zeros((bsz, max_n, x.size(-1)))
+                        edge_batch = x.new_zeros((bsz, max_n, max_n, feat_dim))
 
-                if self.training and self.noise_std > 0:
-                    grad = grad + torch.randn_like(grad) * self.noise_std
+                        # Copy per-graph token blocks into padded [B, N, D] layout.
+                        for i in range(bsz):
+                            start = int(starts[i].item())
+                            size = int(sizes[i].item())
+                            x_batch[i, :size] = x[start : start + size]
 
-                if self.grad_clip_norm is not None:
-                    gnorm = grad.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-                    grad = grad * (self.grad_clip_norm / gnorm).clamp(max=1.0)
+                        if edge_attr is not None:
+                            edge_batch_ids = dense_cache["edge_batch_ids"]
+                            if edge_batch_ids.numel() > 0:
+                                edge_src_ids = dense_cache["edge_src_ids"]
+                                edge_dst_ids = dense_cache["edge_dst_ids"]
+                                edge_global_ids = dense_cache["edge_global_ids"]
+                                edge_batch[edge_batch_ids, edge_src_ids, edge_dst_ids, :] = edge_attr[edge_global_ids].to(
+                                    dtype=x.dtype, device=x.device
+                                )
+                        else:
+                            edge_batch.copy_(dense_cache["edge_static_template"].to(device=x.device, dtype=x.dtype))
 
-                x_next = x_aug - step * grad
-                if self.state_clip_norm is not None:
-                    snorm = x_next.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-                    x_next = x_next * (self.state_clip_norm / snorm).clamp(max=1.0)
+                        mod_batch = self.mask_modulator.dense_modulation_batched(x_batch, edge_batch)  # [B, H, N, N]
+                        for i, chunk in enumerate(graph_chunks):
+                            size = int(chunk["size"])
+                            dense_modulation.append(mod_batch[i, :, :size, :size])
+                    e = core.energy(
+                        g,
+                        c_aug,
+                        u_aug,
+                        graph_chunks,
+                        self.mask_mode,
+                        dense_modulation=dense_modulation,
+                    )
+                    grad_g = torch.autograd.grad(e, g, create_graph=self.training)[0]
 
-                energy_trace.append(float(e.detach().item()))
-                x_aug = x_next
-        return x_aug, energy_trace
+                    if self.training and self.noise_std > 0:
+                        grad_g = grad_g + torch.randn_like(grad_g) * self.noise_std
+                    if self.grad_clip_norm is not None:
+                        gnorm = grad_g.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+                        grad_g = grad_g * (self.grad_clip_norm / gnorm).clamp(max=1.0)
 
-    def forward(self, batch_data, task_level="graph"):
+                    x_next = x - step * grad_g
+                    if self.state_clip_norm is not None:
+                        snorm = x_next.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+                        x_next = x_next * (self.state_clip_norm / snorm).clamp(max=1.0)
+
+                    energy_trace.append(float(e.detach().item()))
+                    x = x_next
+        return x, energy_trace
+
+    def forward(self, batch_data, task_level="graph", return_solver_stats=False):
         x = batch_data.x
         if x.dim() == 1:
             x = x.view(-1, 1).float()
 
         z_nodes = self.node_encoder(x)
-        x_aug, c_aug, u_aug, _g_aug, cls_pos, node_pos = self._build_augmented_graph(batch_data, z_nodes)
-        x_final, energy_trace = self._solve_dynamics(x_aug, c_aug, u_aug)
+        x_aug, c_aug, u_aug, cls_pos, node_pos, graph_chunks = self._build_augmented_graph(batch_data, z_nodes)
+        x_final, energy_trace = self._solve_dynamics(x_aug, c_aug, u_aug, graph_chunks, batch_data)
+        g_final = self.norm_blocks[-1](x_final)
+
+        solver_stats = {
+            "energy_trace": energy_trace,
+            "memory_entropy": self.core_blocks[-1].hn.entropy(g_final),
+        }
 
         if task_level == "graph":
-            out = self.readout(self.layernorm(x_final[cls_pos]))
+            out = self.readout(g_final[cls_pos])
+            if return_solver_stats:
+                return out, energy_trace, solver_stats
             return out, energy_trace
         if task_level == "node":
-            out = self.node_readout(self.layernorm(x_final[node_pos]))
+            out = self.node_readout(g_final[node_pos])
+            if return_solver_stats:
+                return out, energy_trace, solver_stats
             return out, energy_trace
         raise ValueError(f"Unsupported task_level: {task_level}")

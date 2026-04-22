@@ -32,6 +32,18 @@ def test_motif_budget_keeps_boundary_ties():
     assert torch.all(t_tau[center_zero] == 1)
 
 
+def test_zero_motif_budget_disables_motif_extraction():
+    num_nodes = 6
+    edges = [(0, 1), (0, 2), (0, 3), (1, 2), (2, 3)]
+    _c_2, _u_2, c_3, u_3, v_3, t_tau = get_incidence_matrices(
+        num_nodes, edges, max_motifs_per_node=0
+    )
+    assert c_3.numel() == 0
+    assert u_3.numel() == 0
+    assert v_3.numel() == 0
+    assert t_tau.numel() == 0
+
+
 def test_align_pairwise_edge_attr_matches_directed_incidence_order():
     edges = [(0, 1), (1, 2)]
     edge_attr = torch.tensor([[10.0, 0.0], [20.0, 1.0]])

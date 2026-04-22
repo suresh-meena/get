@@ -16,17 +16,19 @@ def _repo_root():
 
 def test_stage2_runner_help():
     repo = _repo_root()
-    cmd = [sys.executable, "experiments/run_stage2.py", "--help"]
+    cmd = [sys.executable, "experiments/stage4/runner.py", "--help"]
     rc, out = _run(cmd, cwd=repo)
     assert rc == 0, out
     assert "Unified Stage-2 runner" in out
+    assert "--get_pairwise_et_mask" in out
+    assert "--get_norm_style" in out
 
 
 def test_stage2_runner_smoke_graph_anomaly():
     repo = _repo_root()
     cmd = [
         sys.executable,
-        "experiments/run_stage2.py",
+        "experiments/stage4/runner.py",
         "--task",
         "graph_anomaly",
         "--num_graphs",

@@ -1,22 +1,23 @@
-# Core numerical and ML stack
+# Simple install file.
+# Mirror first: pip config set global.index-url https://mirrors.sustech.edu.cn/pypi/web/simple
+# CUDA 12.4:
+--extra-index-url https://download.pytorch.org/whl/cu124
+# PyG wheels matched to torch/cuda build:
+--find-links https://data.pyg.org/whl/torch-2.4.0+cu124.html
+# If you are on CPU-only, replace the line above with:
+# --extra-index-url https://download.pytorch.org/whl/cpu
+
 numpy
-torch
-
-# Graph processing and utilities
 networkx
-
-# Metrics and progress
 scikit-learn
 tqdm
-
-# Plotting
 matplotlib
 seaborn
-
-# Test runner
 pytest
-
-# Optional: required for GIN baseline, TU datasets, and node anomaly datasets.
-# Install with compatible wheels for your torch/cuda version from:
-# https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html
+torch==2.4.0
 torch-geometric
+torch-scatter
+torch-sparse
+dgl
+pygod
+ogb

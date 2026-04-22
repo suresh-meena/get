@@ -3,17 +3,13 @@
   "dataset": "synth",
   "summary": {
     "0.4": {
-      "pairwise_mean": 0.5,
-      "pairwise_std": 0.0,
-      "pairwise_f1_mean": 0.2857142857142857,
-      "pairwise_f1_std": 0.0,
-      "fullget_mean": 0.25,
+      "fullget_mean": 0.8333333333333333,
       "fullget_std": 0.0,
-      "fullget_f1_mean": 0.375,
+      "fullget_f1_mean": 0.6666666666666666,
       "fullget_f1_std": 0.0,
-      "et_faithful_mean": 0.5,
+      "et_faithful_mean": 0.4444444444444444,
       "et_faithful_std": 0.0,
-      "et_faithful_f1_mean": 0.4949494949494949,
+      "et_faithful_f1_mean": 0.35714285714285715,
       "et_faithful_f1_std": 0.0
     }
   },
@@ -21,93 +17,49 @@
     "0.4": [
       {
         "seed": 123,
-        "pairwise_auc": 0.5,
-        "pairwise_f1": 0.2857142857142857,
-        "fullget_auc": 0.25,
-        "fullget_f1": 0.375,
-        "gin_auc": 1.0,
-        "gin_f1": 0.375,
-        "et_faithful_auc": 0.5,
-        "et_faithful_f1": 0.4949494949494949,
+        "fullget_auc": 0.8333333333333333,
+        "fullget_f1": 0.6666666666666666,
+        "et_faithful_auc": 0.4444444444444444,
+        "et_faithful_f1": 0.35714285714285715,
         "histories": {
-          "pairwise": {
-            "train_loss": [
-              0.7974905371665955
-            ],
-            "val_auc": [
-              0.5
-            ],
-            "val_f1": [
-              0.3333333333333333
-            ],
-            "test_auc": [
-              0.5
-            ],
-            "test_f1": [
-              0.2857142857142857
-            ],
-            "bad_batches": [
-              0
-            ]
-          },
           "fullget": {
             "train_loss": [
-              0.764334499835968
-            ],
-            "val_auc": [
-              0.75
-            ],
-            "val_f1": [
-              0.3333333333333333
-            ],
-            "test_auc": [
-              0.25
-            ],
-            "test_f1": [
-              0.375
-            ],
-            "bad_batches": [
-              0
-            ]
-          },
-          "gin": {
-            "train_loss": [
-              0.6856779754161835
+              0.9914228916168213
             ],
             "val_auc": [
               1.0
             ],
             "val_f1": [
-              0.3333333333333333
-            ],
-            "test_auc": [
               1.0
             ],
+            "test_auc": [
+              0.8333333333333333
+            ],
             "test_f1": [
-              0.375
+              0.6666666666666666
             ],
             "bad_batches": [
-              0
+              0.0
             ]
           },
           "et_faithful": {
             "train_loss": [
-              0.9995535016059875
+              1.4256663918495178
             ],
             "val_auc": [
-              0.0
-            ],
-            "val_f1": [
-              0.3333333333333333
-            ],
-            "test_auc": [
               0.5
             ],
+            "val_f1": [
+              0.4444444444444444
+            ],
+            "test_auc": [
+              0.4444444444444444
+            ],
             "test_f1": [
-              0.4949494949494949
+              0.35714285714285715
             ],
             "bad_batches": [
-              0
+              0.0
             ]
           }
         }

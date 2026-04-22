@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import torch
 
-from stage2_common import build_anomaly_protocol_split, build_ego_graph_dataset
+from experiments.common import build_anomaly_protocol_split, build_dataloader_kwargs, build_ego_graph_dataset
 
 
 def test_build_ego_graph_dataset_shapes_and_labels():
@@ -42,3 +42,18 @@ def test_build_anomaly_protocol_split_non_empty_partitions():
     assert len(split["test"]) > 0
     union_size = len(split["train"]) + len(split["val"]) + len(split["test"])
     assert union_size == len(dataset)
+
+
+def test_build_dataloader_kwargs_device_aware_defaults():
+    cpu_kwargs = build_dataloader_kwargs("cpu")
+    cuda_kwargs = build_dataloader_kwargs("cuda:0")
+
+    assert cpu_kwargs["num_workers"] == 0
+    assert cpu_kwargs["pin_memory"] is False
+    assert "persistent_workers" not in cpu_kwargs
+    assert "prefetch_factor" not in cpu_kwargs
+
+    assert cuda_kwargs["num_workers"] == 2
+    assert cuda_kwargs["pin_memory"] is True
+    assert cuda_kwargs["persistent_workers"] is True
+    assert cuda_kwargs["prefetch_factor"] == 2

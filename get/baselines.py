@@ -50,7 +50,32 @@ class GINBaseline(nn.Module):
 def PairwiseGET(in_dim, d, num_classes, **kwargs):
     """Pairwise-only baseline (lambda_3=0, lambda_m=0)"""
     beta_2 = kwargs.pop('beta_2', 5.0)
-    return GETModel(in_dim, d, num_classes, lambda_3=0.0, lambda_m=0.0, beta_2=beta_2, **kwargs)
+    return GETModel(
+        in_dim,
+        d,
+        num_classes,
+        lambda_3=0.0,
+        lambda_m=0.0,
+        beta_2=beta_2,
+        use_motif=False,
+        use_memory=False,
+        **kwargs,
+    )
+
+
+def MotifOnlyGET(in_dim, d, num_classes, **kwargs):
+    """Motif-only ablation (pairwise and memory branches disabled)."""
+    return GETModel(
+        in_dim,
+        d,
+        num_classes,
+        lambda_2=0.0,
+        lambda_m=0.0,
+        use_pairwise=False,
+        use_motif=True,
+        use_memory=False,
+        **kwargs,
+    )
 
 
 def FullGET(in_dim, d, num_classes, 
@@ -60,6 +85,21 @@ def FullGET(in_dim, d, num_classes,
     return GETModel(in_dim, d, num_classes, 
                     lambda_2=lambda_2, lambda_3=lambda_3, lambda_m=lambda_m, 
                     beta_2=beta_2, beta_3=beta_3, beta_m=beta_m, **kwargs)
+
+
+def MemoryOnlyGET(in_dim, d, num_classes, **kwargs):
+    """Memory-only baseline (pairwise and motif branches disabled)."""
+    return GETModel(
+        in_dim,
+        d,
+        num_classes,
+        lambda_2=0.0,
+        lambda_3=0.0,
+        use_pairwise=False,
+        use_motif=False,
+        use_memory=True,
+        **kwargs,
+    )
 
 
 def ETFaithful(in_dim, d, num_classes, **kwargs):

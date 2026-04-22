@@ -152,6 +152,23 @@ def test_model_armijo_inference_mode():
         )
     print("Model Armijo inference mode check passed.")
 
+def test_get_cls_graph_readout():
+    print("Running GET CLS Graph Readout Check...")
+    graphs = generate_random_graphs(2, n_min=5, n_max=7, d=4)
+    for label, graph in enumerate(graphs):
+        graph["y"] = torch.tensor([label], dtype=torch.long)
+    batch = collate_get_batch(graphs)
+    model = FullGET(in_dim=4, d=8, num_classes=2, num_steps=2, use_cls_token=True).to(torch.float64)
+    model.eval()
+
+    graph_out, energy_trace = model(batch, task_level="graph")
+    assert graph_out.shape == (2, 2), "CLS graph readout should return one row per graph."
+    assert len(energy_trace) == model.num_steps, "CLS energy trace length mismatch."
+
+    node_out, _ = model(batch, task_level="node")
+    assert node_out.shape[0] == batch.x.size(0), "Node readout should exclude appended CLS states."
+    print("GET CLS graph readout check passed.")
+
 def test_data_preparation_helpers():
     print("Running Data Preparation Helper Checks...")
     graph = {
@@ -173,5 +190,6 @@ if __name__ == "__main__":
     test_equivariance()
     test_monotone_descent()
     test_model_armijo_inference_mode()
+    test_get_cls_graph_readout()
     test_data_preparation_helpers()
     print("All Tier 0 implementation checks passed!")

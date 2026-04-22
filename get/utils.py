@@ -1,6 +1,44 @@
 import torch
 import torch.optim as optim
 
+
+def laplacian_pe_from_adjacency(adj, k, training=False):
+    n = int(adj.size(0))
+    if k <= 0:
+        return adj.new_zeros((n, 0), dtype=torch.float32)
+    if n <= 1:
+        return adj.new_zeros((n, k), dtype=torch.float32)
+
+    a = adj.to(dtype=torch.float32)
+    deg = a.sum(dim=1)
+    inv_sqrt_deg = torch.zeros_like(deg)
+    valid = deg > 0
+    inv_sqrt_deg[valid] = deg[valid].pow(-0.5)
+    l = torch.eye(n, device=adj.device, dtype=torch.float32) - (inv_sqrt_deg[:, None] * a * inv_sqrt_deg[None, :])
+
+    evals, evecs = torch.linalg.eigh(l)
+    order = torch.argsort(evals)
+    evecs = evecs[:, order]
+    use = evecs[:, 1 : 1 + k]
+    if use.size(1) < k:
+        use = torch.cat(
+            [use, torch.zeros((n, k - use.size(1)), device=adj.device, dtype=use.dtype)],
+            dim=1,
+        )
+
+    if training and use.numel() > 0:
+        use = random_flip_pe_signs(use, training=True)
+    return use
+
+
+def random_flip_pe_signs(pe, training=False):
+    if not training or pe is None or pe.numel() == 0:
+        return pe
+    signs = torch.randint(0, 2, (pe.size(1),), device=pe.device, dtype=torch.long)
+    signs = (2 * signs - 1).to(dtype=pe.dtype)
+    return pe * signs[None, :]
+
+
 def _is_get_model(model):
     try:
         from .model import GETModel

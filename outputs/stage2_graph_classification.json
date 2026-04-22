@@ -2,66 +2,74 @@
   "task": "graph_classification",
   "dataset": "synth",
   "summary": {
-    "pairwise_mean": 0.5,
+    "pairwise_mean": 0.2,
     "pairwise_std": 0.0,
-    "fullget_mean": 0.5,
+    "fullget_mean": 0.4,
     "fullget_std": 0.0,
-    "et_faithful_mean": 0.5166666666666666,
+    "et_faithful_mean": 0.4,
     "et_faithful_std": 0.0
   },
   "runs": [
     {
       "seed": 123,
-      "pairwise_acc": 0.5,
-      "fullget_acc": 0.5,
-      "gin_acc": 0.6166666666666666,
-      "et_faithful_acc": 0.5166666666666666,
-      "histories": {
-        "pairwise": {
-          "train_loss": [
-            1.1878615895907083
-          ],
-          "test_acc": [
-            0.5
-          ],
-          "bad_batches": [
-            0.0
-          ]
-        },
-        "fullget": {
-          "train_loss": [
-            1.2311076382795971
-          ],
-          "test_acc": [
-            0.5
-          ],
-          "bad_batches": [
-            0.0
-          ]
-        },
-        "gin": {
-          "train_loss": [
-            10.642644111315409
-          ],
-          "test_acc": [
-            0.6166666666666666
-          ],
-          "bad_batches": [
-            0.0
-          ]
-        },
-        "et_faithful": {
-          "train_loss": [
-            1.2019806027412416
-          ],
-          "test_acc": [
-            0.5166666666666666
-          ],
-          "bad_batches": [
-            0.0
-          ]
+      "folds": [
+        {
+          "fold": 0,
+          "pairwise_acc": 0.2,
+          "fullget_acc": 0.4,
+          "et_faithful_acc": 0.4,
+          "histories": {
+            "pairwise": {
+              "train_loss": [
+                0.8466242750485738
+              ],
+              "test_acc": [
+                0.2
+              ],
+              "bad_batches": [
+                0.0
+              ]
+            },
+            "fullget": {
+              "train_loss": [
+                0.9519854883352915
+              ],
+              "test_acc": [
+                0.4
+              ],
+              "bad_batches": [
+                0.0
+              ]
+            },
+            "et_faithful": {
+              "train_loss": [
+                0.642053484916687
+              ],
+              "test_acc": [
+                0.4
+              ],
+              "bad_batches": [
+                0.0
+              ]
+            },
+            "gin": {
+              "train_loss": [
+                1.8245160182317097
+              ],
+              "test_acc": [
+                0.6
+              ],
+              "bad_batches": [
+                0.0
+              ]
+            }
+          },
+          "gin_acc": 0.6
         }
-      }
+      ],
+      "pairwise_acc": 0.2,
+      "fullget_acc": 0.4,
+      "et_faithful_acc": 0.4
     }
   ]
 }

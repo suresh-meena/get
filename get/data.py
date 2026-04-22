@@ -2,6 +2,7 @@ import torch
 import os
 import hashlib
 from tqdm.auto import tqdm
+from .utils import laplacian_pe_from_adjacency
 
 
 def _build_undirected_adjacency(num_nodes, edges_list):
@@ -34,35 +35,25 @@ def _apply_motif_budget_with_ties(node_motifs, max_motifs_per_node):
 
 
 def _extract_motif_indices(adj, max_motifs_per_node=None):
+    if max_motifs_per_node is not None and max_motifs_per_node <= 0:
+        return [], [], [], []
+
     c_3 = []
     u_3 = []
     v_3 = []
     t_tau = []
-    num_nodes = len(adj)
-    adj_dense = torch.zeros((num_nodes, num_nodes), dtype=torch.bool)
-    for src, neighbors in enumerate(adj):
-        if neighbors:
-            nbr_idx = torch.tensor(sorted(neighbors), dtype=torch.long)
-            adj_dense[src, nbr_idx] = True
 
     for center, neighbors_set in enumerate(adj):
         neighbors = sorted(neighbors_set)
         if len(neighbors) < 2:
             continue
-        neighbors_t = torch.tensor(neighbors, dtype=torch.long)
-        pair_idx = torch.triu_indices(neighbors_t.numel(), neighbors_t.numel(), offset=1)
-        left = neighbors_t[pair_idx[0]]
-        right = neighbors_t[pair_idx[1]]
-        closed = adj_dense[left, right].to(dtype=torch.long)
 
-        node_motifs = list(
-            zip(
-                [center] * left.numel(),
-                left.tolist(),
-                right.tolist(),
-                closed.tolist(),
-            )
-        )
+        node_motifs = []
+        for pos, left_i in enumerate(neighbors):
+            nbrs_left = adj[left_i]
+            for right_i in neighbors[pos + 1 :]:
+                motif_type = 1 if right_i in nbrs_left else 0
+                node_motifs.append((center, left_i, right_i, motif_type))
 
         node_motifs.sort(key=lambda x: (-x[3], x[1], x[2]))
         node_motifs = _apply_motif_budget_with_ties(node_motifs, max_motifs_per_node)
@@ -80,30 +71,11 @@ def _to_long_tensor(values):
     return torch.tensor(values, dtype=torch.long)
 
 def get_laplacian_pe(num_nodes, edges_list, k=16):
-    if k <= 0:
-        return torch.zeros((num_nodes, 0), dtype=torch.float32)
-    if num_nodes <= 1:
-        return torch.zeros((num_nodes, k), dtype=torch.float32)
-
     adj = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
     for u, v in edges_list:
         adj[int(u), int(v)] = 1.0
         adj[int(v), int(u)] = 1.0
-
-    deg = adj.sum(dim=1)
-    inv_sqrt_deg = torch.zeros_like(deg)
-    valid = deg > 0
-    inv_sqrt_deg[valid] = deg[valid].pow(-0.5)
-    l = torch.eye(num_nodes, dtype=torch.float32) - (inv_sqrt_deg[:, None] * adj * inv_sqrt_deg[None, :])
-
-    evals, evecs = torch.linalg.eigh(l)
-    order = torch.argsort(evals)
-    evecs = evecs[:, order]
-    use = evecs[:, 1 : 1 + k]
-    if use.size(1) < k:
-        use = torch.cat([use, torch.zeros((num_nodes, k - use.size(1)), dtype=use.dtype)], dim=1)
-
-    return use
+    return laplacian_pe_from_adjacency(adj, k=k, training=False)
 
 def get_incidence_matrices(num_nodes, edges_list, max_motifs_per_node=None):
     """
@@ -253,10 +225,16 @@ class CachedGraphDataset:
         self.cache_path = os.path.join(cache_dir, f"{name}_{hash_val}.pt")
         
         if os.path.exists(self.cache_path):
-            print(f"Loading cached dataset from {self.cache_path}")
+            print(
+                f"Loading cached dataset from {self.cache_path} "
+                f"(max_motifs={self.max_motifs}, pe_k={self.pe_k})"
+            )
             self.cached_data = torch.load(self.cache_path, weights_only=False)
         else:
-            print(f"Processing and caching dataset to {self.cache_path}...")
+            print(
+                f"Processing and caching dataset to {self.cache_path} "
+                f"(max_motifs={self.max_motifs}, pe_k={self.pe_k})..."
+            )
             self.cached_data = self._process_all()
             torch.save(self.cached_data, self.cache_path)
             
