@@ -2,6 +2,7 @@ import argparse
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from get import FullGET, PairwiseGET, GINBaseline, ETFaithful, collate_get_batch
 from get.data import CachedGraphDataset
@@ -74,7 +75,8 @@ def _train_multilabel(model, tr, val, ts, epochs, batch_size, device):
                 ps.append(prob.cpu().numpy())
         return np.concatenate(ys, axis=0), np.concatenate(ps, axis=0)
 
-    for _ in range(epochs):
+    epoch_bar = tqdm(range(epochs), desc="Training", leave=False)
+    for _ in epoch_bar:
         model.train()
         for b in tr_loader:
             b = b.to(device)
@@ -91,6 +93,7 @@ def _train_multilabel(model, tr, val, ts, epochs, batch_size, device):
         test_ap = _evaluate_ap(yt, pt)
         if val_ap > best["val"]:
             best = {"val": val_ap, "test": test_ap}
+        epoch_bar.set_postfix({"val": f"{val_ap:.3f}", "test": f"{test_ap:.3f}"})
     return {"metric": float(best["test"])}
 
 
@@ -117,7 +120,8 @@ def _train_regression(model, tr, val, ts, epochs, batch_size, device):
         p = np.concatenate(ps, axis=0)
         return float(np.mean(np.abs(y - p)))
 
-    for _ in range(epochs):
+    epoch_bar = tqdm(range(epochs), desc="Training", leave=False)
+    for _ in epoch_bar:
         model.train()
         for b in tr_loader:
             b = b.to(device)
@@ -132,6 +136,7 @@ def _train_regression(model, tr, val, ts, epochs, batch_size, device):
         test_mae = _mae(ts_loader)
         if val_mae < best["val"]:
             best = {"val": val_mae, "test": test_mae}
+        epoch_bar.set_postfix({"val": f"{val_mae:.3f}", "test": f"{test_mae:.3f}"})
     return {"metric": float(best["test"])}
 
 

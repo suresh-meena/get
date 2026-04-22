@@ -2,6 +2,7 @@ import argparse
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from get import FullGET, PairwiseGET, GINBaseline, ETFaithful, collate_get_batch
 from get.data import CachedGraphDataset
@@ -95,7 +96,8 @@ def _train_binary(model, train_ds, val_ds, test_ds, epochs, batch_size, device):
                 ps.extend(prob.cpu().numpy().tolist())
         return _safe_auc(ys, ps)
 
-    for _ in range(epochs):
+    epoch_bar = tqdm(range(epochs), desc="Training", leave=False)
+    for _ in epoch_bar:
         model.train()
         losses = []
         for b in train_loader:
@@ -115,6 +117,7 @@ def _train_binary(model, train_ds, val_ds, test_ds, epochs, batch_size, device):
         if val_auc > best_auc:
             best_auc = val_auc
             best = test_auc
+        epoch_bar.set_postfix({"train": f"{history['train_loss'][-1]:.3f}", "val": f"{val_auc:.3f}"})
     return {"metric": float(best if best is not None else 0.5), "history": history}
 
 
