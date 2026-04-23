@@ -1,42 +1,42 @@
 {
   "task": "graph_anomaly",
-  "dataset": "synth",
+  "dataset": "YelpChi",
   "summary": {
-    "0.4": {
-      "fullget_mean": 0.8333333333333333,
+    "0.01": {
+      "fullget_mean": 0.5,
       "fullget_std": 0.0,
-      "fullget_f1_mean": 0.6666666666666666,
+      "fullget_f1_mean": 1.0,
       "fullget_f1_std": 0.0,
-      "et_faithful_mean": 0.4444444444444444,
+      "et_faithful_mean": 0.5,
       "et_faithful_std": 0.0,
-      "et_faithful_f1_mean": 0.35714285714285715,
+      "et_faithful_f1_mean": 1.0,
       "et_faithful_f1_std": 0.0
     }
   },
   "runs": {
-    "0.4": [
+    "0.01": [
       {
         "seed": 123,
-        "fullget_auc": 0.8333333333333333,
-        "fullget_f1": 0.6666666666666666,
-        "et_faithful_auc": 0.4444444444444444,
-        "et_faithful_f1": 0.35714285714285715,
+        "fullget_auc": 0.5,
+        "fullget_f1": 1.0,
+        "et_faithful_auc": 0.5,
+        "et_faithful_f1": 1.0,
         "histories": {
           "fullget": {
             "train_loss": [
-              0.9914228916168213
+              0.10099457502365113
             ],
             "val_auc": [
-              1.0
+              0.5
             ],
             "val_f1": [
               1.0
             ],
             "test_auc": [
-              0.8333333333333333
+              0.5
             ],
             "test_f1": [
-              0.6666666666666666
+              1.0
             ],
             "bad_batches": [
               0.0
@@ -44,19 +44,19 @@
           },
           "et_faithful": {
             "train_loss": [
-              1.4256663918495178
+              0.3628037452697754
             ],
             "val_auc": [
               0.5
             ],
             "val_f1": [
-              0.4444444444444444
+              1.0
             ],
             "test_auc": [
-              0.4444444444444444
+              0.5
             ],
             "test_f1": [
-              0.35714285714285715
+              1.0
             ],
             "bad_batches": [
               0.0
