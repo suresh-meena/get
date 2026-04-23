@@ -3,18 +3,15 @@ from .et_faithful import ETFaithfulGraphModel
 import torch
 import torch.nn as nn
 
-try:
-    from torch_geometric.nn import GINConv, global_add_pool
-except ImportError:
-    GINConv = None
-    global_add_pool = None
-
 class GINBaseline(nn.Module):
     def __init__(self, in_dim, d, num_classes, num_layers=3):
         super().__init__()
-        if GINConv is None or global_add_pool is None:
-            raise ImportError("torch_geometric is required to use GINBaseline")
+        try:
+            from torch_geometric.nn import GINConv, global_add_pool
+        except ImportError as exc:
+            raise ImportError("torch_geometric is required to use GINBaseline") from exc
         self.encoder = nn.Linear(in_dim, d)
+        self.global_add_pool = global_add_pool
         self.convs = nn.ModuleList()
         for _ in range(num_layers):
             mlp = nn.Sequential(
@@ -39,7 +36,7 @@ class GINBaseline(nn.Module):
             x = torch.relu(x)
             
         if task_level == 'graph':
-            x = global_add_pool(x, batch_data.batch)
+            x = self.global_add_pool(x, batch_data.batch)
             out = self.readout(x)
             return out, None
         else:

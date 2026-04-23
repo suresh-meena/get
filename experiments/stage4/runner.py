@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import random
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ import sys
 
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -59,9 +61,13 @@ def _safe_auc(y_true: list[float], y_score: list[float]) -> float:
     if roc_auc_score is None:
         # Fallback proxy when sklearn is unavailable.
         return 0.5
-    if len(set(int(v >= 0.5) for v in y_true)) < 2:
+    y_bin = [int(float(v) >= 0.5) for v in y_true]
+    if len(set(y_bin)) < 2:
         return 0.5
-    return float(roc_auc_score(y_true, y_score))
+    try:
+        return float(roc_auc_score(y_bin, y_score))
+    except Exception:
+        return 0.5
 
 
 def _safe_f1(y_true: list[float], y_score: list[float], threshold: float = 0.5) -> float:
@@ -79,6 +85,13 @@ def _safe_f1(y_true: list[float], y_score: list[float], threshold: float = 0.5) 
             return 0.0 if denom == 0 else (2 * tp) / denom
         return float((_f1_for(0) + _f1_for(1)) / 2.0)
     return float(f1_score(y_bin, y_pred, average="macro"))
+
+
+def _is_cuda_oom(exc: Exception) -> bool:
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    msg = str(exc).lower()
+    return ("out of memory" in msg) and ("cuda" in msg)
 
 
 def _synthetic_graph(
@@ -184,10 +197,15 @@ def _to_simple_graph_from_obj(obj) -> SimpleNamespace:
         edge_index = obj["edge_index"]
         y = obj["y"]
         num_nodes = int(obj.get("num_nodes", x.size(0)))
+        if isinstance(y, torch.Tensor) and y.dim() > 1:
+            y = y.argmax(dim=-1).to(dtype=torch.long)
         return SimpleNamespace(num_nodes=num_nodes, edge_index=edge_index, x=x, y=y)
     if hasattr(obj, "edge_index") and hasattr(obj, "x") and hasattr(obj, "y"):
         num_nodes = int(getattr(obj, "num_nodes", obj.x.size(0)))
-        return SimpleNamespace(num_nodes=num_nodes, edge_index=obj.edge_index, x=obj.x, y=obj.y)
+        y = obj.y
+        if isinstance(y, torch.Tensor) and y.dim() > 1:
+            y = y.argmax(dim=-1).to(dtype=torch.long)
+        return SimpleNamespace(num_nodes=num_nodes, edge_index=obj.edge_index, x=obj.x, y=y)
     raise ValueError("Unsupported anomaly graph object format.")
 
 
@@ -205,13 +223,55 @@ def _load_anomaly_graph(dataset_name: str, data_root: str) -> SimpleNamespace:
             else:
                 ds = FraudAmazonDataset(raw_dir=data_root)
             g = ds[0]
-            src, dst = g.edges()
-            edge_index = torch.stack([src.long(), dst.long()], dim=0)
+            if getattr(g, "is_homogeneous", False):
+                src, dst = g.edges()
+            else:
+                src_parts = []
+                dst_parts = []
+                for etype in g.canonical_etypes:
+                    s, d = g.edges(etype=etype)
+                    src_parts.append(s.long())
+                    dst_parts.append(d.long())
+                if src_parts:
+                    src = torch.cat(src_parts, dim=0)
+                    dst = torch.cat(dst_parts, dim=0)
+                else:
+                    src = torch.empty(0, dtype=torch.long)
+                    dst = torch.empty(0, dtype=torch.long)
+            edge_index = torch.stack([src, dst], dim=0)
             x = g.ndata.get("feature", g.ndata.get("feat")).float()
             y = g.ndata.get("label").view(-1).long()
             return SimpleNamespace(num_nodes=int(g.num_nodes()), edge_index=edge_index, x=x, y=y)
         except Exception:
             pass
+
+    # Repo-local Yelp fallback. The workspace already carries a processed cache
+    # in data/Yelp/processed/data.pt, which is enough to build the anomaly ego graph.
+    if norm in {"yelp", "yelpchi"}:
+        local_yelp = Path("data") / "Yelp" / "processed" / "data.pt"
+        if local_yelp.exists():
+            try:
+                obj = torch.load(local_yelp, weights_only=False)
+            except Exception:
+                pass
+            else:
+                candidate = obj[0] if isinstance(obj, tuple) and obj else obj
+                y = candidate.get("y") if isinstance(candidate, dict) else getattr(candidate, "y", None)
+                # Compatibility mode for repo-local Yelp cache where labels are
+                # multi-hot vectors [N, C]. Convert to binary anomaly target:
+                # any positive class -> 1, else 0.
+                if isinstance(y, torch.Tensor) and y.dim() > 1:
+                    print(
+                        "Warning: Using compatibility conversion for Yelp fallback labels: "
+                        "multi-dimensional y -> binary (any positive class)."
+                    )
+                    y_bin = (y.sum(dim=-1) > 0).to(dtype=torch.long)
+                    if isinstance(candidate, dict):
+                        candidate = dict(candidate)
+                        candidate["y"] = y_bin
+                    else:
+                        candidate.y = y_bin
+                return _to_simple_graph_from_obj(candidate)
 
     # PyGOD loader for tfinance / tsocial.
     if norm in {"tfinance", "tsocial"}:
@@ -232,7 +292,9 @@ def _load_anomaly_graph(dataset_name: str, data_root: str) -> SimpleNamespace:
 
     raise RuntimeError(
         f"Could not load anomaly dataset '{dataset_name}'. "
-        f"Supported: YelpChi/Amazon via DGL, T-Finance/T-Social via pygod, or local .pt in {data_root}."
+        f"Supported: YelpChi/Amazon via DGL, YelpChi via data/Yelp/processed/data.pt "
+        f"(only if labels are already 1D binary), "
+        f"T-Finance/T-Social via pygod, or local .pt in {data_root}."
     )
 
 
@@ -248,7 +310,9 @@ def _maybe_cache_ego_dataset(
     tag = f"{_normalized_name(dataset_name)}_ego_h{int(num_hops)}_l{lim}_n{int(base_graph.num_nodes)}.pt"
     cache_path = Path(cache_dir) / tag
     if cache_path.exists():
+        print(f"Loading cached ego dataset from {cache_path}")
         return torch.load(cache_path, weights_only=False)
+    print(f"Building ego dataset cache at {cache_path}")
     ds = build_ego_graph_dataset(base_graph, num_hops=num_hops, limit=limit)
     torch.save(ds, cache_path)
     return ds
@@ -309,11 +373,11 @@ def _train_graph_classification(
     )
 
     history = {"train_loss": [], "test_acc": [], "bad_batches": []}
-    for _ in range(int(epochs)):
+    for _ in tqdm(range(int(epochs)), desc="Epochs", leave=False):
         model.train()
         train_losses = []
         bad = 0
-        for batch in train_loader:
+        for batch in tqdm(train_loader, desc="Train", leave=False):
             try:
                 batch = batch.to(device)
                 opt.zero_grad()
@@ -331,7 +395,7 @@ def _train_graph_classification(
         model.eval()
         y_true, y_pred = [], []
         with torch.no_grad():
-            for batch in test_loader:
+            for batch in tqdm(test_loader, desc="Eval", leave=False):
                 batch = batch.to(device)
                 logits, _ = model(batch, task_level="graph")
                 preds = logits.argmax(dim=-1)
@@ -372,6 +436,7 @@ def _train_graph_binary_with_val(
     weight_decay: float = 1e-5,
     loader_kwargs: dict | None = None,
     use_weighted_bce: bool = True,
+    eval_batch_size: int | None = None,
 ) -> FitResult:
     model = model.to(device)
     opt = _build_optimizer(model, lr=lr, wd=weight_decay)
@@ -394,16 +459,18 @@ def _train_graph_binary_with_val(
         collate_fn=collate_get_batch,
         **loader_kwargs,
     )
+    eval_bs = int(eval_batch_size) if eval_batch_size is not None else int(batch_size)
+    eval_bs = max(1, eval_bs)
     val_loader = DataLoader(
         val_ds,
-        batch_size=batch_size,
+        batch_size=eval_bs,
         shuffle=False,
         collate_fn=collate_get_batch,
         **loader_kwargs,
     )
     test_loader = DataLoader(
         test_ds,
-        batch_size=batch_size,
+        batch_size=eval_bs,
         shuffle=False,
         collate_fn=collate_get_batch,
         **loader_kwargs,
@@ -419,11 +486,11 @@ def _train_graph_binary_with_val(
     }
     best = {"val_auc": -1.0, "test_auc": 0.5, "test_f1": 0.0}
 
-    for _ in range(int(epochs)):
+    for _ in tqdm(range(int(epochs)), desc="Epochs", leave=False):
         model.train()
         losses = []
         bad = 0
-        for batch in train_loader:
+        for batch in tqdm(train_loader, desc="Train", leave=False):
             try:
                 batch = batch.to(device)
                 opt.zero_grad()
@@ -439,12 +506,36 @@ def _train_graph_binary_with_val(
         def _collect(loader: DataLoader) -> tuple[list[float], list[float]]:
             ys, ps = [], []
             model.eval()
+            run_on_cpu = False
+            cpu_model = None
             with torch.no_grad():
-                for b in loader:
-                    b = b.to(device)
-                    logits, _ = model(b, task_level="graph")
-                    prob = torch.sigmoid(logits.view(-1))
-                    ys.extend(b.y.view(-1).float().cpu().tolist())
+                for b in tqdm(loader, desc="Eval", leave=False):
+                    if run_on_cpu:
+                        b_cpu = b.to("cpu")
+                        logits, _ = cpu_model(b_cpu, task_level="graph")
+                        prob = torch.sigmoid(logits.view(-1))
+                        ys.extend(b_cpu.y.view(-1).float().cpu().tolist())
+                        ps.extend(prob.cpu().tolist())
+                        continue
+                    try:
+                        b_dev = b.to(device)
+                        logits, _ = model(b_dev, task_level="graph")
+                        prob = torch.sigmoid(logits.view(-1))
+                        ys.extend(b_dev.y.view(-1).float().cpu().tolist())
+                        ps.extend(prob.cpu().tolist())
+                    except Exception as exc:
+                        if not (str(device).startswith("cuda") and _is_cuda_oom(exc)):
+                            raise
+                        torch.cuda.empty_cache()
+                        if cpu_model is None:
+                            cpu_model = copy.deepcopy(model).to("cpu")
+                            cpu_model.eval()
+                            print("Warning: CUDA OOM in eval; switching remaining eval batches to CPU.")
+                        run_on_cpu = True
+                        b_cpu = b.to("cpu")
+                        logits, _ = cpu_model(b_cpu, task_level="graph")
+                        prob = torch.sigmoid(logits.view(-1))
+                        ys.extend(b_cpu.y.view(-1).float().cpu().tolist())
                     ps.extend(prob.cpu().tolist())
             return ys, ps
 
@@ -477,6 +568,21 @@ def _mean_std(xs: list[float]) -> tuple[float, float]:
     return mean, std
 
 
+def _recommend_anomaly_batch_size(dataset: list[dict], requested: int) -> int:
+    if len(dataset) == 0:
+        return 1
+    max_nodes = max(int(item["x"].size(0)) for item in dataset)
+    if max_nodes <= 0:
+        return 1
+    # Keep the total node budget per batch small enough to avoid the
+    # quadratic motif-energy blow-up on large ego graphs.
+    node_budget = 512
+    hard_cap = 8
+    dynamic_cap = max(1, node_budget // max_nodes)
+    safe_batch = min(int(requested), dynamic_cap, hard_cap)
+    return max(1, int(safe_batch))
+
+
 def run_graph_classification(args: argparse.Namespace) -> dict:
     if _normalized_name(args.dataset) in {"tu8", "alltu"}:
         target_datasets = list(TU8_DATASETS)
@@ -484,16 +590,26 @@ def run_graph_classification(args: argparse.Namespace) -> dict:
         target_datasets = [args.dataset]
 
     all_payloads = {}
-    for dataset_name in target_datasets:
+    skipped_datasets: list[str] = []
+    for dataset_name in tqdm(target_datasets, desc="Datasets"):
         runs = []
-        for seed in args.seeds:
+        for seed in tqdm(args.seeds, desc=f"Seeds[{dataset_name}]", leave=False):
             set_seed(int(seed))
             if _normalized_name(dataset_name) == "synth":
                 raw_ds = make_synth_classification_dataset(args.num_graphs, args.in_dim, seed=int(seed))
             else:
-                raw_ds = load_tu_dataset(dataset_name, limit=args.limit_graphs if args.limit_graphs > 0 else None)
+                try:
+                    raw_ds = load_tu_dataset(dataset_name, limit=args.limit_graphs if args.limit_graphs > 0 else None)
+                except Exception as exc:
+                    print(f"Skipping classification dataset '{dataset_name}': {exc}")
+                    skipped_datasets.append(dataset_name)
+                    runs = []
+                    break
                 if len(raw_ds) == 0:
-                    raise RuntimeError(f"No samples loaded for classification dataset '{dataset_name}'.")
+                    print(f"Skipping classification dataset '{dataset_name}': no samples loaded.")
+                    skipped_datasets.append(dataset_name)
+                    runs = []
+                    break
 
             proc_ds = _prepare_get_cached_dataset(
                 dataset=raw_ds,
@@ -508,9 +624,29 @@ def run_graph_classification(args: argparse.Namespace) -> dict:
             num_classes = int(max(unique_labels)) + 1 if unique_labels else 2
             in_dim = int(proc_ds[0]["x"].size(1))
 
-            if args.cv_folds > 1 and StratifiedKFold is not None and len(proc_ds) >= args.cv_folds:
-                splitter = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=int(seed))
-                split_indices = list(splitter.split([0] * len(labels), labels))
+            class_counts = [labels.count(label) for label in unique_labels]
+            max_stratified_folds = min(class_counts) if class_counts else 0
+            requested_folds = int(args.cv_folds)
+            if (
+                requested_folds > 1
+                and StratifiedKFold is not None
+                and len(unique_labels) > 1
+                and max_stratified_folds >= 2
+            ):
+                effective_folds = min(requested_folds, max_stratified_folds, len(proc_ds))
+                if effective_folds >= 2:
+                    if effective_folds != requested_folds:
+                        print(
+                            f"Using {effective_folds}-fold CV for '{dataset_name}' "
+                            f"(requested {requested_folds}, class counts={class_counts})"
+                        )
+                    splitter = StratifiedKFold(n_splits=effective_folds, shuffle=True, random_state=int(seed))
+                    split_indices = list(splitter.split([0] * len(labels), labels))
+                else:
+                    split = int(0.8 * len(proc_ds))
+                    idx_train = list(range(split))
+                    idx_test = list(range(split, len(proc_ds)))
+                    split_indices = [(idx_train, idx_test)]
             else:
                 split = int(0.8 * len(proc_ds))
                 idx_train = list(range(split))
@@ -518,9 +654,10 @@ def run_graph_classification(args: argparse.Namespace) -> dict:
                 split_indices = [(idx_train, idx_test)]
 
             fold_runs = []
+            loader_num_workers = None if int(args.num_workers) < 0 else int(args.num_workers)
             loader_kwargs = build_dataloader_kwargs(
                 args.device,
-                num_workers=args.num_workers,
+                num_workers=loader_num_workers,
                 prefetch_factor=args.prefetch_factor,
             )
             for fold_id, (train_idx, test_idx) in enumerate(split_indices):
@@ -594,6 +731,10 @@ def run_graph_classification(args: argparse.Namespace) -> dict:
                     fold_run["histories"]["gin"] = gin_res.history
                 fold_runs.append(fold_run)
 
+            if not fold_runs:
+                runs = []
+                break
+
             runs.append(
                 {
                     "seed": int(seed),
@@ -620,6 +761,13 @@ def run_graph_classification(args: argparse.Namespace) -> dict:
             "runs": runs,
         }
 
+    if len(all_payloads) == 0:
+        skipped = ", ".join(sorted(set(skipped_datasets))) if skipped_datasets else "all requested datasets"
+        raise RuntimeError(f"No TU classification datasets could be loaded ({skipped}).")
+
+    if skipped_datasets:
+        print(f"Skipped unavailable TU datasets: {', '.join(sorted(set(skipped_datasets)))}")
+
     if len(all_payloads) == 1:
         only = next(iter(all_payloads.values()))
         return {"task": "graph_classification", **only}
@@ -627,33 +775,59 @@ def run_graph_classification(args: argparse.Namespace) -> dict:
 
 
 def run_graph_anomaly(args: argparse.Namespace) -> dict:
+    prebuilt_ds: list[dict] | None = None
+    if _normalized_name(args.dataset) != "synth":
+        base_graph = _load_anomaly_graph(args.dataset, data_root=args.data_root)
+        limit = args.ego_limit if args.ego_limit > 0 else None
+        print(
+            f"Preparing anomaly dataset '{args.dataset}' with ego_limit="
+            f"{limit if limit is not None else 'all'} and ego_hops={args.ego_hops}"
+        )
+        if limit is None and int(base_graph.num_nodes) > 200000:
+            raise RuntimeError(
+                f"Dataset '{args.dataset}' resolved to a very large base graph "
+                f"({int(base_graph.num_nodes)} nodes). "
+                "Set --ego_limit to a reasonable value (e.g. 5000-50000), "
+                "or provide the intended YelpChi binary anomaly source."
+            )
+        use_cache = bool(args.cache_processed or limit is not None or _normalized_name(args.dataset) != "synth")
+        if use_cache:
+            prebuilt_ds = _maybe_cache_ego_dataset(
+                base_graph=base_graph,
+                dataset_name=args.dataset,
+                num_hops=args.ego_hops,
+                limit=limit,
+                cache_dir=args.cache_dir,
+            )
+        else:
+            prebuilt_ds = build_ego_graph_dataset(base_graph, num_hops=args.ego_hops, limit=limit)
+        prebuilt_ds = _prepare_get_cached_dataset(
+            dataset=prebuilt_ds,
+            name=f"stage4_anom_{args.dataset}_h{args.ego_hops}",
+            cache_dir=args.cache_dir,
+            max_motifs=args.max_motifs if args.max_motifs > 0 else None,
+            pe_k=args.get_pe_k,
+            enable_cache=use_cache,
+        )
+
     by_rate: dict[str, list[dict]] = {}
-    for rate in args.anomaly_label_rates:
+    for rate in tqdm(args.anomaly_label_rates, desc="Label rates"):
         runs = []
-        for seed in args.seeds:
+        for seed in tqdm(args.seeds, desc=f"Seeds[{rate}]", leave=False):
             set_seed(int(seed))
             if _normalized_name(args.dataset) == "synth":
                 ds = make_synth_anomaly_dataset(args.num_graphs, args.in_dim, seed=int(seed))
             else:
-                base_graph = _load_anomaly_graph(args.dataset, data_root=args.data_root)
-                limit = args.ego_limit if args.ego_limit > 0 else None
-                if args.cache_processed:
-                    ds = _maybe_cache_ego_dataset(
-                        base_graph=base_graph,
-                        dataset_name=args.dataset,
-                        num_hops=args.ego_hops,
-                        limit=limit,
-                        cache_dir=args.cache_dir,
-                    )
-                else:
-                    ds = build_ego_graph_dataset(base_graph, num_hops=args.ego_hops, limit=limit)
-                ds = _prepare_get_cached_dataset(
-                    dataset=ds,
-                    name=f"stage4_anom_{args.dataset}_h{args.ego_hops}",
-                    cache_dir=args.cache_dir,
-                    max_motifs=args.max_motifs if args.max_motifs > 0 else None,
-                    pe_k=args.get_pe_k,
-                    enable_cache=args.cache_processed,
+                ds = prebuilt_ds
+                if ds is None:
+                    raise RuntimeError("Failed to prepare anomaly dataset.")
+
+            effective_batch_size = _recommend_anomaly_batch_size(ds, args.batch_size)
+            if effective_batch_size != int(args.batch_size):
+                max_nodes = max(int(item["x"].size(0)) for item in ds) if len(ds) else 0
+                print(
+                    f"Using anomaly batch_size={effective_batch_size} "
+                    f"(requested {args.batch_size}, max_nodes={max_nodes})"
                 )
 
             split = build_anomaly_protocol_split(
@@ -688,9 +862,10 @@ def run_graph_anomaly(args: argparse.Namespace) -> dict:
                 et_official_mode=(args.et_mask_mode == "official_dense"),
                 node_cap=args.et_node_cap,
             )
+            loader_num_workers = None if int(args.num_workers) < 0 else int(args.num_workers)
             loader_kwargs = build_dataloader_kwargs(
                 args.device,
-                num_workers=args.num_workers,
+                num_workers=loader_num_workers,
                 prefetch_factor=args.prefetch_factor,
             )
             full_res = _train_graph_binary_with_val(
@@ -699,10 +874,11 @@ def run_graph_anomaly(args: argparse.Namespace) -> dict:
                 val_ds,
                 test_ds,
                 args.epochs,
-                args.batch_size,
+                effective_batch_size,
                 args.device,
                 loader_kwargs=loader_kwargs,
                 use_weighted_bce=args.weighted_bce,
+                eval_batch_size=1,
             )
             et_res = _train_graph_binary_with_val(
                 et_faithful,
@@ -710,10 +886,11 @@ def run_graph_anomaly(args: argparse.Namespace) -> dict:
                 val_ds,
                 test_ds,
                 args.epochs,
-                args.batch_size,
+                effective_batch_size,
                 args.device,
                 loader_kwargs=loader_kwargs,
                 use_weighted_bce=args.weighted_bce,
+                eval_batch_size=1,
             )
             runs.append(
                 {
@@ -759,13 +936,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--in_dim", type=int, default=8)
     parser.add_argument("--hidden_dim", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--num_steps", type=int, default=4)
     parser.add_argument("--cv_folds", type=int, default=1)
     parser.add_argument("--lambda_3", type=float, default=0.5)
     parser.add_argument("--seeds", nargs="+", type=int, default=[123])
     parser.add_argument("--device", default=("cuda" if torch.cuda.is_available() else "cpu"))
-    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--num_workers", type=int, default=-1)
     parser.add_argument("--prefetch_factor", type=int, default=2)
     parser.add_argument("--cache_processed", action="store_true", default=False)
     parser.add_argument("--cache_dir", default=".cache/get_data")
@@ -797,10 +974,6 @@ def main() -> int:
     # ET anomaly protocol uses weighted BCE by default.
     if args.task == "graph_anomaly" and not args.weighted_bce:
         args.weighted_bce = True
-    # ET TU graph classification protocol uses 10-fold CV.
-    if args.task == "graph_classification" and args.cv_folds <= 1 and _normalized_name(args.dataset) != "synth":
-        args.cv_folds = 10
-
     # Current runner focuses on synthetic ET-style smoke/ablation diagnostics.
     if args.dataset != "synth" and args.task == "graph_classification":
         # Fallback to TU where available, otherwise still synthetic.

@@ -124,7 +124,7 @@ def _train_binary(model, train_ds, val_ds, test_ds, epochs, batch_size, device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--hidden_dim", type=int, default=96)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--data_root", default="data/OGB")

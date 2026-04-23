@@ -6,7 +6,7 @@ def main():
     parser.add_argument("--task", choices=["tu", "anomaly"], required=True)
     parser.add_argument("--dataset", default="MUTAG")
     parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=256)
     args, unknown = parser.parse_known_args()
 
     mapped_task = "graph_classification" if args.task == "tu" else "graph_anomaly"

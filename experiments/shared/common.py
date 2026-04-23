@@ -104,7 +104,13 @@ def save_results(name, payload):
 
 def load_tu_dataset(dataset_name, limit=None):
     from torch_geometric.datasets import TUDataset
-    ds = TUDataset(root="data/TU", name=dataset_name)
+    tu_root = Path("data") / "TU"
+    root = tu_root
+    name = dataset_name
+    if str(dataset_name).upper() == "MUTAGENICITY":
+        root = tu_root / "MUTAGENICITY"
+        name = "Mutagenicity"
+    ds = TUDataset(root=str(root), name=name)
     if limit is not None: ds = ds[:int(limit)]
     out = []
     for idx, data in enumerate(ds):
@@ -224,7 +230,7 @@ def build_ego_graph_dataset(data, num_hops: int = 1, limit: int | None = None, u
     adj = _build_undirected_adj(n, edge_index)
 
     samples: list[dict] = []
-    for center in centers:
+    for center in tqdm(centers, desc=f"Building ego graphs (h={int(num_hops)})", leave=False):
         nodes = _k_hop_nodes(adj, center=center, num_hops=int(num_hops))
         local_index = {node: i for i, node in enumerate(nodes)}
 

@@ -39,7 +39,7 @@ def main():
 
     print(f"\n--- Training {args.model} on ZINC ---")
     trainer = GETTrainer(model, task_type='regression', device=device, lr=1e-3)
-    res = trainer.run(tr_ds, val_ds, ts_ds, args.epochs, 128)
+    res = trainer.run(tr_ds, val_ds, ts_ds, args.epochs, 256)
     print(f"ZINC Test MAE: {res['metric']:.4f}")
 
     save_results(f"zinc_{args.model}_results", res)

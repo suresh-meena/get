@@ -19,5 +19,8 @@ torch-geometric
 torch-scatter
 torch-sparse
 dgl
+torchdata==0.7.1
+PyYAML
+pydantic
 pygod
 ogb

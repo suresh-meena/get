@@ -30,6 +30,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_pairs", type=int, default=500)
     parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -56,7 +57,7 @@ def main():
             margin_loss_weight=0.05,
             logit_margin=1.0,
         )
-        results[name] = trainer.run(train_ds, val_ds, test_ds, args.epochs, 32)
+        results[name] = trainer.run(train_ds, val_ds, test_ds, args.epochs, args.batch_size)
         print(f"{name} Test AUC: {results[name]['metric']:.4f}")
 
     save_results("exp1_wedge_results", results)

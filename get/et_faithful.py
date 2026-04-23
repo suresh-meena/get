@@ -120,6 +120,8 @@ class ETFaithfulGraphModel(nn.Module):
         ptr = batch_data.ptr
         c2 = batch_data.c_2
         u2 = batch_data.u_2
+        pe_cls = getattr(batch_data, "pe_cls", None)
+        pe_cls_ptr = getattr(batch_data, "pe_cls_ptr", None)
 
         token_chunks = []
         center_ids = []
@@ -155,7 +157,15 @@ class ETFaithfulGraphModel(nn.Module):
             if self.allow_self:
                 adj_aug.fill_diagonal_(True)
 
-            pe = laplacian_pe_from_adjacency(adj_aug, k=self.pe_k, training=self.training)
+            if (
+                pe_cls is not None
+                and pe_cls_ptr is not None
+                and not self.allow_self
+                and int(pe_cls_ptr[g_idx + 1].item()) > int(pe_cls_ptr[g_idx].item())
+            ):
+                pe = pe_cls[int(pe_cls_ptr[g_idx].item()) : int(pe_cls_ptr[g_idx + 1].item())]
+            else:
+                pe = laplacian_pe_from_adjacency(adj_aug, k=self.pe_k, training=self.training)
             z_cls = self.cls_token.expand(1, -1)
             z_aug = torch.cat([z_cls, z_g], dim=0) + self.pe_proj(pe.to(dtype=z_g.dtype))
             token_chunks.append(z_aug)
@@ -183,41 +193,44 @@ class ETFaithfulGraphModel(nn.Module):
 
         if self.mask_mode == "official_dense" and self.mask_modulator is not None:
             edge_attr = getattr(batch_data, "edge_attr", None)
-            c2 = batch_data.c_2
-            u2 = batch_data.u_2
+            c2 = batch_data.c_2.to(device=x.device)
+            u2 = batch_data.u_2.to(device=x.device)
+            ptr = batch_data.ptr.to(device=x.device)
             bsz = len(graph_chunks)
             max_n = max(int(chunk["size"]) for chunk in graph_chunks)
             feat_dim = int(edge_attr.size(-1)) if edge_attr is not None else 1
 
             # Static plan for copying token states into padded dense tensors.
-            starts = torch.tensor([int(chunk["start"]) for chunk in graph_chunks], dtype=torch.long, device=x.device)
             sizes = torch.tensor([int(chunk["size"]) for chunk in graph_chunks], dtype=torch.long, device=x.device)
 
+            if bsz > 0 and max_n > 0:
+                batch_grid = torch.arange(bsz, dtype=torch.long, device=x.device)[:, None].expand(bsz, max_n)
+                local_grid = torch.arange(max_n, dtype=torch.long, device=x.device)[None, :].expand(bsz, max_n)
+                valid_grid = local_grid < sizes[:, None]
+                x_batch_ids = batch_grid[valid_grid]
+                x_local_ids = local_grid[valid_grid]
+                x_source_ids = torch.arange(x.size(0), dtype=torch.long, device=x.device)
+            else:
+                x_batch_ids = torch.empty((0,), dtype=torch.long, device=x.device)
+                x_local_ids = torch.empty((0,), dtype=torch.long, device=x.device)
+                x_source_ids = torch.empty((0,), dtype=torch.long, device=x.device)
+
             if edge_attr is not None:
-                batch_ids = []
-                src_ids = []
-                dst_ids = []
-                edge_ids = []
-                for i, chunk in enumerate(graph_chunks):
-                    size = int(chunk["size"])
-                    n = size - 1
-                    orig_start = int(chunk["orig_start"])
-                    orig_end = orig_start + n
-                    mask = (c2 >= orig_start) & (c2 < orig_end) & (u2 >= orig_start) & (u2 < orig_end)
-                    if bool(mask.any()):
-                        local_src = ((c2[mask] - orig_start) + 1).to(dtype=torch.long, device=x.device)
-                        local_dst = ((u2[mask] - orig_start) + 1).to(dtype=torch.long, device=x.device)
-                        local_edge_ids = torch.nonzero(mask, as_tuple=False).reshape(-1).to(dtype=torch.long, device=x.device)
-                        local_batch = torch.full_like(local_src, i)
-                        batch_ids.append(local_batch)
-                        src_ids.append(local_src)
-                        dst_ids.append(local_dst)
-                        edge_ids.append(local_edge_ids)
-                if edge_ids:
-                    edge_batch_ids = torch.cat(batch_ids, dim=0)
-                    edge_src_ids = torch.cat(src_ids, dim=0)
-                    edge_dst_ids = torch.cat(dst_ids, dim=0)
-                    edge_global_ids = torch.cat(edge_ids, dim=0)
+                if c2.numel() > 0:
+                    graph_ids = torch.bucketize(c2, ptr[1:-1], right=True)
+                    edge_starts = ptr[graph_ids]
+                    edge_ends = ptr[graph_ids + 1]
+                    edge_mask = (u2 >= edge_starts) & (u2 < edge_ends)
+                else:
+                    graph_ids = c2.new_empty((0,), dtype=torch.long)
+                    edge_starts = c2.new_empty((0,), dtype=torch.long)
+                    edge_mask = c2.new_empty((0,), dtype=torch.bool)
+
+                if bool(edge_mask.any()):
+                    edge_global_ids = torch.nonzero(edge_mask, as_tuple=False).reshape(-1).to(dtype=torch.long, device=x.device)
+                    edge_batch_ids = graph_ids[edge_mask].to(dtype=torch.long, device=x.device)
+                    edge_src_ids = (c2[edge_mask] - edge_starts[edge_mask] + 1).to(dtype=torch.long, device=x.device)
+                    edge_dst_ids = (u2[edge_mask] - edge_starts[edge_mask] + 1).to(dtype=torch.long, device=x.device)
                 else:
                     edge_batch_ids = torch.empty((0,), dtype=torch.long, device=x.device)
                     edge_src_ids = torch.empty((0,), dtype=torch.long, device=x.device)
@@ -232,18 +245,28 @@ class ETFaithfulGraphModel(nn.Module):
                     edge_static_template[i, :size, :size, 0] = adj_local
                 edge_batch_ids = edge_src_ids = edge_dst_ids = edge_global_ids = None
 
+            if edge_attr is not None:
+                edge_batch_static = None
+            else:
+                edge_batch_static = edge_static_template
+
             dense_cache = {
                 "bsz": bsz,
                 "max_n": max_n,
                 "feat_dim": feat_dim,
-                "starts": starts,
                 "sizes": sizes,
+                "x_batch": x.new_zeros((bsz, max_n, x.size(-1))),
+                "x_batch_ids": x_batch_ids,
+                "x_local_ids": x_local_ids,
+                "x_source_ids": x_source_ids,
                 "edge_attr": edge_attr,
+                "edge_batch": None if edge_attr is not None else edge_static_template,
                 "edge_batch_ids": edge_batch_ids,
                 "edge_src_ids": edge_src_ids,
                 "edge_dst_ids": edge_dst_ids,
                 "edge_global_ids": edge_global_ids,
                 "edge_static_template": edge_static_template,
+                "edge_batch_static": edge_batch_static,
             }
 
         with torch.enable_grad():
@@ -259,24 +282,24 @@ class ETFaithfulGraphModel(nn.Module):
                     # Official ET update uses grad wrt g, then updates x directly.
                     g = norm(x)
                     dense_modulation = None
+                    dense_x_batch = None
                     if dense_cache is not None:
-                        dense_modulation = []
                         bsz = dense_cache["bsz"]
                         max_n = dense_cache["max_n"]
                         feat_dim = dense_cache["feat_dim"]
-                        starts = dense_cache["starts"]
                         sizes = dense_cache["sizes"]
                         edge_attr = dense_cache["edge_attr"]
-                        x_batch = x.new_zeros((bsz, max_n, x.size(-1)))
-                        edge_batch = x.new_zeros((bsz, max_n, max_n, feat_dim))
-
-                        # Copy per-graph token blocks into padded [B, N, D] layout.
-                        for i in range(bsz):
-                            start = int(starts[i].item())
-                            size = int(sizes[i].item())
-                            x_batch[i, :size] = x[start : start + size]
+                        x_batch = dense_cache["x_batch"]
+                        x_batch.zero_()
+                        x_batch_ids = dense_cache["x_batch_ids"]
+                        x_local_ids = dense_cache["x_local_ids"]
+                        x_source_ids = dense_cache["x_source_ids"]
+                        if x_batch_ids.numel() > 0:
+                            x_batch[x_batch_ids, x_local_ids] = x[x_source_ids]
+                        x_batch = x_batch.requires_grad_(True)
 
                         if edge_attr is not None:
+                            edge_batch = x.new_zeros((bsz, max_n, max_n, feat_dim))
                             edge_batch_ids = dense_cache["edge_batch_ids"]
                             if edge_batch_ids.numel() > 0:
                                 edge_src_ids = dense_cache["edge_src_ids"]
@@ -286,12 +309,11 @@ class ETFaithfulGraphModel(nn.Module):
                                     dtype=x.dtype, device=x.device
                                 )
                         else:
-                            edge_batch.copy_(dense_cache["edge_static_template"].to(device=x.device, dtype=x.dtype))
+                            edge_batch = dense_cache["edge_batch"]
 
-                        mod_batch = self.mask_modulator.dense_modulation_batched(x_batch, edge_batch)  # [B, H, N, N]
-                        for i, chunk in enumerate(graph_chunks):
-                            size = int(chunk["size"])
-                            dense_modulation.append(mod_batch[i, :, :size, :size])
+                        dense_modulation = self.mask_modulator.dense_modulation_batched(x_batch, edge_batch)  # [B, H, N, N]
+                        g = norm(x_batch)
+                        dense_x_batch = x_batch
                     e = core.energy(
                         g,
                         c_aug,
@@ -300,7 +322,12 @@ class ETFaithfulGraphModel(nn.Module):
                         self.mask_mode,
                         dense_modulation=dense_modulation,
                     )
-                    grad_g = torch.autograd.grad(e, g, create_graph=self.training)[0]
+                    if dense_x_batch is not None:
+                        grad_x_batch = torch.autograd.grad(e, dense_x_batch, create_graph=self.training)[0]
+                        grad_g = x.new_zeros(x.shape)
+                        grad_g[x_source_ids] = grad_x_batch[x_batch_ids, x_local_ids]
+                    else:
+                        grad_g = torch.autograd.grad(e, g, create_graph=self.training)[0]
 
                     if self.training and self.noise_std > 0:
                         grad_g = grad_g + torch.randn_like(grad_g) * self.noise_std

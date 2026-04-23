@@ -47,15 +47,45 @@ class ETAttentionCore(nn.Module):
         nn.init.normal_(self.Wk, mean=0.0, std=0.002)
 
     def _project_qk(self, g):
-        # g: [N, D]
+        # g: [N, D] or [B, N, D]
         # W*: [H, Z, D] -> [H, D, Z] for batched matmul
         wq_t = self.Wq.transpose(1, 2)
         wk_t = self.Wk.transpose(1, 2)
-        q = torch.matmul(g.unsqueeze(0), wq_t).permute(1, 0, 2).contiguous()  # [N, H, Z]
-        k = torch.matmul(g.unsqueeze(0), wk_t).permute(1, 0, 2).contiguous()  # [N, H, Z]
+        if g.dim() == 2:
+            q = torch.matmul(g.unsqueeze(0), wq_t).permute(1, 0, 2).contiguous()  # [N, H, Z]
+            k = torch.matmul(g.unsqueeze(0), wk_t).permute(1, 0, 2).contiguous()  # [N, H, Z]
+        else:
+            q = torch.einsum("bnd,hdz->bnhz", g, wq_t).contiguous()  # [B, N, H, Z]
+            k = torch.einsum("bnd,hdz->bnhz", g, wk_t).contiguous()  # [B, N, H, Z]
         return q, k
 
+    def _dense_energy_batched(self, g, dense_modulation, dense_sizes):
+        q_all, k_all = self._project_qk(g)
+        q_all = q_all.permute(0, 2, 1, 3).contiguous()  # [B, H, N, Z]
+        k_all = k_all.permute(0, 2, 1, 3).contiguous()  # [B, H, N, Z]
+        logits = torch.einsum("bhnz,bhmz->bhnm", q_all, k_all)
+        logits = logits + dense_modulation
+        logits = self.betas[None, :, None, None] * logits
+
+        max_n = int(g.size(1))
+        node_ids = torch.arange(max_n, device=g.device)
+        node_mask = node_ids[None, :] < dense_sizes[:, None]
+        pair_mask = node_mask[:, :, None] & node_mask[:, None, :]
+        finfo_min = torch.finfo(g.dtype).min
+        logits = logits.masked_fill(~pair_mask[:, None, :, :], finfo_min)
+        lse = torch.logsumexp(logits, dim=-1)
+        lse = torch.where(node_mask[:, None, :], lse, torch.zeros_like(lse))
+        return -(((lse.sum(dim=-1) / self.betas[None, :]).sum()))
+
     def _dense_energy(self, g, graph_chunks, dense_modulation=None):
+        if (
+            isinstance(dense_modulation, torch.Tensor)
+            and dense_modulation.dim() == 4
+            and g.dim() == 3
+        ):
+            dense_sizes = torch.tensor([int(chunk["size"]) for chunk in graph_chunks], dtype=torch.long, device=g.device)
+            return self._dense_energy_batched(g, dense_modulation, dense_sizes)
+
         q_all, k_all = self._project_qk(g)
         e = g.new_zeros(())
         finfo_min = torch.finfo(g.dtype).min
@@ -69,7 +99,10 @@ class ETAttentionCore(nn.Module):
             # [Q,H,Z] -> [H,Q,Z], [K,H,Z] -> [H,Z,K]
             logits = torch.bmm(q.permute(1, 0, 2), k.permute(1, 2, 0))
             if dense_modulation is not None:
-                logits = logits + dense_modulation[idx]
+                if isinstance(dense_modulation, torch.Tensor):
+                    logits = logits + dense_modulation[idx, :, : chunk["size"], : chunk["size"]]
+                else:
+                    logits = logits + dense_modulation[idx]
             logits = self.betas[:, None, None] * logits
             logits = logits.masked_fill(~mask.unsqueeze(0), finfo_min)
             lse = torch.logsumexp(logits, dim=-1)  # [H, Q]

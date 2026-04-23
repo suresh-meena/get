@@ -51,7 +51,7 @@ def generate_degree_controlled_triangle_dataset(num_graphs=2000, n_nodes=24, deg
     return dataset
 
 
-def _predict(model, dataset, batch_size=64, device="cpu"):
+def _predict(model, dataset, batch_size=256, device="cpu"):
     model.eval()
     preds = []
     ys = []
@@ -116,7 +116,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_graphs", type=int, default=2000)
     parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n_nodes", type=int, default=24)
     parser.add_argument("--degree", type=int, default=4)

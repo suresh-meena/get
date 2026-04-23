@@ -77,6 +77,14 @@ def get_laplacian_pe(num_nodes, edges_list, k=16):
         adj[int(v), int(u)] = 1.0
     return laplacian_pe_from_adjacency(adj, k=k, training=False)
 
+
+def get_cls_augmented_laplacian_pe(num_nodes, edges_list, k=16):
+    cls_idx = int(num_nodes)
+    cls_edges = list(edges_list)
+    cls_edges.extend((i, cls_idx) for i in range(num_nodes))
+    cls_edges.extend((cls_idx, i) for i in range(num_nodes))
+    return get_laplacian_pe(num_nodes + 1, cls_edges, k=k)
+
 def get_incidence_matrices(num_nodes, edges_list, max_motifs_per_node=None):
     """
     Extracts the sparse support for pairwise and motif interactions from an edge list.
@@ -253,6 +261,7 @@ class CachedGraphDataset:
             item['t_tau'] = t_tau
             if self.pe_k > 0:
                 item['pe'] = get_laplacian_pe(num_nodes, g['edges'], self.pe_k)
+                item['pe_cls'] = get_cls_augmented_laplacian_pe(num_nodes, g['edges'], self.pe_k)
             
             if 'edge_attr' in g:
                 item['aligned_edge_attr'] = align_pairwise_edge_attr(g['edges'], g['edge_attr'], c_2, u_2)
@@ -269,7 +278,7 @@ class CachedGraphDataset:
 
 class GETBatch:
     """A data class representing a batch of graphs for the GET model."""
-    def __init__(self, x, c_2, u_2, c_3, u_3, v_3, t_tau, batch, ptr, y=None, edge_attr=None, pe=None):
+    def __init__(self, x, c_2, u_2, c_3, u_3, v_3, t_tau, batch, ptr, y=None, edge_attr=None, pe=None, pe_cls=None, pe_cls_ptr=None):
         self.x = x
         self.c_2 = c_2
         self.u_2 = u_2
@@ -282,6 +291,8 @@ class GETBatch:
         self.y = y
         self.edge_attr = edge_attr
         self.pe = pe
+        self.pe_cls = pe_cls
+        self.pe_cls_ptr = pe_cls_ptr
         self.num_nodes = x.size(0)
 
     def to(self, device, non_blocking=False):
@@ -300,6 +311,10 @@ class GETBatch:
             self.edge_attr = self.edge_attr.to(device, non_blocking=non_blocking)
         if self.pe is not None:
             self.pe = self.pe.to(device, non_blocking=non_blocking)
+        if self.pe_cls is not None:
+            self.pe_cls = self.pe_cls.to(device, non_blocking=non_blocking)
+        if self.pe_cls_ptr is not None:
+            self.pe_cls_ptr = self.pe_cls_ptr.to(device, non_blocking=non_blocking)
         return self
 
 def collate_get_batch(graph_list, max_motifs=None):
@@ -318,6 +333,8 @@ def collate_get_batch(graph_list, max_motifs=None):
     y_list = []
     edge_attr_list = []
     pe_list = []
+    pe_cls_list = []
+    pe_cls_ptr_list = [0]
     
     node_offset = 0
     
@@ -342,7 +359,15 @@ def collate_get_batch(graph_list, max_motifs=None):
         ptr_list.append(ptr_list[-1] + num_nodes)
         
         if 'y' in g:
-            y_list.append(g['y'])
+            # Canonicalize graph labels so mixed scalar vs [1]-shaped values
+            # can be batched together without cat/stack shape errors.
+            y = torch.as_tensor(g['y']).reshape(-1)
+            if y.numel() != 1:
+                raise ValueError(
+                    "Expected one graph label per sample; "
+                    f"got shape {tuple(torch.as_tensor(g['y']).shape)}."
+                )
+            y_list.append(y)
         if 'aligned_edge_attr' in g:
             edge_attr_list.append(g['aligned_edge_attr'])
         elif 'edge_attr' in g:
@@ -350,6 +375,9 @@ def collate_get_batch(graph_list, max_motifs=None):
         
         if 'pe' in g:
             pe_list.append(g['pe'])
+        if 'pe_cls' in g:
+            pe_cls_list.append(g['pe_cls'])
+            pe_cls_ptr_list.append(pe_cls_ptr_list[-1] + g['pe_cls'].size(0))
             
         node_offset += num_nodes
         
@@ -365,5 +393,7 @@ def collate_get_batch(graph_list, max_motifs=None):
     y = torch.cat(y_list, dim=0) if y_list else None
     edge_attr = torch.cat(edge_attr_list, dim=0) if edge_attr_list else None
     pe = torch.cat(pe_list, dim=0) if pe_list else None
+    pe_cls = torch.cat(pe_cls_list, dim=0) if pe_cls_list else None
+    pe_cls_ptr = torch.tensor(pe_cls_ptr_list, dtype=torch.long) if pe_cls_list else None
     
-    return GETBatch(x, c_2, u_2, c_3, u_3, v_3, t_tau, batch, ptr, y, edge_attr, pe=pe)
+    return GETBatch(x, c_2, u_2, c_3, u_3, v_3, t_tau, batch, ptr, y, edge_attr, pe=pe, pe_cls=pe_cls, pe_cls_ptr=pe_cls_ptr)

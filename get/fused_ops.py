@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+from triton import Config
 
 try:
     from torch_scatter import scatter as _torch_scatter  # type: ignore
@@ -77,6 +78,16 @@ def segment_reduce_1d(src, segment_ids, num_segments, reduce="sum"):
     return _segment_reduce_with_scatter_reduce(src, segment_ids, num_segments, reduce)
 
 
+@triton.autotune(
+    configs=[
+        Config({"BLOCK_SIZE_M": 16, "BLOCK_SIZE_R": 1, "BLOCK_SIZE_D": 32}, num_warps=2, num_stages=2),
+        Config({"BLOCK_SIZE_M": 32, "BLOCK_SIZE_R": 1, "BLOCK_SIZE_D": 32}, num_warps=4, num_stages=2),
+        Config({"BLOCK_SIZE_M": 32, "BLOCK_SIZE_R": 2, "BLOCK_SIZE_D": 32}, num_warps=4, num_stages=2),
+        Config({"BLOCK_SIZE_M": 32, "BLOCK_SIZE_R": 2, "BLOCK_SIZE_D": 64}, num_warps=4, num_stages=3),
+        Config({"BLOCK_SIZE_M": 64, "BLOCK_SIZE_R": 2, "BLOCK_SIZE_D": 32}, num_warps=8, num_stages=3),
+    ],
+    key=["M", "R", "D"],
+)
 @triton.jit
 def _fused_motif_dot_kernel(
     Q_ptr, K_u_ptr, K_v_ptr, T_ptr, Out_ptr,
@@ -177,16 +188,18 @@ def fused_motif_dot(Q3_c, K3_u, K3_v, T_tau):
     Uses Triton if on CUDA and dimensions are suitable, otherwise fallbacks to optimized einsum.
     """
     if _can_use_fused_motif_triton(Q3_c, K3_u, K3_v, T_tau):
+        Q3_c = Q3_c.contiguous()
+        K3_u = K3_u.contiguous()
+        K3_v = K3_v.contiguous()
+        T_tau = T_tau.contiguous()
+
         B, M, R, D = Q3_c.shape
         out = torch.empty((B, M), device=Q3_c.device, dtype=Q3_c.dtype)
-        
-        # Grid: (M, B)
-        # We process BLOCK_SIZE_M motifs in parallel
-        BLOCK_SIZE_M = 32
-        BLOCK_SIZE_R = 4
-        BLOCK_SIZE_D = 32
-        
-        grid = (triton.cdiv(M, BLOCK_SIZE_M), B)
+
+        def grid(meta):
+            return (triton.cdiv(M, meta["BLOCK_SIZE_M"]), B)
+
+        # Autotune chooses BLOCK_SIZE_* and launch geometry at compile time.
         
         _fused_motif_dot_kernel[grid](
             Q3_c, K3_u, K3_v, T_tau, out,

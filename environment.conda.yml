@@ -1,0 +1,27 @@
+name: get
+channels:
+  - dglteam/label/th24_cu124
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pytorch=2.4.*
+  - pytorch-cuda=12.4
+  - numpy
+  - scipy
+  - scikit-learn
+  - networkx
+  - tqdm
+  - matplotlib
+  - seaborn
+  - pytest
+  - pyyaml
+  - pydantic
+  - dgl
+  - torch-geometric=2.6.1
+  - pip:
+      - torchdata==0.7.1
+      - pygod==1.1.0
+      - ogb==1.3.6
