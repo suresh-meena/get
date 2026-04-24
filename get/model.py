@@ -179,7 +179,6 @@ class GETLayer(nn.Module):
             if not X.requires_grad:
                 X = X.requires_grad_(True)
             E = self.compute_energy(X, batch_data, static_projections)
-            # autograd expects scalar but E is [num_graphs]. Use .sum() for joint pullback.
             return E, torch.autograd.grad(E.sum(), X, create_graph=create_graph)[0]
 
         G = self.layernorm(X)
@@ -341,6 +340,7 @@ class GETModel(nn.Module):
             X = X + self.pe_proj(batch_data.pe)
         if self.rwse_k > 0 and hasattr(batch_data, 'rwse') and batch_data.rwse is not None:
             X = X + self.rwse_proj(batch_data.rwse)
+
         X, solver_batch, cls_positions = self._augment_with_cls_token(X, batch_data)
         static_projections = self._build_static_projections(solver_batch)
         if inference_mode == 'fixed':
@@ -355,23 +355,28 @@ class GETModel(nn.Module):
     def _run_fixed_solver(self, X, solver_batch, static_projections, training_mode=True):
         energy_trace = []
         eta = self.eta
+        X_current = X
         for _ in range(self.num_steps):
-            X_prev = X
-            X, E = self.get_layer(X, solver_batch, eta, static_projections, is_training=training_mode)
+            X_prev = X_current
+            X_current, E = self.get_layer(X_current, solver_batch, eta, static_projections, is_training=training_mode)
             energy_trace.append(E.detach())
             if self.tol > 0:
                 with torch.no_grad():
-                    # E is [num_graphs]. Monitor relative change in state
-                    diff = torch.norm(X - X_prev) / (torch.norm(X_prev) + 1e-6)
+                    # Monitor relative change in state for early stopping
+                    diff = torch.norm(X_current - X_prev) / (torch.norm(X_prev) + 1e-6)
                     if diff < self.tol:
                         break
-        return X, energy_trace, {}
+        return X_current, energy_trace, {}
 
     def _run_armijo_solver(self, X, batch_data, static_projections, armijo_c=0.1, armijo_gamma=0.5, armijo_eta0=0.2, armijo_max_backtracks=25):
         num_graphs = int(batch_data.batch.max().item() + 1)
         energy_trace = []
         stats = {'backtracks': [], 'steps': 0, 'step_sizes': [], 'accepted': []}
         eta0 = armijo_eta0
+
+        # Hoist loop invariants
+        etas = eta0 * (armijo_gamma ** torch.arange(armijo_max_backtracks, device=X.device, dtype=X.dtype))
+
         X_current = X.detach()
         for step_idx in range(self.num_steps):
             E_t, grad_X = self.get_layer.energy_and_grad(X_current, batch_data, static_projections=static_projections, create_graph=False)
@@ -379,25 +384,22 @@ class GETModel(nn.Module):
                 gnorm = torch.norm(grad_X) / (torch.norm(X_current) + 1e-6)
                 if gnorm < self.tol:
                     break
-            # grad_norm_sq_per_graph: [num_graphs]
+
             gn_sq = (grad_X**2).sum(dim=-1)
             gn_sq_graph = _scatter_add_nd(gn_sq.new_zeros(num_graphs), batch_data.batch, gn_sq, dim=0)
-            etas = eta0 * (armijo_gamma ** torch.arange(armijo_max_backtracks, device=X.device, dtype=X.dtype))
-            # X_tries: [num_trials, N, D]
+
             X_tries = X_current.unsqueeze(0) - etas.view(-1, 1, 1) * grad_X.unsqueeze(0)
-            # E_tries: [num_trials, num_graphs]
             E_tries = self.get_layer.compute_energy(X_tries, batch_data, static_projections=static_projections)
-            # E_target: [num_trials, num_graphs]
             E_target = E_t.unsqueeze(0) - armijo_c * etas.view(-1, 1) * gn_sq_graph.unsqueeze(0)
+
             valid = (E_tries <= E_target)
             found = valid.any(dim=0)
             best_idx = valid.to(torch.long).argmax(dim=0)
             best_idx = torch.where(found, best_idx, E_tries.argmin(dim=0))
-            # Per-graph selection: X_current is [N, D]
-            # X_tries is [num_trials, N, D]
-            # best_idx is [num_graphs]
-            node_best_idx = best_idx[batch_data.batch]  # [N]
+
+            node_best_idx = best_idx[batch_data.batch]
             X_current = X_tries[node_best_idx, torch.arange(X_current.size(0))]
+
             energy_trace.append(E_t.detach())
             stats['backtracks'].append(best_idx.float().mean().item())
             stats['step_sizes'].append(etas[best_idx].mean().item())
