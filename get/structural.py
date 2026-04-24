@@ -6,14 +6,34 @@ from numba import njit
 import torch
 
 
-def _adj_to_csr_structural(adj):
-    num_nodes = len(adj)
+@njit
+def _edges_to_csr_structural(num_nodes, edges_arr):
+    """Directly build CSR from edge array in Numba."""
     indptr = np.zeros(num_nodes + 1, dtype=np.int64)
-    for i, neighbors in enumerate(adj):
-        indptr[i+1] = indptr[i] + len(neighbors)
-    indices = np.empty(indptr[-1], dtype=np.int64)
-    for i, neighbors in enumerate(adj):
-        indices[indptr[i]:indptr[i+1]] = sorted(neighbors)
+    for i in range(edges_arr.shape[0]):
+        u, v = edges_arr[i, 0], edges_arr[i, 1]
+        if u == v or u >= num_nodes or v >= num_nodes:
+            continue
+        indptr[u + 1] += 1
+        indptr[v + 1] += 1
+    
+    for i in range(num_nodes):
+        indptr[i + 1] += indptr[i]
+        
+    indices = np.empty(indptr[num_nodes], dtype=np.int64)
+    curr_idx = indptr[:-1].copy()
+    for i in range(edges_arr.shape[0]):
+        u, v = edges_arr[i, 0], edges_arr[i, 1]
+        if u == v or u >= num_nodes or v >= num_nodes:
+            continue
+        indices[curr_idx[u]] = v
+        curr_idx[u] += 1
+        indices[curr_idx[v]] = u
+        curr_idx[v] += 1
+        
+    for i in range(num_nodes):
+        indices[indptr[i]:indptr[i+1]].sort()
+        
     return indptr, indices
 
 
@@ -49,6 +69,7 @@ def _numba_msbfs(indptr, indices, max_distance, unreachable):
 
 
 def build_undirected_adjacency(num_nodes: int, edges_list: list[tuple[int, int]]) -> list[set[int]]:
+    """Legacy wrapper (prefer CSR utilities for performance)."""
     adj = [set() for _ in range(int(num_nodes))]
     for u, v in edges_list:
         ui = int(u)
@@ -61,20 +82,22 @@ def build_undirected_adjacency(num_nodes: int, edges_list: list[tuple[int, int]]
 
 
 def shortest_path_distances(num_nodes: int, edges_list: list[tuple[int, int]], max_distance: int | None = None) -> torch.Tensor:
-    adj = build_undirected_adjacency(num_nodes, edges_list)
+    edges_arr = np.ascontiguousarray(np.array(edges_list, dtype=np.int64))
     n = int(num_nodes)
     m_dist = int(max_distance) if max_distance is not None else -1
     unreachable = n if max_distance is None else int(max_distance) + 1
     
-    indptr, indices = _adj_to_csr_structural(adj)
+    indptr, indices = _edges_to_csr_structural(n, edges_arr)
     dist_np = _numba_msbfs(indptr, indices, m_dist, unreachable)
     
     return torch.from_numpy(dist_np)
 
 
 def degree_centrality(num_nodes: int, edges_list: list[tuple[int, int]]) -> torch.Tensor:
-    adj = build_undirected_adjacency(num_nodes, edges_list)
-    return torch.tensor([len(adj[i]) for i in range(int(num_nodes))], dtype=torch.long)
+    edges_arr = np.ascontiguousarray(np.array(edges_list, dtype=np.int64))
+    n = int(num_nodes)
+    indptr, _ = _edges_to_csr_structural(n, edges_arr)
+    return torch.from_numpy(np.diff(indptr)).to(dtype=torch.long)
 
 
 def augment_with_virtual_node(x: torch.Tensor, edges_list: list[tuple[int, int]], virtual_token: torch.Tensor):
