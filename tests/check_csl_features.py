@@ -1,5 +1,4 @@
 import networkx as nx
-import numpy as np
 def generate_csl(n=41, k=2):
     G = nx.Graph()
     G.add_nodes_from(range(n))

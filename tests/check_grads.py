@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 from get import FullGET
 from get.data import collate_get_batch
 import networkx as nx

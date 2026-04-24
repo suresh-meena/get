@@ -1,11 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from get import FullGET, PairwiseGET
+from get import FullGET
 from get.data import collate_get_batch
 import networkx as nx
 import random
-from tqdm.auto import tqdm
 
 # Generate two graphs with same degrees but different triangles
 def generate_matched_pair(n=20):

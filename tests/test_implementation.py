@@ -1,8 +1,6 @@
 import torch
-import torch.nn as nn
 from get import FullGET
 from get.data import add_structural_node_features, collate_get_batch
-from get.energy import compute_energy_GET
 import networkx as nx
 import random
 import sys
@@ -22,16 +20,14 @@ def test_finite_difference():
     graphs = generate_random_graphs(1, d=8)
     batch = collate_get_batch(graphs)
     
-    # We need float64 for finite difference accuracy
-    model = FullGET(in_dim=8, d=8, num_classes=1, num_steps=1).to(torch.float64)
+    # We need float64 for finite difference accuracy. Use num_heads=1 for small d.
+    model = FullGET(in_dim=8, d=8, num_classes=1, num_steps=1, num_heads=1).to(torch.float64)
     model.eval()
     
     # Function to check: energy computation given X
     def energy_func(X):
         # We need to manually apply layernorm here to treat X as the input variable
-        G = model.get_layer.layernorm(X)
-        params = model.get_layer.get_params_dict()
-        E = compute_energy_GET(X, G, batch.c_2, batch.u_2, batch.c_3, batch.u_3, batch.v_3, batch.t_tau, params)
+        E = model.get_layer.compute_energy(X, batch)
         return E
 
     X = batch.x.clone().requires_grad_(True)
@@ -51,12 +47,11 @@ def test_equivariance():
     
     # Original graph
     batch_orig = collate_get_batch([g])
-    model = FullGET(in_dim=4, d=4, num_classes=1, num_steps=1).to(torch.float64)
+    model = FullGET(in_dim=4, d=4, num_classes=1, num_steps=1, num_heads=1).to(torch.float64)
     model.eval()
     
     X_orig = batch_orig.x.clone().requires_grad_(True)
-    E_orig = compute_energy_GET(X_orig, model.get_layer.layernorm(X_orig), 
-                                batch_orig.c_2, batch_orig.u_2, batch_orig.c_3, batch_orig.u_3, batch_orig.v_3, batch_orig.t_tau, model.get_layer.get_params_dict())
+    E_orig = model.get_layer.compute_energy(X_orig, batch_orig)
     grad_orig = torch.autograd.grad(E_orig, X_orig)[0]
     
     # Permute graph
@@ -69,8 +64,7 @@ def test_equivariance():
     batch_perm = collate_get_batch([{'x': x_perm, 'edges': edges_perm}])
     X_perm = batch_perm.x.clone().requires_grad_(True)
     
-    E_perm = compute_energy_GET(X_perm, model.get_layer.layernorm(X_perm), 
-                                batch_perm.c_2, batch_perm.u_2, batch_perm.c_3, batch_perm.u_3, batch_perm.v_3, batch_perm.t_tau, model.get_layer.get_params_dict())
+    E_perm = model.get_layer.compute_energy(X_perm, batch_perm)
     grad_perm = torch.autograd.grad(E_perm, X_perm)[0]
     
     # Check energy invariance
@@ -83,7 +77,7 @@ def test_equivariance():
 def test_monotone_descent():
     print("Running Monotone Armijo Descent Checks...")
     graphs = generate_random_graphs(100, n_min=5, n_max=12, d=4)
-    model = FullGET(in_dim=4, d=4, num_classes=1, num_steps=1).to(torch.float64)
+    model = FullGET(in_dim=4, d=4, num_classes=1, num_steps=1, num_heads=1).to(torch.float64)
     model.eval()
     
     failures = 0
@@ -91,9 +85,7 @@ def test_monotone_descent():
         batch = collate_get_batch([g])
         X = batch.x.clone().requires_grad_(True)
         
-        G = model.get_layer.layernorm(X)
-        E_0 = compute_energy_GET(X, G, batch.c_2, batch.u_2, batch.c_3, batch.u_3, batch.v_3, batch.t_tau, model.get_layer.get_params_dict())
-        
+        E_0 = model.get_layer.compute_energy(X, batch)
         grad_X = torch.autograd.grad(E_0, X)[0]
         
         # Backtracking line search
@@ -104,8 +96,7 @@ def test_monotone_descent():
         
         while True:
             X_1 = X - eta * grad_X
-            G_1 = model.get_layer.layernorm(X_1)
-            E_1 = compute_energy_GET(X_1, G_1, batch.c_2, batch.u_2, batch.c_3, batch.u_3, batch.v_3, batch.t_tau, model.get_layer.get_params_dict())
+            E_1 = model.get_layer.compute_energy(X_1, batch)
             
             if E_1 <= E_0 - c * eta * grad_norm_sq + 1e-8:
                 # Armijo condition satisfied
@@ -129,7 +120,7 @@ def test_model_armijo_inference_mode():
     print("Running Model Armijo Inference Mode Check...")
     graphs = generate_random_graphs(1, n_min=10, n_max=10, d=4)
     batch = collate_get_batch(graphs)
-    model = FullGET(in_dim=4, d=4, num_classes=1, num_steps=5).to(torch.float64)
+    model = FullGET(in_dim=4, d=4, num_classes=1, num_steps=5, num_heads=1).to(torch.float64)
     model.eval()
 
     out, energy_trace, solver_stats = model(
@@ -158,7 +149,7 @@ def test_get_cls_graph_readout():
     for label, graph in enumerate(graphs):
         graph["y"] = torch.tensor([label], dtype=torch.long)
     batch = collate_get_batch(graphs)
-    model = FullGET(in_dim=4, d=8, num_classes=2, num_steps=2, use_cls_token=True).to(torch.float64)
+    model = FullGET(in_dim=4, d=8, num_classes=2, num_steps=2, use_cls_token=True, num_heads=1).to(torch.float64)
     model.eval()
 
     graph_out, energy_trace = model(batch, task_level="graph")
@@ -168,6 +159,24 @@ def test_get_cls_graph_readout():
     node_out, _ = model(batch, task_level="node")
     assert node_out.shape[0] == batch.x.size(0), "Node readout should exclude appended CLS states."
     print("GET CLS graph readout check passed.")
+
+def test_get_positional_encodings_affect_output():
+    print("Running GET Positional Encoding Check...")
+    graph = generate_random_graphs(1, n_min=6, n_max=6, d=4)[0]
+    graph_with_pe = dict(graph)
+    graph_with_pe["pe"] = torch.randn(graph["x"].size(0), 2, dtype=torch.float64)
+
+    batch_without_pe = collate_get_batch([graph])
+    batch_with_pe = collate_get_batch([graph_with_pe])
+
+    model = FullGET(in_dim=4, d=8, num_classes=1, num_steps=1, pe_k=2, num_heads=1).to(torch.float64)
+    model.eval()
+
+    out_without_pe, _ = model(batch_without_pe, task_level="graph")
+    out_with_pe, _ = model(batch_with_pe, task_level="graph")
+
+    assert not torch.allclose(out_without_pe, out_with_pe), "Positive pe_k should make GET sensitive to input PE."
+    print("GET positional encoding check passed.")
 
 def test_data_preparation_helpers():
     print("Running Data Preparation Helper Checks...")
@@ -191,5 +200,6 @@ if __name__ == "__main__":
     test_monotone_descent()
     test_model_armijo_inference_mode()
     test_get_cls_graph_readout()
+    test_get_positional_encodings_affect_output()
     test_data_preparation_helpers()
     print("All Tier 0 implementation checks passed!")
