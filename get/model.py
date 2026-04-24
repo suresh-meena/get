@@ -443,6 +443,17 @@ class GETModel(nn.Module):
                 nn.Linear(d, readout_hidden_mult * d), nn.GELU(), nn.LayerNorm(readout_hidden_mult * d), nn.Dropout(dropout),
                 nn.Linear(readout_hidden_mult * d, d), nn.GELU(), nn.LayerNorm(d), nn.Dropout(dropout), nn.Linear(d, num_classes)
             )
+
+        # Optimization: Use torch.compile to fuse sequential unrolling kernels if requested
+        if compile and hasattr(torch, "compile"):
+            try:
+                # Compile core energy and gradient logic
+                self.get_layer.energy_and_grad = torch.compile(self.get_layer.energy_and_grad, dynamic=True)
+                # Compile the fixed solver (the main training/inference path)
+                self._run_fixed_solver = torch.compile(self._run_fixed_solver, dynamic=True)
+                print("INFO:    Successfully compiled GrET inference solvers using torch.compile.")
+            except Exception as e:
+                print(f"WARNING: torch.compile failed: {e}. Falling back to eager execution.")
         
         self.node_readout = nn.Sequential(
             nn.Linear(d, d), nn.GELU(), nn.LayerNorm(d), nn.Dropout(dropout), nn.Linear(d, num_classes)
