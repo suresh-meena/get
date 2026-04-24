@@ -40,7 +40,8 @@ def _segment_reduce_with_scatter_reduce(src, segment_ids, num_segments, reduce):
              dim = -3 # Motif case
     
     # Adjust dim to positive
-    if dim < 0: dim = src.dim() + dim
+    if dim < 0:
+        dim = src.dim() + dim
     
     # Create index tensor matching src shape
     idx_shape = [1] * src.dim()

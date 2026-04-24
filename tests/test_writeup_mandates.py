@@ -1,7 +1,6 @@
 import torch
-import torch.nn as nn
 from get import GETModel, FullGET, PairwiseGET, collate_get_batch
-from get.energy import compute_energy_GET, compute_energy_and_grad_GET
+from get.energy import compute_energy_GET
 
 def test_inheritance_hopfield_reduction():
     """
@@ -27,7 +26,6 @@ def test_inheritance_hopfield_reduction():
     with torch.no_grad():
         X = model.node_encoder(batch.x)
         G = model.get_layer.layernorm(X)
-        projections = model.get_layer._build_projections(G, batch_data=batch)
         params = model.get_layer.get_params_dict()
         params['num_heads'] = 1
 
@@ -71,7 +69,6 @@ def test_inheritance_et_reduction():
     with torch.no_grad():
         X = model.node_encoder(batch.x)
         G = model.get_layer.layernorm(X)
-        projections = model.get_layer._build_projections(G, batch_data=batch)
         params = model.get_layer.get_params_dict()
         params['num_heads'] = 1
 
