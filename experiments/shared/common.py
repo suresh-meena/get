@@ -138,11 +138,13 @@ def load_tu_dataset(dataset_name, limit=None):
     return out
 
 
-def build_dataloader_kwargs(device, num_workers=None, prefetch_factor=2):
-    """Return DataLoader kwargs tuned for the target device."""
+def build_dataloader_kwargs(device, num_workers=None, prefetch_factor=4):
+    """Return DataLoader kwargs tuned for aggressive asynchronous prefetching."""
     is_cuda = str(device).startswith("cuda")
     if num_workers is None:
-        num_workers = 2 if is_cuda else 0
+        # Scale workers with CPU count, capped for stability
+        import os
+        num_workers = min(os.cpu_count() or 4, 8) if is_cuda else 0
     num_workers = max(0, int(num_workers))
 
     kwargs = {
@@ -150,6 +152,7 @@ def build_dataloader_kwargs(device, num_workers=None, prefetch_factor=2):
         "pin_memory": is_cuda,
     }
     if num_workers > 0:
+        # persistent_workers=True keeps motifs/PEs in worker memory across epochs
         kwargs["persistent_workers"] = True
         kwargs["prefetch_factor"] = max(2, int(prefetch_factor))
     return kwargs
