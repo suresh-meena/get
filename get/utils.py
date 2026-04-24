@@ -39,29 +39,38 @@ def _adj_to_csr_utils(adj):
 
 
 @njit
-def _numba_rwse(indptr, indices, k):
-    """Compute RWSE using sparse random walk."""
+def _numba_sp_vec_mul(indptr, indices, deg_inv, p_vec):
+    """Sparse vector-matrix multiplication p_next = p_vec * (D^-1 A)."""
+    num_nodes = len(indptr) - 1
+    p_next = np.zeros(num_nodes, dtype=np.float32)
+    for u in range(num_nodes):
+        if p_vec[u] > 0:
+            prob_u = p_vec[u] * deg_inv[u]
+            for idx in range(indptr[u], indptr[u+1]):
+                v = indices[idx]
+                p_next[v] += prob_u
+    return p_next
+
+
+@njit
+def _numba_rwse_sparse(indptr, indices, k):
+    """Compute RWSE using sparse random walk with optimized memory usage."""
     num_nodes = len(indptr) - 1
     rwse = np.zeros((num_nodes, k), dtype=np.float32)
     
-    # deg_inv = 1 / deg
     deg_inv = np.zeros(num_nodes, dtype=np.float32)
     for i in range(num_nodes):
         d = indptr[i+1] - indptr[i]
         if d > 0:
             deg_inv[i] = 1.0 / d
             
-    # p_curr[i, j] is probability of being at j after t steps, starting at i
-    # We only need diagonals: p_curr[i, i]
-    # For large k, full sparse matrix power is better, but for small k (16-24),
-    # repeated sparse vector multiplication is efficient.
-    
+    # For each start node, perform k-step random walk
     for start_node in range(num_nodes):
-        # prob vector for current start node
         p_vec = np.zeros(num_nodes, dtype=np.float32)
         p_vec[start_node] = 1.0
         
         for t in range(k):
+            # p_next = p_vec * P
             p_next = np.zeros(num_nodes, dtype=np.float32)
             for u in range(num_nodes):
                 if p_vec[u] > 0:
@@ -80,7 +89,8 @@ def rwse_from_adjacency(num_nodes, indptr, indices, k):
     if k <= 0:
         return torch.zeros((num_nodes, 0), dtype=torch.float32)
     
-    rwse_np = _numba_rwse(indptr, indices, k)
+    # Use the sparse-optimized version
+    rwse_np = _numba_rwse_sparse(indptr, indices, k)
     return torch.from_numpy(rwse_np).to(dtype=torch.float32)
 
 

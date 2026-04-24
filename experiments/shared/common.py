@@ -271,6 +271,52 @@ def _build_ego_graph_dataset_dgl(data, centers: list[int], num_hops: int) -> lis
     return samples
 
 
+@njit
+def _numba_extract_subgraph_edges(indptr, indices, nodes):
+    """Numba-accelerated extraction of edges within a subset of nodes."""
+    # Build a local mapping array (faster than a dict in Numba)
+    # Map global_id -> local_id
+    max_global = -1
+    for n in nodes:
+        if n > max_global:
+            max_global = n
+            
+    mapping = np.full(max_global + 1, -1, dtype=np.int64)
+    for i in range(len(nodes)):
+        mapping[nodes[i]] = i
+        
+    # Estimate max possible edges (worst case: complete graph)
+    # We use a dynamic list growth pattern in logic, but here we'll pre-count or use a buffer
+    num_nodes = len(nodes)
+    
+    # Pass 1: count edges
+    count = 0
+    for i in range(num_nodes):
+        u_global = nodes[i]
+        for idx in range(indptr[u_global], indptr[u_global+1]):
+            v_global = indices[idx]
+            if v_global <= max_global:
+                v_local = mapping[v_global]
+                if v_local != -1 and i <= v_local:
+                    count += 1
+                    
+    # Pass 2: fill edges
+    local_src = np.empty(count, dtype=np.int64)
+    local_dst = np.empty(count, dtype=np.int64)
+    curr = 0
+    for i in range(num_nodes):
+        u_global = nodes[i]
+        for idx in range(indptr[u_global], indptr[u_global+1]):
+            v_global = indices[idx]
+            if v_global <= max_global:
+                v_local = mapping[v_global]
+                if v_local != -1 and i <= v_local:
+                    local_src[curr] = i
+                    local_dst[curr] = v_local
+                    curr += 1
+    return local_src, local_dst
+
+
 def build_ego_graph_dataset(data, num_hops: int = 1, limit: int | None = None, use_dgl_if_available: bool = True) -> list[dict]:
     """
     Convert a node-labeled single graph into graph samples via ego subgraphs.
@@ -296,18 +342,9 @@ def build_ego_graph_dataset(data, num_hops: int = 1, limit: int | None = None, u
         # Numba-accelerated BFS
         nodes = _numba_k_hop_nodes(indptr, indices, int(center), int(num_hops))
         
-        # Build local index mapping
-        local_index = {int(node): i for i, node in enumerate(nodes)}
-        
-        local_edges = []
-        for u_global in nodes:
-            u_local = local_index[int(u_global)]
-            for idx in range(indptr[u_global], indptr[u_global+1]):
-                v_global = indices[idx]
-                if int(v_global) in local_index:
-                    v_local = local_index[int(v_global)]
-                    if u_local <= v_local:
-                        local_edges.append((u_local, v_local))
+        # Numba-accelerated subgraph extraction
+        l_src, l_dst = _numba_extract_subgraph_edges(indptr, indices, nodes)
+        local_edges = list(zip(l_src.tolist(), l_dst.tolist()))
 
         x_local = x_all[nodes].float()
         y_local = torch.tensor([float(y_all[int(center)].item())], dtype=torch.float32)

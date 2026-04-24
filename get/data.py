@@ -448,30 +448,49 @@ class CachedGraphDataset:
             torch.save(self.cached_data, self.cache_path)
             
     def _process_all(self):
+        # Determine number of workers: scale with CPU count but cap to avoid memory pressure
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+        
+        num_workers = min(multiprocessing.cpu_count() or 4, 8)
         processed = []
-        for g in tqdm(self.dataset, desc="Caching incidence matrices"):
-            num_nodes = g['x'].size(0)
-            c_2, u_2, c_3, u_3, v_3, t_tau = get_incidence_matrices(num_nodes, g['edges'], self.max_motifs)
-            
-            item = dict(g)
-            item['c_2'] = c_2
-            item['u_2'] = u_2
-            item['c_3'] = c_3
-            item['u_3'] = u_3
-            item['v_3'] = v_3
-            item['t_tau'] = t_tau
-            if self.pe_k > 0:
-                item['pe'] = get_laplacian_pe(num_nodes, g['edges'], self.pe_k)
-                item['pe_cls'] = get_cls_augmented_laplacian_pe(num_nodes, g['edges'], self.pe_k)
-            
-            if self.rwse_k > 0:
-                item['rwse'] = get_rwse(num_nodes, g['edges'], self.rwse_k)
-            
-            if 'edge_attr' in g:
-                item['aligned_edge_attr'] = align_pairwise_edge_attr(g['edges'], g['edge_attr'], c_2, u_2)
-            
-            processed.append(item)
+        
+        # Parallel processing for incidence matrices and PEs
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = [
+                executor.submit(
+                    _process_one_graph, 
+                    g, self.max_motifs, self.pe_k, self.rwse_k
+                ) for g in self.dataset
+            ]
+            for future in tqdm(futures, desc="Caching incidence matrices (parallel)"):
+                processed.append(future.result())
         return processed
+
+
+def _process_one_graph(g, max_motifs, pe_k, rwse_k):
+    """Worker function for parallel processing."""
+    num_nodes = g['x'].size(0)
+    c_2, u_2, c_3, u_3, v_3, t_tau = get_incidence_matrices(num_nodes, g['edges'], max_motifs)
+    
+    item = dict(g)
+    item['c_2'] = c_2
+    item['u_2'] = u_2
+    item['c_3'] = c_3
+    item['u_3'] = u_3
+    item['v_3'] = v_3
+    item['t_tau'] = t_tau
+    if pe_k > 0:
+        item['pe'] = get_laplacian_pe(num_nodes, g['edges'], pe_k)
+        item['pe_cls'] = get_cls_augmented_laplacian_pe(num_nodes, g['edges'], pe_k)
+    
+    if rwse_k > 0:
+        item['rwse'] = get_rwse(num_nodes, g['edges'], rwse_k)
+    
+    if 'edge_attr' in g:
+        item['aligned_edge_attr'] = align_pairwise_edge_attr(g['edges'], g['edge_attr'], c_2, u_2)
+    
+    return item
         
     def __len__(self):
         return len(self.cached_data)
