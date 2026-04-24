@@ -21,23 +21,6 @@ def _adj_to_csr_utils(adj):
     return indptr, indices
 
 
-def _adj_to_csr_utils(adj):
-    """Convert dense adjacency tensor to CSR format."""
-    # Move to CPU/numpy for Numba
-    a = adj.detach().cpu().numpy()
-    num_nodes = a.shape[0]
-    # Find indices of non-zero entries
-    rows, cols = np.where(a > 0)
-    
-    indptr = np.zeros(num_nodes + 1, dtype=np.int64)
-    # Count occurrences of each row index to build indptr
-    row_counts = np.bincount(rows, minlength=num_nodes)
-    indptr[1:] = np.cumsum(row_counts)
-    
-    indices = cols.astype(np.int64)
-    return indptr, indices
-
-
 @njit
 def _numba_sp_vec_mul(indptr, indices, deg_inv, p_vec):
     """Sparse vector-matrix multiplication p_next = p_vec * (D^-1 A)."""

@@ -374,7 +374,7 @@ def add_structural_node_features(
         return dict(graph)
 
     num_nodes = graph["x"].size(0)
-    edges_arr = np.ascontiguousarray(np.array(graph["edges"], dtype=np.int64))
+    edges_arr = np.ascontiguousarray(np.array(graph["edges"], dtype=np.int64).reshape(-1, 2))
     indptr, indices = _numba_edges_to_csr(num_nodes, edges_arr)
     
     features = []
@@ -452,7 +452,7 @@ def _process_one_graph(g, max_motifs, pe_k, rwse_k):
     num_nodes = g['x'].size(0)
     
     # BUILD CSR ONCE
-    edges_arr = np.ascontiguousarray(np.array(g['edges'], dtype=np.int64))
+    edges_arr = np.ascontiguousarray(np.array(g['edges'], dtype=np.int64).reshape(-1, 2))
     indptr, indices = _numba_edges_to_csr(num_nodes, edges_arr)
     
     c_2, u_2, c_3, u_3, v_3, t_tau = get_incidence_matrices(num_nodes, indptr, indices, max_motifs)
@@ -552,7 +552,7 @@ def collate_get_batch(graph_list, max_motifs=None):
             # Incidence matrices not cached, will compute on the fly
             # This is slow, but we need the counts for pre-allocation
             num_n = g['x'].size(0)
-            e_arr = np.ascontiguousarray(np.array(g['edges'], dtype=np.int64))
+            e_arr = np.ascontiguousarray(np.array(g['edges'], dtype=np.int64).reshape(-1, 2))
             iptr, idc = _numba_edges_to_csr(num_n, e_arr)
             c_2, u_2, c_3, u_3, v_3, t_tau = get_incidence_matrices(num_n, iptr, idc, max_motifs)
             g['c_2'], g['u_2'], g['c_3'], g['u_3'], g['v_3'], g['t_tau'] = c_2, u_2, c_3, u_3, v_3, t_tau

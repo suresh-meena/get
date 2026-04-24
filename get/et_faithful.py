@@ -105,69 +105,68 @@ class ETFaithfulGraphModel(nn.Module):
         num_graphs = ptr.numel() - 1
         num_nodes = z_nodes.size(0)
         device = z_nodes.device
+        dtype = z_nodes.dtype
 
         # 1. Integrate CLS tokens
-        # Each graph gets one CLS token at the start of its node block
-        # New node order: [CLS_0, G0_nodes, CLS_1, G1_nodes, ...]
-        # Actually, simpler to put all CLS tokens after all nodes, or use original node indexing + offset
+        X_aug = torch.empty((num_nodes + num_graphs, self.d), dtype=dtype, device=device)
+        X_aug[:num_nodes] = z_nodes
+        X_aug[num_nodes:] = self.cls_token.expand(num_graphs, -1)
         
-        # New approach: X_aug = [z_nodes, cls_tokens_batched]
-        cls_tokens = self.cls_token.expand(num_graphs, -1)
-        X_aug = torch.cat([z_nodes, cls_tokens], dim=0)
-        
-        # Mapping from original node index to augmented node index
-        # Nodes 0..N-1 stay 0..N-1. CLS tokens are N..N+num_graphs-1
         cls_indices = torch.arange(num_nodes, num_nodes + num_graphs, device=device)
         node_batch = batch_data.batch
         node_cls_indices = cls_indices[node_batch]
         
         # 2. Vectorized augmented edges
+        # c2/u2 + 2*N (cls-node bidirectional) + N or 2*N (self-loops)
+        num_orig_edges = c2.numel()
+        num_cls_edges = 2 * num_nodes
+        num_self_loops = num_nodes + num_graphs if self.allow_self else num_graphs
+        total_aug_edges = num_orig_edges + num_cls_edges + num_self_loops
+        
+        c_aug = torch.empty(total_aug_edges, dtype=torch.long, device=device)
+        u_aug = torch.empty(total_aug_edges, dtype=torch.long, device=device)
+        
+        curr = 0
         # Original edges
-        c_aug_list = [c2]
-        u_aug_list = [u2]
+        c_aug[curr : curr + num_orig_edges] = c2
+        u_aug[curr : curr + num_orig_edges] = u2
+        curr += num_orig_edges
         
         # CLS <-> Node edges
-        # node_indices <-> node_cls_indices
         node_indices = torch.arange(num_nodes, device=device)
-        c_aug_list.extend([node_indices, node_cls_indices])
-        u_aug_list.extend([node_cls_indices, node_indices])
+        c_aug[curr : curr + num_nodes] = node_indices
+        u_aug[curr : curr + num_nodes] = node_cls_indices
+        curr += num_nodes
+        c_aug[curr : curr + num_nodes] = node_cls_indices
+        u_aug[curr : curr + num_nodes] = node_indices
+        curr += num_nodes
         
-        # CLS self-loops
+        # Self-loops
         if self.allow_self:
-            c_aug_list.append(cls_indices)
-            u_aug_list.append(cls_indices)
-            # Original nodes self-loops
-            c_aug_list.append(node_indices)
-            u_aug_list.append(node_indices)
-        else:
-            # CLS needs self-loop even if others don't? (ET convention)
-            c_aug_list.append(cls_indices)
-            u_aug_list.append(cls_indices)
-
-        c_aug = torch.cat(c_aug_list, dim=0)
-        u_aug = torch.cat(u_aug_list, dim=0)
+            c_aug[curr : curr + num_nodes] = node_indices
+            u_aug[curr : curr + num_nodes] = node_indices
+            curr += num_nodes
+            
+        c_aug[curr : curr + num_graphs] = cls_indices
+        u_aug[curr : curr + num_graphs] = cls_indices
+        curr += num_graphs
         
-        # 3. Handle PE (Laplacian PE requires adjacency)
-        # Vectorized PE computation for augmented graphs is hard without a loop,
-        # but we can at least keep the rest vectorized.
-        # If PE is already provided in batch_data, we use it.
+        # 3. Handle PE
         if hasattr(batch_data, "pe") and batch_data.pe is not None:
             pe = batch_data.pe
-            # Pad PE for CLS tokens
-            pe_cls = pe.new_zeros((num_graphs, pe.size(-1)))
-            pe_aug = torch.cat([pe, pe_cls], dim=0)
+            # Pre-allocated augmented PE
+            pe_aug = torch.zeros((num_nodes + num_graphs, pe.size(-1)), dtype=dtype, device=device)
+            pe_aug[:num_nodes] = pe.to(dtype=dtype)
             if self.pe_proj is not None:
-                X_aug = X_aug + self.pe_proj(pe_aug.to(dtype=X_aug.dtype))
+                X_aug.add_(self.pe_proj(pe_aug))
 
         # RWSE
         if self.rwse_proj is not None and hasattr(batch_data, "rwse") and batch_data.rwse is not None:
             rwse = batch_data.rwse
-            rwse_cls = rwse.new_zeros((num_graphs, rwse.size(-1)))
-            rwse_aug = torch.cat([rwse, rwse_cls], dim=0)
-            X_aug = X_aug + self.rwse_proj(rwse_aug.to(dtype=X_aug.dtype))
+            rwse_aug = torch.zeros((num_nodes + num_graphs, rwse.size(-1)), dtype=dtype, device=device)
+            rwse_aug[:num_nodes] = rwse.to(dtype=dtype)
+            X_aug.add_(self.rwse_proj(rwse_aug))
 
-        # Return info needed for the solver
-        # We don't need 'graph_chunks' if we use the sparse energy function
         return X_aug, c_aug, u_aug, cls_indices, node_indices, None
 
     def _prepare_dense_cache(self, x, cls_indices, node_indices, batch_data):

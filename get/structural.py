@@ -82,7 +82,7 @@ def build_undirected_adjacency(num_nodes: int, edges_list: list[tuple[int, int]]
 
 
 def shortest_path_distances(num_nodes: int, edges_list: list[tuple[int, int]], max_distance: int | None = None) -> torch.Tensor:
-    edges_arr = np.ascontiguousarray(np.array(edges_list, dtype=np.int64))
+    edges_arr = np.ascontiguousarray(np.array(edges_list, dtype=np.int64).reshape(-1, 2))
     n = int(num_nodes)
     m_dist = int(max_distance) if max_distance is not None else -1
     unreachable = n if max_distance is None else int(max_distance) + 1
@@ -94,7 +94,7 @@ def shortest_path_distances(num_nodes: int, edges_list: list[tuple[int, int]], m
 
 
 def degree_centrality(num_nodes: int, edges_list: list[tuple[int, int]]) -> torch.Tensor:
-    edges_arr = np.ascontiguousarray(np.array(edges_list, dtype=np.int64))
+    edges_arr = np.ascontiguousarray(np.array(edges_list, dtype=np.int64).reshape(-1, 2))
     n = int(num_nodes)
     indptr, _ = _edges_to_csr_structural(n, edges_arr)
     return torch.from_numpy(np.diff(indptr)).to(dtype=torch.long)
