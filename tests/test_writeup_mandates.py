@@ -34,15 +34,6 @@ def test_inheritance_hopfield_reduction():
         # Our implementation uses lambda_m and beta_m directly.
         
         # Manually compute energy from Eq. 2
-        G = model.get_layer.layernorm(model.node_encoder(batch.x))
-        Qm = G @ model.get_layer.W_Qm[0] # Single head
-        Km = model.get_layer.B_mem @ model.get_layer.W_Km[0]
-        
-        # logsumexp term
-        beta_m = torch.nn.functional.softplus(model.get_layer.beta_m) + 1e-8
-        
-        scale = d ** 0.5
-        scores = (Qm @ Km.transpose(-2, -1)) / scale
         # compute_energy_GET will return [TrialBatch * num_heads]
         X = model.node_encoder(batch.x)
         G = model.get_layer.layernorm(X)
