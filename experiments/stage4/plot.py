@@ -5,18 +5,27 @@ import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import seaborn as sns
 import numpy as np
 
-MODEL_ORDER = ["fullget", "et_faithful"]
+# Apply seaborn publication-ready style
+sns.set_theme(style="whitegrid", context="paper", font_scale=1.2)
+sns.set_palette("deep")
+
+MODEL_ORDER = ["fullget", "et_faithful", "pairwise", "gin"]
 MODEL_LABEL = {
     "fullget": "FullGET",
     "et_faithful": "ETFaithful",
+    "pairwise": "PairwiseGET",
+    "gin": "GIN",
 }
+# Publication-friendly distinct colors
 MODEL_COLOR = {
-    "fullget": "#2ca02c",
-    "et_faithful": "#8c564b",
+    "fullget": "#D55E00",      # Vermillion
+    "et_faithful": "#0072B2",  # Blue
+    "pairwise": "#E69F00",     # Orange
+    "gin": "#009E73",          # Green
 }
-
 
 def _load_json(path: Path) -> dict:
     with path.open("r", encoding="utf-8") as f:
@@ -53,34 +62,40 @@ def plot_stage2_graph_classification(json_path: Path, output_path: Path | None =
     if output_path is None:
         output_path = json_path.with_name("stage2_graph_classification.png")
 
-    plt.figure(figsize=(12, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), dpi=300)
+    axes = axes.flatten()
 
-    for subplot_idx, metric_key, title in [
-        (1, "train_loss", "Training Loss"),
-        (2, "val_acc", "Validation Accuracy"),
-    ]:
-        ax = plt.subplot(1, 2, subplot_idx)
+    for subplot_idx, (metric_key, title) in enumerate([
+        ("train_loss", "Training Loss"),
+        ("val_acc", "Validation Accuracy"),
+    ]):
+        ax = axes[subplot_idx]
         for model_key in MODEL_ORDER:
             mean_curve, std_curve = _history_mean_std(runs, model_key, metric_key)
             if mean_curve.size == 0:
                 continue
             x = np.arange(mean_curve.shape[0])
-            color = MODEL_COLOR[model_key]
-            ax.plot(x, mean_curve, color=color, linewidth=2.2, label=MODEL_LABEL[model_key])
-            ax.fill_between(x, mean_curve - std_curve, mean_curve + std_curve, color=color, alpha=0.15)
+            color = MODEL_COLOR.get(model_key, "#333333")
+            ax.plot(x, mean_curve, color=color, linewidth=2.5, label=MODEL_LABEL.get(model_key, model_key))
+            ax.fill_between(x, mean_curve - std_curve, mean_curve + std_curve, color=color, alpha=0.15, linewidth=0)
 
-        ax.set_title(title)
-        ax.set_xlabel("Epoch")
-        ax.grid(alpha=0.2, linestyle="--")
-        if subplot_idx == 1:
-            ax.set_ylabel("Loss")
+        ax.set_title(title, fontweight='bold', pad=15)
+        ax.set_xlabel("Epoch", fontweight='bold')
+        ax.grid(alpha=0.3, linestyle="--")
+        
+        # Despine
+        sns.despine(ax=ax)
+        
+        if subplot_idx == 0:
+            ax.set_ylabel("Loss", fontweight='bold')
+            ax.legend(frameon=False, loc="upper right")
         else:
-            ax.set_ylabel("Accuracy")
-        ax.legend()
+            ax.set_ylabel("Accuracy", fontweight='bold')
+            ax.legend(frameon=False, loc="lower right")
 
     plt.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=160)
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
     return output_path
 
@@ -97,10 +112,10 @@ def plot_stage2_graph_anomaly(json_path: Path, output_path: Path | None = None) 
         raise ValueError("No anomaly summary found in JSON payload.")
 
     xs = np.arange(len(label_rates))
-    width = 0.22
+    width = 0.35
     model_offsets = {"fullget": -0.5 * width, "et_faithful": 0.5 * width}
 
-    plt.figure(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(8, 6), dpi=300)
     for model_key, offset in model_offsets.items():
         means = []
         stds = []
@@ -108,27 +123,36 @@ def plot_stage2_graph_anomaly(json_path: Path, output_path: Path | None = None) 
             s = summary[str(rate)]
             means.append(float(s[f"{model_key}_mean"]))
             stds.append(float(s[f"{model_key}_std"]))
-        plt.bar(
+        
+        ax.bar(
             xs + offset,
             means,
-            width=width,
+            width=width * 0.9,
             yerr=stds,
-            capsize=4,
-            color=MODEL_COLOR[model_key],
-            label=MODEL_LABEL[model_key],
+            capsize=5,
+            color=MODEL_COLOR.get(model_key, "#333333"),
+            label=MODEL_LABEL.get(model_key, model_key),
+            edgecolor='black',
+            linewidth=1.2,
+            error_kw=dict(lw=1.5, capthick=1.5)
         )
 
-    plt.xticks(xs, [f"{rate:.2f}" for rate in label_rates])
-    plt.xlabel("Labeled anomaly rate")
-    plt.ylabel("AUC")
-    plt.ylim(0.0, 1.0)
-    plt.title("Stage-2 Graph Anomaly")
-    plt.grid(axis="y", alpha=0.2, linestyle="--")
-    plt.legend()
+    ax.set_xticks(xs)
+    ax.set_xticklabels([f"{rate*100:.0f}%" for rate in label_rates])
+    ax.set_xlabel("Labeled Anomaly Rate", fontweight='bold')
+    ax.set_ylabel("ROC-AUC", fontweight='bold')
+    ax.set_ylim(0.0, 1.0)
+    ax.set_title("Graph Anomaly Detection", fontweight='bold', pad=15)
+    
+    ax.grid(axis="y", alpha=0.3, linestyle="--")
+    ax.set_axisbelow(True)
+    sns.despine(ax=ax, bottom=True)
+    ax.legend(frameon=False, loc='lower right')
+    
     plt.tight_layout()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=160)
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
     return output_path
 
@@ -143,12 +167,14 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.task in ("graph_classification", "all"):
-        out = plot_stage2_graph_classification(Path(args.classification_json), Path(args.classification_out))
-        print(f"Saved {out}")
+        if Path(args.classification_json).exists():
+            out = plot_stage2_graph_classification(Path(args.classification_json), Path(args.classification_out))
+            print(f"Saved {out}")
 
     if args.task in ("graph_anomaly", "all"):
-        out = plot_stage2_graph_anomaly(Path(args.anomaly_json), Path(args.anomaly_out))
-        print(f"Saved {out}")
+        if Path(args.anomaly_json).exists():
+            out = plot_stage2_graph_anomaly(Path(args.anomaly_json), Path(args.anomaly_out))
+            print(f"Saved {out}")
 
     return 0
 

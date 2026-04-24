@@ -1,25 +1,26 @@
 import argparse
 from pathlib import Path
 import torch
-import numpy as np
-import networkx as nx
 import json
 
 from get import FullGET, collate_get_batch
-from experiments.common import save_results
+from experiments.common import save_results, get_num_params
 
 class BRECComparer:
-    def __init__(self, eps=1e-6): self.eps = eps
+    def __init__(self, eps=1e-6):
+        self.eps = eps
     def distinguish(self, z1, z2):
-        if z1.shape[0] != z2.shape[0]: return True
+        if z1.shape[0] != z2.shape[0]:
+            return True
         return torch.norm(torch.sort(z1, dim=0)[0] - torch.sort(z2, dim=0)[0], p='fro').item() > self.eps
 
 def get_node_embeddings(model, g, device):
+    model.eval()
     batch = collate_get_batch([g]).to(device)
-    x = batch.x.view(-1, 1).float() if batch.x.dim() == 1 else batch.x
-    X = model.node_encoder(x)
-    X, _, _ = model._run_fixed_solver(X, batch, model._build_static_projections(batch))
-    return model.get_layer.layernorm(X)
+    # Use Armijo inference for better stability in expressivity comparison
+    with torch.no_grad():
+        X, _ = model(batch, task_level='node', inference_mode='armijo')
+    return X
 
 
 def _normalize_graph(g):
@@ -70,6 +71,16 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = FullGET(in_dim=1, d=args.hidden_dim, num_classes=1).to(device)
     comparer = BRECComparer(eps=args.eps)
+    
+    # Informative log
+    print("-" * 50)
+    print("EXPERIMENT: BREC Expressivity")
+    print(f"DEVICE:     {device}")
+    print(f"PARAMS:     {get_num_params(model)}")
+    if hasattr(model, 'get_layer'):
+        layer = model.get_layer
+        print(f"CONFIG:     d={layer.d}, H={layer.num_heads}, steps={model.num_steps}")
+    print("-" * 50)
     
     pairs = _load_brec_pairs(args.brec_file)
     cats = sorted({cat for cat, _, _ in pairs})

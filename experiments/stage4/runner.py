@@ -24,6 +24,7 @@ from experiments.common import (
     set_seed,
     build_anomaly_protocol_split,
     build_ego_graph_dataset,
+    get_num_params,
 )
 from get import ETFaithful, FullGET, PairwiseGET, collate_get_batch, CachedGraphDataset
 
@@ -58,6 +59,12 @@ TU8_DATASETS = [
 
 
 def _safe_auc(y_true: list[float], y_score: list[float]) -> float:
+    n = min(len(y_true), len(y_score))
+    if n == 0:
+        return 0.5
+    if len(y_true) != len(y_score):
+        y_true = y_true[:n]
+        y_score = y_score[:n]
     if roc_auc_score is None:
         # Fallback proxy when sklearn is unavailable.
         return 0.5
@@ -71,6 +78,12 @@ def _safe_auc(y_true: list[float], y_score: list[float]) -> float:
 
 
 def _safe_f1(y_true: list[float], y_score: list[float], threshold: float = 0.5) -> float:
+    n = min(len(y_true), len(y_score))
+    if n == 0:
+        return 0.0
+    if len(y_true) != len(y_score):
+        y_true = y_true[:n]
+        y_score = y_score[:n]
     y_pred = [1 if s >= threshold else 0 for s in y_score]
     y_bin = [1 if y >= 0.5 else 0 for y in y_true]
     if f1_score is None:
@@ -324,6 +337,7 @@ def _prepare_get_cached_dataset(
     cache_dir: str,
     max_motifs: int | None,
     pe_k: int,
+    rwse_k: int,
     enable_cache: bool,
 ) -> list[dict]:
     if not enable_cache:
@@ -334,6 +348,7 @@ def _prepare_get_cached_dataset(
         name=name,
         max_motifs=max_motifs,
         pe_k=pe_k,
+        rwse_k=rwse_k,
     )
     return wrapped.cached_data
 
@@ -352,8 +367,12 @@ def _train_graph_classification(
     lr: float = 1e-3,
     weight_decay: float = 1e-5,
     loader_kwargs: dict | None = None,
+    model_name: str | None = None,
 ) -> FitResult:
+    import time
+    
     model = model.to(device)
+    model_name = model_name or model.__class__.__name__
     opt = _build_optimizer(model, lr=lr, wd=weight_decay)
     criterion = torch.nn.CrossEntropyLoss()
     loader_kwargs = loader_kwargs or {}
@@ -373,11 +392,27 @@ def _train_graph_classification(
     )
 
     history = {"train_loss": [], "test_acc": [], "bad_batches": []}
-    for _ in tqdm(range(int(epochs)), desc="Epochs", leave=False):
+    param_cnt = get_num_params(model)
+    
+    # Informative log
+    print("-" * 50)
+    print(f"EXPERIMENT: {model_name}")
+    print(f"DEVICE:     {device}")
+    print(f"PARAMS:     {param_cnt}")
+    if hasattr(model, 'get_layer'):
+        layer = model.get_layer
+        steps = getattr(model, 'num_steps', '?')
+        print(f"CONFIG:     d={layer.d}, H={layer.num_heads}, steps={steps}")
+    print("-" * 50)
+
+    epoch_bar = tqdm(range(int(epochs)), desc=f"Train {model_name} [{param_cnt}]", bar_format='{l_bar}{bar:20}{r_bar}', leave=False)
+    
+    for _ in epoch_bar:
+        t0 = time.time()
         model.train()
         train_losses = []
         bad = 0
-        for batch in tqdm(train_loader, desc="Train", leave=False):
+        for batch in train_loader:
             try:
                 batch = batch.to(device)
                 opt.zero_grad()
@@ -389,18 +424,27 @@ def _train_graph_classification(
                 train_losses.append(float(loss.detach().item()))
             except Exception:
                 bad += 1
-        history["train_loss"].append(float(statistics.fmean(train_losses) if train_losses else 0.0))
+        
+        train_loss = float(statistics.fmean(train_losses) if train_losses else 0.0)
+        history["train_loss"].append(train_loss)
         history["bad_batches"].append(float(bad))
 
         model.eval()
         y_true, y_pred = [], []
         with torch.no_grad():
-            for batch in tqdm(test_loader, desc="Eval", leave=False):
+            for batch in test_loader:
                 batch = batch.to(device)
-                logits, _ = model(batch, task_level="graph")
+                # Use Armijo at test time as per paper recommendation
+                forward_kwargs = {'task_level': "graph"}
+                import inspect
+                if 'inference_mode' in inspect.signature(model.forward).parameters:
+                    forward_kwargs['inference_mode'] = 'armijo'
+                
+                logits, _ = model(batch, **forward_kwargs)
                 preds = logits.argmax(dim=-1)
                 y_pred.extend(preds.cpu().tolist())
                 y_true.extend(batch.y.view(-1).long().cpu().tolist())
+                
         if y_true:
             if accuracy_score is not None:
                 acc = float(accuracy_score(y_true, y_pred))
@@ -408,12 +452,23 @@ def _train_graph_classification(
                 acc = float(sum(int(a == b) for a, b in zip(y_true, y_pred)) / len(y_true))
         else:
             acc = 0.0
+            
         history["test_acc"].append(acc)
+        epoch_time = time.time() - t0
+        
+        metrics_str = f"L: {train_loss:.3f} | A: {acc:.3f} | B: {max(history['test_acc']):.3f} | {epoch_time:.1f}s/ep"
+        epoch_bar.set_postfix_str(metrics_str)
 
-    return FitResult(metric=history["test_acc"][-1], history=history, extra={})
+    return FitResult(metric=history["test_acc"][-1] if history["test_acc"] else 0.0, history=history, extra={})
 
 
 def _select_threshold(y_true: list[float], y_score: list[float]) -> float:
+    n = min(len(y_true), len(y_score))
+    if n == 0:
+        return 0.5
+    if len(y_true) != len(y_score):
+        y_true = y_true[:n]
+        y_score = y_score[:n]
     best_t = 0.5
     best_f1 = -1.0
     for t in [0.05 * i for i in range(1, 20)]:
@@ -437,8 +492,12 @@ def _train_graph_binary_with_val(
     loader_kwargs: dict | None = None,
     use_weighted_bce: bool = True,
     eval_batch_size: int | None = None,
+    model_name: str | None = None,
 ) -> FitResult:
+    import time
+    
     model = model.to(device)
+    model_name = model_name or model.__class__.__name__
     opt = _build_optimizer(model, lr=lr, wd=weight_decay)
     if use_weighted_bce and len(train_ds) > 0:
         y = torch.tensor([float(g["y"].view(-1)[0].item()) for g in train_ds], dtype=torch.float32)
@@ -486,11 +545,27 @@ def _train_graph_binary_with_val(
     }
     best = {"val_auc": -1.0, "test_auc": 0.5, "test_f1": 0.0}
 
-    for _ in tqdm(range(int(epochs)), desc="Epochs", leave=False):
+    param_cnt = get_num_params(model)
+    
+    # Informative log
+    print("-" * 50)
+    print(f"EXPERIMENT: {model_name}")
+    print(f"DEVICE:     {device}")
+    print(f"PARAMS:     {param_cnt}")
+    if hasattr(model, 'get_layer'):
+        layer = model.get_layer
+        steps = getattr(model, 'num_steps', '?')
+        print(f"CONFIG:     d={layer.d}, H={layer.num_heads}, steps={steps}")
+    print("-" * 50)
+
+    epoch_bar = tqdm(range(int(epochs)), desc=f"Train {model_name} [{param_cnt}]", bar_format='{l_bar}{bar:20}{r_bar}', leave=False)
+
+    for _ in epoch_bar:
+        t0 = time.time()
         model.train()
         losses = []
         bad = 0
-        for batch in tqdm(train_loader, desc="Train", leave=False):
+        for batch in train_loader:
             try:
                 batch = batch.to(device)
                 opt.zero_grad()
@@ -509,17 +584,23 @@ def _train_graph_binary_with_val(
             run_on_cpu = False
             cpu_model = None
             with torch.no_grad():
-                for b in tqdm(loader, desc="Eval", leave=False):
+                for b in loader:
+                    # Use Armijo at test time as per paper recommendation
+                    forward_kwargs = {'task_level': "graph"}
+                    import inspect
+                    if 'inference_mode' in inspect.signature(model.forward).parameters:
+                        forward_kwargs['inference_mode'] = 'armijo'
+
                     if run_on_cpu:
                         b_cpu = b.to("cpu")
-                        logits, _ = cpu_model(b_cpu, task_level="graph")
+                        logits, _ = cpu_model(b_cpu, **forward_kwargs)
                         prob = torch.sigmoid(logits.view(-1))
                         ys.extend(b_cpu.y.view(-1).float().cpu().tolist())
                         ps.extend(prob.cpu().tolist())
                         continue
                     try:
                         b_dev = b.to(device)
-                        logits, _ = model(b_dev, task_level="graph")
+                        logits, _ = model(b_dev, **forward_kwargs)
                         prob = torch.sigmoid(logits.view(-1))
                         ys.extend(b_dev.y.view(-1).float().cpu().tolist())
                         ps.extend(prob.cpu().tolist())
@@ -533,10 +614,10 @@ def _train_graph_binary_with_val(
                             print("Warning: CUDA OOM in eval; switching remaining eval batches to CPU.")
                         run_on_cpu = True
                         b_cpu = b.to("cpu")
-                        logits, _ = cpu_model(b_cpu, task_level="graph")
+                        logits, _ = cpu_model(b_cpu, **forward_kwargs)
                         prob = torch.sigmoid(logits.view(-1))
                         ys.extend(b_cpu.y.view(-1).float().cpu().tolist())
-                    ps.extend(prob.cpu().tolist())
+                        ps.extend(prob.cpu().tolist())
             return ys, ps
 
         yv, pv = _collect(val_loader)
@@ -547,7 +628,8 @@ def _train_graph_binary_with_val(
         test_auc = _safe_auc(yt, pt) if yt else 0.5
         test_f1 = _safe_f1(yt, pt, threshold=threshold) if yt else 0.0
 
-        history["train_loss"].append(float(statistics.fmean(losses) if losses else 0.0))
+        train_loss = float(statistics.fmean(losses) if losses else 0.0)
+        history["train_loss"].append(train_loss)
         history["val_auc"].append(val_auc)
         history["val_f1"].append(val_f1)
         history["test_auc"].append(test_auc)
@@ -556,6 +638,10 @@ def _train_graph_binary_with_val(
 
         if val_auc > best["val_auc"]:
             best = {"val_auc": val_auc, "test_auc": test_auc, "test_f1": test_f1}
+            
+        epoch_time = time.time() - t0
+        metrics_str = f"L: {train_loss:.3f} | V: {val_auc:.3f} | B: {best['test_auc']:.3f} | {epoch_time:.1f}s/ep"
+        epoch_bar.set_postfix_str(metrics_str)
 
     return FitResult(metric=best["test_auc"], history=history, extra={"best_test_f1": best["test_f1"]})
 
@@ -584,6 +670,7 @@ def _recommend_anomaly_batch_size(dataset: list[dict], requested: int) -> int:
 
 
 def run_graph_classification(args: argparse.Namespace) -> dict:
+    get_pe_k = int(args.get_pe_k) if int(args.get_pe_k) > 0 else 16
     if _normalized_name(args.dataset) in {"tu8", "alltu"}:
         target_datasets = list(TU8_DATASETS)
     else:
@@ -616,7 +703,8 @@ def run_graph_classification(args: argparse.Namespace) -> dict:
                 name=f"stage4_cls_{dataset_name}",
                 cache_dir=args.cache_dir,
                 max_motifs=args.max_motifs if args.max_motifs > 0 else None,
-                pe_k=args.get_pe_k,
+                pe_k=get_pe_k,
+                rwse_k=args.rwse_k,
                 enable_cache=args.cache_processed,
             )
             labels = [int(g["y"].view(-1)[0].item()) for g in proc_ds]
@@ -670,10 +758,14 @@ def run_graph_classification(args: argparse.Namespace) -> dict:
                     "num_classes": num_classes,
                     "num_steps": args.num_steps,
                 }
+                pairwise_kwargs = dict(common_kwargs)
+                pairwise_kwargs["d"] = int(args.hidden_dim * 1.73)
                 pairwise = PairwiseGET(
-                    **common_kwargs,
+                    **pairwise_kwargs,
                     norm_style=args.get_norm_style,
                     pairwise_et_mask=args.get_pairwise_et_mask,
+                    pe_k=get_pe_k,
+                    rwse_k=args.rwse_k,
                     use_cls_token=False,
                 )
                 fullget = FullGET(
@@ -681,6 +773,8 @@ def run_graph_classification(args: argparse.Namespace) -> dict:
                     lambda_3=args.lambda_3,
                     norm_style=args.get_norm_style,
                     pairwise_et_mask=args.get_pairwise_et_mask,
+                    pe_k=get_pe_k,
+                    rwse_k=args.rwse_k,
                     use_cls_token=False,
                 )
                 et_faithful = ETFaithful(
@@ -691,6 +785,7 @@ def run_graph_classification(args: argparse.Namespace) -> dict:
                     num_heads=args.et_num_heads,
                     head_dim=args.et_head_dim if args.et_head_dim > 0 else None,
                     pe_k=args.et_pe_k,
+                    rwse_k=args.rwse_k,
                     mask_mode=args.et_mask_mode,
                     et_official_mode=(args.et_mask_mode == "official_dense"),
                     node_cap=args.et_node_cap,
@@ -703,13 +798,13 @@ def run_graph_classification(args: argparse.Namespace) -> dict:
                         gin = None
 
                 pair_res = _train_graph_classification(
-                    pairwise, train_ds, test_ds, args.epochs, args.batch_size, args.device, loader_kwargs=loader_kwargs
+                    pairwise, train_ds, test_ds, args.epochs, args.batch_size, args.device, loader_kwargs=loader_kwargs, model_name="PairwiseGET"
                 )
                 full_res = _train_graph_classification(
-                    fullget, train_ds, test_ds, args.epochs, args.batch_size, args.device, loader_kwargs=loader_kwargs
+                    fullget, train_ds, test_ds, args.epochs, args.batch_size, args.device, loader_kwargs=loader_kwargs, model_name="FullGET"
                 )
                 et_res = _train_graph_classification(
-                    et_faithful, train_ds, test_ds, args.epochs, args.batch_size, args.device, loader_kwargs=loader_kwargs
+                    et_faithful, train_ds, test_ds, args.epochs, args.batch_size, args.device, loader_kwargs=loader_kwargs, model_name="ETFaithful"
                 )
 
                 fold_run = {
@@ -725,7 +820,7 @@ def run_graph_classification(args: argparse.Namespace) -> dict:
                 }
                 if gin is not None:
                     gin_res = _train_graph_classification(
-                        gin, train_ds, test_ds, args.epochs, args.batch_size, args.device, loader_kwargs=loader_kwargs
+                        gin, train_ds, test_ds, args.epochs, args.batch_size, args.device, loader_kwargs=loader_kwargs, model_name="GIN"
                     )
                     fold_run["gin_acc"] = gin_res.metric
                     fold_run["histories"]["gin"] = gin_res.history
@@ -807,6 +902,7 @@ def run_graph_anomaly(args: argparse.Namespace) -> dict:
             cache_dir=args.cache_dir,
             max_motifs=args.max_motifs if args.max_motifs > 0 else None,
             pe_k=args.get_pe_k,
+            rwse_k=args.rwse_k,
             enable_cache=use_cache,
         )
 
@@ -848,6 +944,8 @@ def run_graph_anomaly(args: argparse.Namespace) -> dict:
                 lambda_3=args.lambda_3,
                 norm_style=args.get_norm_style,
                 pairwise_et_mask=args.get_pairwise_et_mask,
+                pe_k=args.get_pe_k,
+                rwse_k=args.rwse_k,
                 use_cls_token=False,
             )
             et_faithful = ETFaithful(
@@ -858,6 +956,7 @@ def run_graph_anomaly(args: argparse.Namespace) -> dict:
                 num_heads=args.et_num_heads,
                 head_dim=args.et_head_dim if args.et_head_dim > 0 else None,
                 pe_k=args.et_pe_k,
+                rwse_k=args.rwse_k,
                 mask_mode=args.et_mask_mode,
                 et_official_mode=(args.et_mask_mode == "official_dense"),
                 node_cap=args.et_node_cap,
@@ -879,6 +978,7 @@ def run_graph_anomaly(args: argparse.Namespace) -> dict:
                 loader_kwargs=loader_kwargs,
                 use_weighted_bce=args.weighted_bce,
                 eval_batch_size=1,
+                model_name="FullGET"
             )
             et_res = _train_graph_binary_with_val(
                 et_faithful,
@@ -891,6 +991,7 @@ def run_graph_anomaly(args: argparse.Namespace) -> dict:
                 loader_kwargs=loader_kwargs,
                 use_weighted_bce=args.weighted_bce,
                 eval_batch_size=1,
+                model_name="ETFaithful"
             )
             runs.append(
                 {
@@ -934,7 +1035,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num_graphs", type=int, default=120)
     parser.add_argument("--limit_graphs", type=int, default=0)
     parser.add_argument("--in_dim", type=int, default=8)
-    parser.add_argument("--hidden_dim", type=int, default=64)
+    parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--num_steps", type=int, default=4)
@@ -948,6 +1049,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--cache_dir", default=".cache/get_data")
     parser.add_argument("--max_motifs", type=int, default=16)
     parser.add_argument("--get_pe_k", type=int, default=0)
+    parser.add_argument("--rwse_k", type=int, default=0)
     parser.add_argument("--ego_hops", type=int, default=1)
     parser.add_argument("--ego_limit", type=int, default=0)
 
@@ -961,7 +1063,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--et_num_heads", type=int, default=1)
     parser.add_argument("--et_head_dim", type=int, default=0)
     parser.add_argument("--et_pe_k", type=int, default=8)
-    parser.add_argument("--et_mask_mode", choices=["sparse", "official_dense"], default="sparse")
+    parser.add_argument("--et_mask_mode", choices=["sparse", "official_dense"], default="official_dense")
     parser.add_argument("--et_node_cap", type=int, default=0)
     return parser.parse_args()
 

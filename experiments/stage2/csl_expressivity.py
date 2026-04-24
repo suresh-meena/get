@@ -1,7 +1,6 @@
 import argparse
 import torch
 import networkx as nx
-from tqdm.auto import tqdm
 import numpy as np
 from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
 
@@ -39,7 +38,7 @@ def main():
     results = {}
 
     model_factories = [
-        ("PairwiseGET", lambda: PairwiseGET(1, 64, 10)),
+        ("PairwiseGET", lambda: PairwiseGET(1, int(64 * 1.73), 10)),
         ("FullGET", lambda: FullGET(1, 64, 10, R=2, lambda_3=0.5)),
         ("GIN", lambda: GINBaseline(1, 64, 10))
     ]

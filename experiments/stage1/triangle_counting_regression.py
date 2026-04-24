@@ -18,7 +18,8 @@ def generate_degree_controlled_triangle_dataset(num_graphs=2000, n_nodes=24, deg
         nswap = rng.randint(max(4, degree * 2), max(8, degree * n_nodes))
         try:
             nx.double_edge_swap(G, nswap=nswap, max_tries=max(100, nswap * 20), seed=rng.randint(0, 10**9))
-        except nx.NetworkXException: continue
+        except nx.NetworkXException:
+            continue
         tri_count = sum(nx.triangles(G).values()) // 3
         rows.append({"graph": G, "tri_count": tri_count})
         pbar.update(1)
@@ -136,8 +137,8 @@ def main():
 
     results = {}
     models = [
-        ("PairwiseGET", PairwiseGET(1, 96, 1, num_steps=8, eta=0.01, eta_max=0.05, beta_2=1.0, grad_clip_norm=0.5, state_clip_norm=5.0, beta_max=3.0), 1e-4, 0.5),
-        ("FullGET", FullGET(1, 96, 1, num_steps=8, R=2, lambda_3=0.8, lambda_m=0.0, beta_2=1.0, beta_3=1.2, eta=0.008, eta_max=0.04, grad_clip_norm=0.3, state_clip_norm=5.0, beta_max=3.0, update_damping=0.5, dropout=0.0, compile=False), 3e-5, 0.3),
+        ("PairwiseGET", PairwiseGET(1, int(96 * 1.73), 1, num_steps=8, eta=0.01, eta_max=0.05, beta_2=1.0, grad_clip_norm=0.5, state_clip_norm=5.0, beta_max=3.0), 1e-4, 0.5),
+        ("FullGET", FullGET(1, 96, 1, num_steps=8, R=2, lambda_3=0.8, lambda_m=1.0, beta_2=1.0, beta_3=1.2, eta=0.008, eta_max=0.04, grad_clip_norm=0.3, state_clip_norm=5.0, beta_max=3.0, update_damping=0.5, dropout=0.0, compile=False), 3e-5, 0.3),
         ("GIN", GINBaseline(1, 96, 1, num_layers=4), 2e-4, 1.0),
     ]
 
@@ -145,15 +146,29 @@ def main():
         print(f"\n--- Training {name} ---")
         trainer = GETTrainer(
             model,
-            task_type='binary',
+            task_type='regression',
             device=device,
             lr=lr,
             max_grad_norm=max_grad_norm,
-            margin_loss_weight=args.margin_loss_weight,
-            logit_margin=args.logit_margin,
         )
-        results[name] = trainer.run(train_ds, val_ds, test_ds, args.epochs, args.batch_size)
-        print(f"{name} Test AUC: {results[name]['metric']:.4f}")
+        _ = trainer.run(train_ds, val_ds, test_ds, args.epochs, args.batch_size)
+        
+        y_pred, y_true = _predict(model, test_ds, batch_size=args.batch_size, device=device)
+        degs = np.array([g["degree"] for g in test_ds], dtype=np.float64)
+        
+        rmse_val = _rmse(y_true, y_pred)
+        spearman_val = _spearman(y_true, y_pred)
+        deg_res = _degree_regressed_scores(y_true, y_pred, degs)
+        
+        res = {
+            'mae': float(np.mean(np.abs(y_true - y_pred))),
+            'rmse': rmse_val,
+            'spearman': spearman_val,
+            'rmse_deg_residual': deg_res['rmse_deg_residual'],
+            'spearman_deg_residual': deg_res['spearman_deg_residual'],
+        }
+        results[name] = res
+        print(f"{name} Test MAE: {res['mae']:.4f}, RMSE: {res['rmse']:.4f}, Spearman: {res['spearman']:.4f}, Deg-Resid Spearman: {res['spearman_deg_residual']:.4f}")
 
     save_results("exp2_triangle_results", results)
 

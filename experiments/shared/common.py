@@ -1,20 +1,31 @@
-import math
 import random
-import tempfile
 import json
-import os
+import time
+import inspect
 from pathlib import Path
-from functools import partial
 from collections import deque
 
 import numpy as np
 import torch
+from torch.nn.parameter import UninitializedParameter
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, mean_absolute_error
+from sklearn.metrics import accuracy_score, roc_auc_score, mean_absolute_error
 from tqdm.auto import tqdm
 
 from get import build_adamw_optimizer, collate_get_batch
+
+def get_num_params(model):
+    """Return formatted string of trainable parameter count."""
+    num_params = sum(
+        p.numel() for p in model.parameters() 
+        if p.requires_grad and not isinstance(p, UninitializedParameter)
+    )
+    if num_params >= 1e6:
+        return f"{num_params / 1e6:.2f}M"
+    if num_params >= 1e3:
+        return f"{num_params / 1e3:.2f}K"
+    return str(num_params)
 
 def set_seed(seed):
     random.seed(seed)
@@ -95,11 +106,16 @@ def split_grouped_dataset(dataset, split_key, seed, train_ratio=0.70, val_ratio=
     test_data = [g for g in dataset if g[split_key] in test_ids]
     return train_data, val_data, test_data
 
-def save_results(name, payload):
+def save_results(name, payload, metadata=None):
     Path("outputs").mkdir(parents=True, exist_ok=True)
     path = Path("outputs") / f"{name}.json"
+    
+    data = payload
+    if metadata is not None:
+        data = {"results": payload, "metadata": metadata}
+        
     with path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+        json.dump(data, f, indent=2)
     print(f"Results saved to {path}")
 
 def load_tu_dataset(dataset_name, limit=None):
@@ -111,7 +127,8 @@ def load_tu_dataset(dataset_name, limit=None):
         root = tu_root / "MUTAGENICITY"
         name = "Mutagenicity"
     ds = TUDataset(root=str(root), name=name)
-    if limit is not None: ds = ds[:int(limit)]
+    if limit is not None:
+        ds = ds[:int(limit)]
     out = []
     for idx, data in enumerate(ds):
         x = data.x.float() if data.x is not None else torch.ones(data.num_nodes, 1)
@@ -322,17 +339,21 @@ def build_anomaly_protocol_split(
 
 class GETTrainer:
     """Unified trainer for GET experiments supporting Classification and Regression."""
-    def __init__(self, model, task_type='binary', device='cuda', **kwargs):
+    def __init__(self, model, task_type='binary', device='cuda', model_name=None, **kwargs):
         self.model = model.to(device)
         self.task_type = task_type
         self.device = device
-        self.lr = kwargs.get('lr', 1e-4)
+        self.model_name = model_name or model.__class__.__name__
+        
+        self.lr = kwargs.get('lr', 1e-3)
         self.weight_decay = kwargs.get('weight_decay', 1e-5)
         self.max_grad_norm = kwargs.get('max_grad_norm', 1.0)
         self.margin_loss_weight = float(kwargs.get('margin_loss_weight', 0.0))
         self.logit_margin = float(kwargs.get('logit_margin', 1.0))
         self.use_amp = (device == 'cuda' or 'cuda' in str(device))
+        self.autocast_device_type = torch.device(self.device).type
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+        self.supports_armijo = 'inference_mode' in inspect.signature(self.model.forward).parameters
         
         self.optimizer = build_adamw_optimizer(self.model, lr=self.lr, weight_decay=self.weight_decay)
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -342,13 +363,58 @@ class GETTrainer:
         self.loader_num_workers = kwargs.get('num_workers', None)
         self.loader_prefetch_factor = kwargs.get('prefetch_factor', 2)
         
-        # Loss selection
+        # Loss selection (placeholder, can be updated in run() with data-dependent weights)
         if task_type == 'regression':
             self.criterion = nn.L1Loss()
-        elif task_type == 'binary':
+        elif task_type in ['binary', 'multilabel']:
             self.criterion = nn.BCEWithLogitsLoss()
         else:
             self.criterion = nn.CrossEntropyLoss()
+
+    def _prepare_weighted_criterion(self, dataset):
+        """Compute pos_weight for imbalanced binary/multilabel datasets."""
+        if self.task_type not in ['binary', 'multilabel']:
+            return
+        
+        ys = []
+        for item in dataset:
+            y = item['y']
+            ys.append(y.view(-1).float())
+        ys = torch.stack(ys, dim=0)
+        
+        pos = (ys > 0.5).sum(dim=0).float()
+        neg = (ys <= 0.5).sum(dim=0).float()
+        
+        # pos_weight = neg / pos
+        weights = torch.ones_like(pos)
+        mask = (pos > 0) & (neg > 0)
+        weights[mask] = neg[mask] / pos[mask]
+        
+        print(f"INFO:    Applied class weights: {weights.cpu().numpy()}")
+        self.criterion = nn.BCEWithLogitsLoss(pos_weight=weights.to(self.device))
+
+    def log_info(self):
+        """Print a summary of the model and training configuration."""
+        print("-" * 50)
+        print(f"EXPERIMENT: {self.model_name}")
+        print(f"TASK:       {self.task_type.upper()}")
+        print(f"DEVICE:     {self.device}")
+        print(f"PARAMS:     {get_num_params(self.model)}")
+        
+        # Detect GET-specific config
+        target = self.model
+        if hasattr(target, 'get_layer'):
+            layer = target.get_layer
+            steps = getattr(target, 'num_steps', '?')
+            print(f"CONFIG:     d={layer.d}, H={layer.num_heads}, steps={steps}")
+            if hasattr(layer, 'R'):
+                print(f"            R={layer.R}, K={layer.K}")
+            print(f"COUPLINGS:  λ2={torch.nn.functional.softplus(layer.lambda_2).item():.3f}, "
+                  f"λ3={torch.nn.functional.softplus(layer.lambda_3).item():.3f}, "
+                  f"λm={torch.nn.functional.softplus(layer.lambda_m).item():.3f}")
+        
+        print(f"HYPER-P:    lr={self.lr}, wd={self.weight_decay}, clip={self.max_grad_norm}")
+        print("-" * 50)
 
     def train_epoch(self, loader):
         self.model.train()
@@ -356,15 +422,17 @@ class GETTrainer:
         if len(loader) == 0:
             return 0.0
         for batch in loader:
-            batch = batch.to(self.device)
+            batch = batch.to(self.device, non_blocking=True)
             self.optimizer.zero_grad()
-            with torch.autocast(device_type=torch.device(self.device).type, enabled=self.use_amp):
+            with torch.autocast(device_type=self.autocast_device_type, enabled=self.use_amp):
                 out, _ = self.model(batch, task_level='graph')
                 # Align shapes
                 if self.task_type in ['binary', 'regression']:
                     loss = self.criterion(out.view(-1), batch.y.view(-1).float())
                     if self.task_type == 'binary' and self.margin_loss_weight > 0.0:
                         loss = loss + self.margin_loss_weight * _signed_margin_loss(out.view(-1), batch.y.view(-1).float(), self.logit_margin)
+                elif self.task_type == 'multilabel':
+                    loss = self.criterion(out, batch.y.view(out.shape).float())
                 else:
                     loss = self.criterion(out, batch.y.view(-1).long())
             
@@ -382,7 +450,7 @@ class GETTrainer:
         return total_loss / max(len(loader), 1)
 
     @torch.no_grad()
-    def evaluate(self, loader):
+    def evaluate(self, loader, inference_mode='fixed'):
         self.model.eval()
         all_preds, all_y = [], []
         total_loss = 0
@@ -391,28 +459,55 @@ class GETTrainer:
             metrics['metric'] = 0.5 if self.task_type == 'binary' else 0.0
             return metrics
         for batch in loader:
-            batch = batch.to(self.device)
-            with torch.autocast(device_type=torch.device(self.device).type, enabled=self.use_amp):
-                out, _ = self.model(batch, task_level='graph')
+            batch = batch.to(self.device, non_blocking=True)
+            with torch.autocast(device_type=self.autocast_device_type, enabled=self.use_amp):
+                # Use Armijo if requested and supported by the model
+                forward_kwargs = {'task_level': 'graph'}
+                if inference_mode == 'armijo' and self.supports_armijo:
+                    forward_kwargs['inference_mode'] = 'armijo'
+                
+                out, _ = self.model(batch, **forward_kwargs)
                 if self.task_type in ['binary', 'regression']:
                     total_loss += self.criterion(out.view(-1), batch.y.view(-1).float()).item()
                     pred = torch.sigmoid(out).view(-1) if self.task_type == 'binary' else out.view(-1)
+                    all_preds.extend(pred.cpu().numpy().tolist())
+                    all_y.extend(batch.y.view(-1).cpu().numpy().tolist())
+                elif self.task_type == 'multilabel':
+                    total_loss += self.criterion(out, batch.y.view(out.shape).float()).item()
+                    pred = torch.sigmoid(out)
+                    all_preds.append(pred.cpu().numpy())
+                    all_y.append(batch.y.view(out.shape).cpu().numpy())
                 else:
                     total_loss += self.criterion(out, batch.y.view(-1).long()).item()
                     pred = out.argmax(dim=-1)
-            all_preds.extend(pred.cpu().numpy().tolist())
-            all_y.extend(batch.y.view(-1).cpu().numpy().tolist())
+                    all_preds.extend(pred.cpu().numpy().tolist())
+                    all_y.extend(batch.y.view(-1).cpu().numpy().tolist())
         
         metrics = {'loss': total_loss / max(len(loader), 1)}
         if self.task_type == 'binary':
             metrics['metric'] = roc_auc_score(all_y, all_preds) if len(set(all_y)) > 1 else 0.5
+            y_pred_bin = [int(p >= 0.5) for p in all_preds]
+            metrics['accuracy'] = accuracy_score(all_y, y_pred_bin)
         elif self.task_type == 'regression':
             metrics['metric'] = mean_absolute_error(all_y, all_preds)
+        elif self.task_type == 'multilabel':
+            y_true_arr = np.concatenate(all_y, axis=0)
+            y_pred_arr = np.concatenate(all_preds, axis=0)
+            from sklearn.metrics import average_precision_score
+            aps = []
+            for c in range(y_true_arr.shape[1]):
+                if len(set(y_true_arr[:, c].tolist())) < 2:
+                    continue
+                aps.append(average_precision_score(y_true_arr[:, c], y_pred_arr[:, c]))
+            metrics['metric'] = float(np.mean(aps)) if aps else 0.0
         else:
             metrics['metric'] = accuracy_score(all_y, all_preds)
         return metrics
 
-    def run(self, train_ds, val_ds, test_ds, epochs, batch_size, collate_fn=collate_get_batch):
+    def run(self, train_ds, val_ds, test_ds, epochs, batch_size, collate_fn=collate_get_batch, use_armijo_at_test=True, use_weighted_loss=False):
+        if use_weighted_loss:
+            self._prepare_weighted_criterion(train_ds)
+        self.log_info()
         loader_kwargs = build_dataloader_kwargs(
             self.device,
             num_workers=self.loader_num_workers,
@@ -425,19 +520,33 @@ class GETTrainer:
         best_metric = float('inf') if self.task_type == 'regression' else -float('inf')
         best_state = None
         
-        pbar = tqdm(range(epochs), desc="Training")
+        param_cnt = get_num_params(self.model)
+        pbar = tqdm(range(epochs), desc=f"Train {self.model_name} [{param_cnt}]", bar_format='{l_bar}{bar:20}{r_bar}')
+        
         for epoch in pbar:
+            t0 = time.time()
             train_loss = self.train_epoch(train_loader)
-            val_res = self.evaluate(val_loader)
+            # Use fixed during validation for speed
+            val_res = self.evaluate(val_loader, inference_mode='fixed')
+            epoch_time = time.time() - t0
+            
             self.scheduler.step(val_res['loss'] if self.task_type == 'regression' else val_res['metric'])
             
             is_best = (val_res['metric'] < best_metric) if self.task_type == 'regression' else (val_res['metric'] > best_metric)
             if is_best:
                 best_metric = val_res['metric']
-                best_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+                best_state = {}
+                for k, v in self.model.state_dict().items():
+                    if isinstance(v, UninitializedParameter):
+                        continue
+                    best_state[k] = v.cpu().clone()
             
-            pbar.set_postfix({'t_loss': f"{train_loss:.3f}", 'v_metric': f"{val_res['metric']:.3f}"})
+            metrics_str = f"L: {train_loss:.3f} | V: {val_res['metric']:.3f} | B: {best_metric:.3f} | {epoch_time:.1f}s/ep"
+            pbar.set_postfix_str(metrics_str)
         
         if best_state:
-            self.model.load_state_dict(best_state)
-        return self.evaluate(test_loader)
+            self.model.load_state_dict(best_state, strict=False)
+        
+        # Use Armijo for the final test evaluation as per paper
+        test_mode = 'armijo' if use_armijo_at_test else 'fixed'
+        return self.evaluate(test_loader, inference_mode=test_mode)

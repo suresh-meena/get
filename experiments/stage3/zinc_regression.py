@@ -1,6 +1,5 @@
 import argparse
 import torch
-import numpy as np
 
 from get import FullGET, PairwiseGET, GINBaseline
 from get.data import CachedGraphDataset
@@ -17,23 +16,24 @@ def load_zinc_subset(root="data/ZINC"):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--hidden_dim", type=int, default=64)
+    parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--model", choices=["pairwise", "full", "gin"], default="full")
+    parser.add_argument("--rwse_k", type=int, default=0)
     args = parser.parse_args()
 
     set_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     raw_tr, raw_val, raw_ts = load_zinc_subset()
     
-    tr_ds = CachedGraphDataset(raw_tr, name="zinc_train", max_motifs=16, pe_k=16)
-    val_ds = CachedGraphDataset(raw_val, name="zinc_val", max_motifs=16, pe_k=16)
-    ts_ds = CachedGraphDataset(raw_ts, name="zinc_test", max_motifs=16, pe_k=16)
+    tr_ds = CachedGraphDataset(raw_tr, name="zinc_train", max_motifs=16, pe_k=16, rwse_k=args.rwse_k)
+    val_ds = CachedGraphDataset(raw_val, name="zinc_val", max_motifs=16, pe_k=16, rwse_k=args.rwse_k)
+    ts_ds = CachedGraphDataset(raw_ts, name="zinc_test", max_motifs=16, pe_k=16, rwse_k=args.rwse_k)
 
     in_dim = tr_ds[0]['x'].size(1)
     if args.model == "full":
-        model = FullGET(in_dim, args.hidden_dim, 1, pe_k=16, lambda_3=1.0)
+        model = FullGET(in_dim, args.hidden_dim, 1, pe_k=16, rwse_k=args.rwse_k, lambda_3=1.0)
     elif args.model == "pairwise":
-        model = PairwiseGET(in_dim, int(args.hidden_dim * 1.73), 1, pe_k=16)
+        model = PairwiseGET(in_dim, int(args.hidden_dim * 1.73), 1, pe_k=16, rwse_k=args.rwse_k)
     else:
         model = GINBaseline(in_dim, args.hidden_dim, 1)
 
