@@ -276,6 +276,7 @@ def get_laplacian_pe(num_nodes, edges_list, k=16):
     edges_arr = np.ascontiguousarray(np.array(edges_list, dtype=np.int64))
     indptr, indices = _numba_edges_to_csr(num_nodes, edges_arr)
     
+    # Pass CSR to laplacian_pe_from_adjacency
     from .utils import laplacian_pe_from_adjacency
     return laplacian_pe_from_adjacency(num_nodes, indptr, indices, k=k, training=False)
 
@@ -491,12 +492,6 @@ def _process_one_graph(g, max_motifs, pe_k, rwse_k):
         item['aligned_edge_attr'] = align_pairwise_edge_attr(g['edges'], g['edge_attr'], c_2, u_2)
     
     return item
-        
-    def __len__(self):
-        return len(self.cached_data)
-        
-    def __getitem__(self, idx):
-        return self.cached_data[idx]
 
 
 class GETBatch:
@@ -543,88 +538,127 @@ class GETBatch:
             self.rwse = self.rwse.to(device, non_blocking=non_blocking)
         return self
 
+
 def collate_get_batch(graph_list, max_motifs=None):
     """
     Collate a list of graphs into a single large disconnected graph (PyG style).
-    Each graph in graph_list is a dict: {'x': tensor, 'edges': list_of_tuples, 'y': tensor(optional)}
+    Uses pre-allocated tensors for efficiency.
     """
     if len(graph_list) == 0:
         raise ValueError("graph_list must contain at least one graph.")
 
-    x_list = []
-    c_2_list, u_2_list = [], []
-    c_3_list, u_3_list, v_3_list, t_tau_list = [], [], [], []
-    batch_list = []
-    ptr_list = [0]
-    y_list = []
-    edge_attr_list = []
-    pe_list = []
-    pe_cls_list = []
-    pe_cls_ptr_list = [0]
-    rwse_list = []
+    # 1. Pre-calculate total sizes
+    total_nodes = 0
+    total_edges_pair = 0
+    total_motifs = 0
+    total_pe_cls_nodes = 0
+    has_y = 'y' in graph_list[0]
+    has_edge_attr = 'aligned_edge_attr' in graph_list[0] or 'edge_attr' in graph_list[0]
+    has_pe = 'pe' in graph_list[0]
+    has_pe_cls = 'pe_cls' in graph_list[0]
+    has_rwse = 'rwse' in graph_list[0]
     
-    node_offset = 0
+    for g in graph_list:
+        num_nodes = g['x'].size(0)
+        total_nodes += num_nodes
+        
+        if 'c_2' in g:
+            total_edges_pair += g['c_2'].numel()
+            total_motifs += g['c_3'].numel()
+        else:
+            # Incidence matrices not cached, will compute on the fly
+            # This is slow, but we need the counts for pre-allocation
+            c_2, u_2, c_3, u_3, v_3, t_tau = get_incidence_matrices(num_nodes, g['edges'], max_motifs)
+            g['c_2'], g['u_2'], g['c_3'], g['u_3'], g['v_3'], g['t_tau'] = c_2, u_2, c_3, u_3, v_3, t_tau
+            total_edges_pair += c_2.numel()
+            total_motifs += c_3.numel()
+            
+        if has_pe_cls:
+            total_pe_cls_nodes += g['pe_cls'].size(0)
+
+    # 2. Pre-allocate tensors
+    device = graph_list[0]['x'].device
+    x_dtype = graph_list[0]['x'].dtype
+    
+    x = torch.empty((total_nodes, graph_list[0]['x'].size(1)), dtype=x_dtype, device=device)
+    c_2 = torch.empty(total_edges_pair, dtype=torch.long, device=device)
+    u_2 = torch.empty(total_edges_pair, dtype=torch.long, device=device)
+    c_3 = torch.empty(total_motifs, dtype=torch.long, device=device)
+    u_3 = torch.empty(total_motifs, dtype=torch.long, device=device)
+    v_3 = torch.empty(total_motifs, dtype=torch.long, device=device)
+    t_tau = torch.empty(total_motifs, dtype=torch.int32, device=device)
+    batch = torch.empty(total_nodes, dtype=torch.long, device=device)
+    ptr = torch.empty(len(graph_list) + 1, dtype=torch.long, device=device)
+    ptr[0] = 0
+    
+    y = torch.empty(len(graph_list), dtype=torch.float32, device=device) if has_y else None
+    
+    edge_attr = None
+    if has_edge_attr:
+        attr_sample = graph_list[0].get('aligned_edge_attr', graph_list[0].get('edge_attr'))
+        edge_attr = torch.empty((total_edges_pair, attr_sample.size(1)), dtype=x_dtype, device=device)
+        
+    pe = torch.empty((total_nodes, graph_list[0]['pe'].size(1)), dtype=x_dtype, device=device) if has_pe else None
+    
+    pe_cls = None
+    pe_cls_ptr = None
+    if has_pe_cls:
+        pe_cls = torch.empty((total_pe_cls_nodes, graph_list[0]['pe_cls'].size(1)), dtype=x_dtype, device=device)
+        pe_cls_ptr = torch.empty(len(graph_list) + 1, dtype=torch.long, device=device)
+        pe_cls_ptr[0] = 0
+        
+    rwse = torch.empty((total_nodes, graph_list[0]['rwse'].size(1)), dtype=x_dtype, device=device) if has_rwse else None
+
+    # 3. Fill tensors
+    n_curr, e_curr, m_curr, p_cls_curr = 0, 0, 0, 0
     
     for g_idx, g in enumerate(graph_list):
         num_nodes = g['x'].size(0)
-        x_list.append(g['x'])
+        n_end = n_curr + num_nodes
         
-        if 'c_2' in g:
-            c_2, u_2 = g['c_2'], g['u_2']
-            c_3, u_3, v_3, t_tau = g['c_3'], g['u_3'], g['v_3'], g['t_tau']
-        else:
-            c_2, u_2, c_3, u_3, v_3, t_tau = get_incidence_matrices(num_nodes, g['edges'], max_motifs)
+        x[n_curr:n_end] = g['x']
+        batch[n_curr:n_end] = g_idx
+        ptr[g_idx + 1] = n_end
         
-        c_2_list.append(c_2 + node_offset)
-        u_2_list.append(u_2 + node_offset)
-        c_3_list.append(c_3 + node_offset)
-        u_3_list.append(u_3 + node_offset)
-        v_3_list.append(v_3 + node_offset)
-        t_tau_list.append(t_tau)
+        c2, u2 = g['c_2'], g['u_2']
+        e_cnt = c2.numel()
+        e_end = e_curr + e_cnt
+        c_2[e_curr:e_end] = c2 + n_curr
+        u_2[e_curr:e_end] = u2 + n_curr
         
-        batch_list.append(torch.full((num_nodes,), g_idx, dtype=torch.long))
-        ptr_list.append(ptr_list[-1] + num_nodes)
+        c3, u3, v3, tt = g['c_3'], g['u_3'], g['v_3'], g['t_tau']
+        m_cnt = c3.numel()
+        m_end = m_curr + m_cnt
+        c_3[m_curr:m_end] = c3 + n_curr
+        u_3[m_curr:m_end] = u3 + n_curr
+        v_3[m_curr:m_end] = v3 + n_curr
+        t_tau[m_curr:m_end] = tt
         
-        if 'y' in g:
-            # Canonicalize graph labels so mixed scalar vs [1]-shaped values
-            # can be batched together without cat/stack shape errors.
-            y = torch.as_tensor(g['y']).reshape(-1)
-            if y.numel() != 1:
-                raise ValueError(
-                    "Expected one graph label per sample; "
-                    f"got shape {tuple(torch.as_tensor(g['y']).shape)}."
-                )
-            y_list.append(y)
-        if 'aligned_edge_attr' in g:
-            edge_attr_list.append(g['aligned_edge_attr'])
-        elif 'edge_attr' in g:
-            edge_attr_list.append(align_pairwise_edge_attr(g['edges'], g['edge_attr'], c_2, u_2))
-        
-        if 'pe' in g:
-            pe_list.append(g['pe'])
-        if 'pe_cls' in g:
-            pe_cls_list.append(g['pe_cls'])
-            pe_cls_ptr_list.append(pe_cls_ptr_list[-1] + g['pe_cls'].size(0))
-        
-        if 'rwse' in g:
-            rwse_list.append(g['rwse'])
+        if has_y:
+            y[g_idx] = torch.as_tensor(g['y']).view(-1)[0]
             
-        node_offset += num_nodes
+        if has_edge_attr:
+            curr_attr = g.get('aligned_edge_attr')
+            if curr_attr is None:
+                curr_attr = align_pairwise_edge_attr(g['edges'], g['edge_attr'], c2, u2)
+            edge_attr[e_curr:e_end] = curr_attr
+            
+        if has_pe:
+            pe[n_curr:n_end] = g['pe']
+            
+        if has_pe_cls:
+            curr_pe_cls = g['pe_cls']
+            p_cls_cnt = curr_pe_cls.size(0)
+            p_cls_end = p_cls_curr + p_cls_cnt
+            pe_cls[p_cls_curr:p_cls_end] = curr_pe_cls
+            pe_cls_ptr[g_idx + 1] = p_cls_end
+            p_cls_curr = p_cls_end
+            
+        if has_rwse:
+            rwse[n_curr:n_end] = g['rwse']
+            
+        n_curr = n_end
+        e_curr = e_end
+        m_curr = m_end
         
-    x = torch.cat(x_list, dim=0)
-    c_2 = torch.cat(c_2_list, dim=0) if c_2_list else torch.empty(0, dtype=torch.long)
-    u_2 = torch.cat(u_2_list, dim=0) if u_2_list else torch.empty(0, dtype=torch.long)
-    c_3 = torch.cat(c_3_list, dim=0) if c_3_list else torch.empty(0, dtype=torch.long)
-    u_3 = torch.cat(u_3_list, dim=0) if u_3_list else torch.empty(0, dtype=torch.long)
-    v_3 = torch.cat(v_3_list, dim=0) if v_3_list else torch.empty(0, dtype=torch.long)
-    t_tau = torch.cat(t_tau_list, dim=0) if t_tau_list else torch.empty(0, dtype=torch.long)
-    batch = torch.cat(batch_list, dim=0)
-    ptr = torch.tensor(ptr_list, dtype=torch.long)
-    y = torch.cat(y_list, dim=0) if y_list else None
-    edge_attr = torch.cat(edge_attr_list, dim=0) if edge_attr_list else None
-    pe = torch.cat(pe_list, dim=0) if pe_list else None
-    pe_cls = torch.cat(pe_cls_list, dim=0) if pe_cls_list else None
-    pe_cls_ptr = torch.tensor(pe_cls_ptr_list, dtype=torch.long) if pe_cls_list else None
-    rwse = torch.cat(rwse_list, dim=0) if rwse_list else None
-    
     return GETBatch(x, c_2, u_2, c_3, u_3, v_3, t_tau, batch, ptr, y, edge_attr, pe=pe, pe_cls=pe_cls, pe_cls_ptr=pe_cls_ptr, rwse=rwse)

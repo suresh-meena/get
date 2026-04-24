@@ -242,7 +242,7 @@ class ETFaithfulGraphModel(nn.Module):
         for block_idx in range(self.num_blocks):
             norm = self.norm_blocks[block_idx]
             core = self.core_blocks[block_idx]
-            for _ in range(self.num_steps):
+            for step_idx in range(self.num_steps):
                 g = norm(x)
                 # Analytical gradient call
                 e, grad_g = core.energy_and_grad(
@@ -265,15 +265,15 @@ class ETFaithfulGraphModel(nn.Module):
                     gnorm = grad_x.norm(dim=-1, keepdim=True).clamp_min(1e-6)
                     grad_x = grad_x * (self.grad_clip_norm / gnorm).clamp(max=1.0)
 
-                x_next = x - step * grad_x
+                # In-place update for efficiency
+                x.sub_(step * grad_x)
                 if noise is not None:
-                    x_next = x_next + torch.sqrt(step.clamp_min(1e-8)) * noise
+                    x.add_(torch.sqrt(step.clamp_min(1e-8)) * noise)
                 if self.state_clip_norm is not None:
-                    snorm = x_next.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-                    x_next = x_next * (self.state_clip_norm / snorm).clamp(max=1.0)
+                    snorm = x.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+                    x.mul_((self.state_clip_norm / snorm).clamp(max=1.0))
 
                 energy_trace.append(float(e.detach().item()))
-                x = x_next
         return x, energy_trace
 
     def _init_solver_stats(self, inference_mode):

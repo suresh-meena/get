@@ -352,13 +352,19 @@ class GETModel(nn.Module):
         energy_trace = []
         eta = self.eta
         X_current = X
-        for _ in range(self.num_steps):
-            X_prev = X_current
-            X_current, E = self.get_layer(X_current, solver_batch, eta, static_projections, is_training=training_mode)
+        check_freq = 4
+        
+        for step_idx in range(self.num_steps):
+            X_prev = X_current.detach().clone() if (self.tol > 0 and step_idx % check_freq == 0) else None
+            
+            # Use the layer's forward which now returns next state and energy
+            X_next, E = self.get_layer(X_current, solver_batch, eta, static_projections, is_training=training_mode)
             energy_trace.append(E.detach())
-            if self.tol > 0:
+            X_current = X_next
+            
+            if self.tol > 0 and X_prev is not None:
+                # Tolerance check every 4 steps to reduce sync stalls
                 with torch.no_grad():
-                    # Monitor relative change in state for early stopping
                     diff = torch.norm(X_current - X_prev) / (torch.norm(X_prev) + 1e-6)
                     if diff < self.tol:
                         break
@@ -414,7 +420,8 @@ class GETModel(nn.Module):
             # Final assignment
             # Use etas_all to get the final accepted states
             accepted_etas = etas_all[best_idx]
-            X_current = X_current - accepted_etas[batch_data.batch].view(-1, 1) * grad_X
+            # In-place update to reduce memory pressure
+            X_current.sub_(accepted_etas[batch_data.batch].view(-1, 1) * grad_X)
 
             energy_trace.append(E_t.detach())
             stats['backtracks'].append(best_idx.float().mean().item())

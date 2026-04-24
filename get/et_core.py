@@ -37,10 +37,11 @@ class EnergyLayerNorm(nn.Module):
         xmeaned = x - x.mean(dim=-1, keepdim=True)
         var = (xmeaned.pow(2)).mean(dim=-1, keepdim=True)
         std_inv = 1.0 / torch.sqrt(var + self.eps)
+        std_inv_sq = std_inv**2
         
         term1 = grad_v
         term2 = grad_v.mean(dim=-1, keepdim=True)
-        term3 = xmeaned * (grad_v * xmeaned).mean(dim=-1, keepdim=True) * (std_inv**2)
+        term3 = xmeaned * (grad_v * xmeaned).mean(dim=-1, keepdim=True) * std_inv_sq
         
         grad_x = self.gamma * std_inv * (term1 - term2 - term3)
         return grad_x
