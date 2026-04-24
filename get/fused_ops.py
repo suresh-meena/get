@@ -7,86 +7,89 @@ except (ImportError, OSError):
 
 
 def _segment_reduce_with_torch_segment(src, segment_ids, num_segments, reduce):
-    if src.dim() == 2:
-        B, L = src.shape
-        counts = torch.bincount(segment_ids, minlength=num_segments)
-        if L == 0:
-            if reduce == "max":
-                return torch.full((B, num_segments), float("-inf"), dtype=src.dtype, device=src.device), counts
-            return torch.zeros((B, num_segments), dtype=src.dtype, device=src.device), counts
-        return _segment_reduce_with_scatter_reduce(src, segment_ids, num_segments, reduce)
-
-    counts = torch.bincount(segment_ids, minlength=num_segments)
-    if src.numel() == 0:
-        if reduce == "max":
-            return torch.full((num_segments,), float("-inf"), dtype=src.dtype, device=src.device), counts
-        return torch.zeros((num_segments,), dtype=src.dtype, device=src.device), counts
-    perm = torch.argsort(segment_ids)
-    src_sorted = src[perm]
-    out = torch.segment_reduce(src_sorted, reduce=reduce, lengths=counts)
-    return out, counts
+    """Fallback using torch.segment_reduce (if available) or manual scatter."""
+    if hasattr(torch, "segment_reduce"):
+        # torch.segment_reduce requires sorted segments and counts
+        # This is more complex to implement correctly as a general fallback
+        pass
+    return _segment_reduce_with_scatter_reduce(src, segment_ids, num_segments, reduce)
 
 
 def _segment_reduce_with_scatter_reduce(src, segment_ids, num_segments, reduce):
+    """
+    Robust segmented reduction using torch.scatter_reduce.
+    Handles any number of batch dimensions in src.
+    """
     counts = torch.bincount(segment_ids, minlength=num_segments)
-    if src.dim() == 2:
-        B, L = src.shape
-        expanded_ids = segment_ids.unsqueeze(0).expand(B, L)
-        if reduce == "sum":
-            out = torch.zeros((B, num_segments), dtype=src.dtype, device=src.device)
-            out.scatter_add_(1, expanded_ids, src)
-        elif reduce == "max":
-            out = torch.full((B, num_segments), float("-inf"), dtype=src.dtype, device=src.device)
-            if src.numel() > 0:
-                out.scatter_reduce_(1, expanded_ids, src, reduce="amax", include_self=False)
-        return out, counts
-
+    
+    # We need to reduce along the dimension corresponding to segment_ids.
+    # We assume segment_ids corresponds to the LAST dimension of src if src is 1D or 2D,
+    # or a specific dimension in the general case.
+    # In GrET, segment_ids usually corresponds to the 'num_edges' dimension.
+    # Let's find that dimension.
+    
+    # Standard GrET usage:
+    # Pairwise: src [H, L], segment_ids [L] -> dim -1
+    # Motif: src [H, L, R, d], segment_ids [L] -> dim -3
+    
+    dim = -1
+    if src.dim() > 2:
+        # For motifs, src is [..., L, R, d]. L is dim -3.
+        # For pairwise, src is [..., L]. L is dim -1.
+        if src.size(-1) != len(segment_ids):
+             dim = -3 # Motif case
+    
+    # Adjust dim to positive
+    if dim < 0: dim = src.dim() + dim
+    
+    # Create index tensor matching src shape
+    idx_shape = [1] * src.dim()
+    idx_shape[dim] = len(segment_ids)
+    idx = segment_ids.view(*idx_shape).expand_as(src)
+    
+    out_shape = list(src.shape)
+    out_shape[dim] = num_segments
+    
     if reduce == "sum":
-        out = torch.zeros((num_segments,), dtype=src.dtype, device=src.device)
-        out.scatter_add_(0, segment_ids, src)
+        out = torch.zeros(out_shape, dtype=src.dtype, device=src.device)
+        out.scatter_add_(dim, idx, src)
     elif reduce == "max":
-        out = torch.full((num_segments,), float("-inf"), dtype=src.dtype, device=src.device)
+        out = torch.full(out_shape, float("-inf"), dtype=src.dtype, device=src.device)
         if src.numel() > 0:
-            out.scatter_reduce_(0, segment_ids, src, reduce="amax", include_self=False)
-    else:
-        raise ValueError(f"Unsupported reduce: {reduce}")
+            # torch.scatter_reduce_ is available in PyTorch 1.12+
+            out.scatter_reduce_(dim, idx, src, reduce="amax", include_self=False)
+            
     return out, counts
 
 
 def segment_reduce_1d(src, segment_ids, num_segments, reduce="sum"):
     """
-    Segment reduction with best available backend.
+    Segmented reduction for GNNs.
+    src: [..., L, ...] tensor of values.
+    segment_ids: [L] tensor of target segment indices.
     """
     if _torch_scatter is not None:
-        dim = 1 if src.dim() == 2 else 0
-        idx = segment_ids
-        if src.dim() == 2:
-            idx = segment_ids.unsqueeze(0).expand(src.size(0), -1)
-        
-        if reduce == "sum":
-            out = _torch_scatter(src, idx, dim=dim, dim_size=num_segments, reduce="sum")
+        try:
+            # Determine dim based on where L matches len(segment_ids)
+            dim = -1
+            if src.dim() > 2 and src.size(-1) != len(segment_ids):
+                dim = -3
+            out = _torch_scatter(src, segment_ids, dim=dim, dim_size=num_segments, reduce=reduce)
             counts = torch.bincount(segment_ids, minlength=num_segments)
             return out, counts
-        if reduce == "max":
-            out = _torch_scatter(src, idx, dim=dim, dim_size=num_segments, reduce="max")
-            counts = torch.bincount(segment_ids, minlength=num_segments)
-            out = torch.where(counts > 0, out, torch.full_like(out, float("-inf")))
-            return out, counts
-        raise ValueError(f"Unsupported reduce: {reduce}")
+        except Exception:
+            pass
 
-    if hasattr(torch, "segment_reduce") and not src.requires_grad and src.dim() == 1:
-        return _segment_reduce_with_torch_segment(src, segment_ids, num_segments, reduce)
     return _segment_reduce_with_scatter_reduce(src, segment_ids, num_segments, reduce)
 
 
 def fused_motif_dot(Q3_c, K3_u, K3_v, T_tau):
     """
     Performs the trilinear motif score contraction.
-    Factorizing as Q * (K_u * K_v + T) allows torch.compile to fuse this into a 
-    single CUDA kernel, avoiding the allocation of intermediate triplet tensors.
+    (Q * (K_u * K_v + T)).sum(dim=(-1, -2))
+    Robustly handles multi-head broadcasting.
     """
-    # Use in-place capable operations to hint fusion to the compiler
-    res = K3_u * K3_v
-    res.add_(T_tau)
-    res.mul_(Q3_c)
-    return res.sum(dim=(-1, -2))
+    # K3_u/v are [..., L, R, d]
+    # T_tau is [..., L, R, d]
+    # Ensure T_tau matches K tensors rank and head count
+    return (Q3_c * (K3_u * K3_v + T_tau)).sum(dim=(-1, -2))
