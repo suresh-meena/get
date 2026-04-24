@@ -196,15 +196,10 @@ def compute_motif_energy(G, c_3, u_3, v_3, t_tau, params, projections, num_nodes
         
     scale = (R * d) ** 0.5
     if G.dim() == 3:
-        Q3_c = torch.index_select(Q3, 1, c_3)
-        K3_u = torch.index_select(K3, 1, u_3)
-        K3_v = torch.index_select(K3, 1, v_3)
-        ell_3 = fused_motif_dot(Q3_c, K3_u, K3_v, T_tau) / scale
+        # Use direct indexing to allow torch.compile to perform gather-fusion
+        ell_3 = fused_motif_dot(Q3[:, c_3], K3[:, u_3], K3[:, v_3], T_tau) / scale
     else:
-        Q3_c = torch.index_select(Q3, 0, c_3)
-        K3_u = torch.index_select(K3, 0, u_3)
-        K3_v = torch.index_select(K3, 0, v_3)
-        ell_3 = fused_motif_dot(Q3_c, K3_u, K3_v, T_tau) / scale
+        ell_3 = fused_motif_dot(Q3[c_3], K3[u_3], K3[v_3], T_tau) / scale
 
     beta_3 = inverse_temperature(params, 'beta_3', beta_max=beta_max)
     lse_3, exp_x, denom = segment_logsumexp(beta_3 * ell_3, c_3, num_nodes, return_intermediates=True)

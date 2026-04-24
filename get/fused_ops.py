@@ -82,8 +82,11 @@ def segment_reduce_1d(src, segment_ids, num_segments, reduce="sum"):
 def fused_motif_dot(Q3_c, K3_u, K3_v, T_tau):
     """
     Performs the trilinear motif score contraction.
-    Using direct element-wise multiplication and sum avoids einsum parsing 
-    overhead and allows PyTorch's inductor/JIT to perfectly fuse the operations
-    without allocating large intermediate tensors when compiled, fully supporting double backward.
+    Factorizing as Q * (K_u * K_v + T) allows torch.compile to fuse this into a 
+    single CUDA kernel, avoiding the allocation of intermediate triplet tensors.
     """
-    return (Q3_c * (K3_u * K3_v + T_tau)).sum(dim=(-1, -2))
+    # Use in-place capable operations to hint fusion to the compiler
+    res = K3_u * K3_v
+    res.add_(T_tau)
+    res.mul_(Q3_c)
+    return res.sum(dim=(-1, -2))
