@@ -201,8 +201,7 @@ def compute_memory_energy(G, batch, num_graphs, params, projections, return_grad
     return E, (grad_Qm, None)
 
 
-def compute_energy_GET(X, G, c_2, u_2, c_3, u_3, v_3, t_tau, batch, params, projections=None):
-    num_graphs = int(batch.max().item() + 1)
+def compute_energy_GET(X, G, c_2, u_2, c_3, u_3, v_3, t_tau, batch, num_graphs, params, projections=None):
     num_nodes = X.size(-2)
     E_quad = compute_quadratic_energy(X, batch, num_graphs)
     E_att2 = compute_pairwise_energy(G, c_2, u_2, batch, num_graphs, params, projections, num_nodes)
@@ -219,8 +218,7 @@ def compute_energy_GET(X, G, c_2, u_2, c_3, u_3, v_3, t_tau, batch, params, proj
     return E_quad - E_att2 - E_att3 - E_mem
 
 
-def compute_energy_and_grad_GET(X, G, c_2, u_2, c_3, u_3, v_3, t_tau, batch, params, projections=None):
-    num_graphs = int(batch.max().item() + 1)
+def compute_energy_and_grad_GET(X, G, c_2, u_2, c_3, u_3, v_3, t_tau, batch, num_graphs, params, projections=None):
     num_nodes = X.size(-2)
     E_quad = compute_quadratic_energy(X, batch, num_graphs)
     E_att2, (gQ2, gK2) = compute_pairwise_energy(G, c_2, u_2, batch, num_graphs, params, projections, num_nodes, return_grad=True)

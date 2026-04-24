@@ -168,7 +168,8 @@ class GETLayer(nn.Module):
         projections = self._build_projections(G, static_projections, batch_data=batch_data)
         params = self.get_params_dict()
         params['num_heads'] = self.num_heads
-        return compute_energy_GET(X, G, batch_data.c_2, batch_data.u_2, batch_data.c_3, batch_data.u_3, batch_data.v_3, batch_data.t_tau, batch_data.batch, params, projections)
+        num_graphs = len(batch_data.ptr) - 1
+        return compute_energy_GET(X, G, batch_data.c_2, batch_data.u_2, batch_data.c_3, batch_data.u_3, batch_data.v_3, batch_data.t_tau, batch_data.batch, num_graphs, params, projections)
 
     def energy_and_grad(self, X, batch_data, static_projections=None, create_graph=False):
         if not hasattr(self.layernorm, "backward"):
@@ -181,7 +182,8 @@ class GETLayer(nn.Module):
         projections = self._build_projections(G, static_projections, batch_data=batch_data)
         params = self.get_params_dict()
         params['num_heads'] = self.num_heads
-        E, grad_X_quad, head_grads = compute_energy_and_grad_GET(X, G, batch_data.c_2, batch_data.u_2, batch_data.c_3, batch_data.u_3, batch_data.v_3, batch_data.t_tau, batch_data.batch, params, projections)
+        num_graphs = len(batch_data.ptr) - 1
+        E, grad_X_quad, head_grads = compute_energy_and_grad_GET(X, G, batch_data.c_2, batch_data.u_2, batch_data.c_3, batch_data.u_3, batch_data.v_3, batch_data.t_tau, batch_data.batch, num_graphs, params, projections)
 
         grad_G_att = torch.zeros_like(G)
         W_Q2 = getattr(self, 'W_Q2', None)
@@ -297,7 +299,7 @@ class GETModel(nn.Module):
             if cls_positions is not None:
                 return self.cls_readout(Z[cls_positions])
             batch = batch_data.batch
-            num_graphs = int(batch.max().item() + 1)
+            num_graphs = len(batch_data.ptr) - 1
             counts = torch.bincount(batch, minlength=num_graphs).view(-1, 1).to(dtype=Z.dtype).clamp_min(1.0)
             
             z_sum = torch.zeros(num_graphs, self.d, dtype=Z.dtype, device=Z.device)
@@ -339,7 +341,7 @@ class GETModel(nn.Module):
     def _augment_with_cls_token(self, X, batch_data):
         if not self.use_cls_token:
             return X, batch_data, None
-        num_nodes, num_graphs = X.size(0), int(batch_data.batch.max().item() + 1)
+        num_nodes, num_graphs = X.size(0), len(batch_data.ptr) - 1
         cls_tokens = self.cls_token.expand(num_graphs, -1)
         X = torch.cat([X, cls_tokens], dim=0)
         cls_positions = torch.arange(num_nodes, num_nodes + num_graphs, device=X.device)
@@ -399,7 +401,7 @@ class GETModel(nn.Module):
         return X_current, energy_trace, {}
 
     def _run_armijo_solver(self, X, batch_data, static_projections_list, armijo_c=0.1, armijo_gamma=0.5, armijo_eta0=0.2, armijo_max_backtracks=25, chunk_size=4):
-        num_graphs = int(batch_data.batch.max().item() + 1)
+        num_graphs = len(batch_data.ptr) - 1
         energy_trace = []
         stats = {'backtracks': [], 'steps': 0, 'step_sizes': [], 'accepted': []}
         eta0 = armijo_eta0
