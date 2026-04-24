@@ -246,7 +246,8 @@ def _numba_augment_laplacian_cls(num_nodes, indptr, indices):
         # Original edges scaled
         for idx in range(indptr[i], indptr[i+1]):
             j = indices[idx]
-            if i == j: continue
+            if i == j:
+                continue
             l_indices[curr] = j
             l_data[curr] = - inv_sqrt_deg[i] * inv_sqrt_deg[j]
             curr += 1

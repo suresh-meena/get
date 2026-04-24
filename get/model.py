@@ -364,14 +364,14 @@ class GETModel(nn.Module):
                         break
         return X_current, energy_trace, {}
 
-    def _run_armijo_solver(self, X, batch_data, static_projections, armijo_c=0.1, armijo_gamma=0.5, armijo_eta0=0.2, armijo_max_backtracks=25):
+    def _run_armijo_solver(self, X, batch_data, static_projections, armijo_c=0.1, armijo_gamma=0.5, armijo_eta0=0.2, armijo_max_backtracks=25, chunk_size=4):
         num_graphs = int(batch_data.batch.max().item() + 1)
         energy_trace = []
         stats = {'backtracks': [], 'steps': 0, 'step_sizes': [], 'accepted': []}
         eta0 = armijo_eta0
 
         # Hoist loop invariants
-        etas = eta0 * (armijo_gamma ** torch.arange(armijo_max_backtracks, device=X.device, dtype=X.dtype))
+        etas_all = eta0 * (armijo_gamma ** torch.arange(armijo_max_backtracks, device=X.device, dtype=X.dtype))
 
         X_current = X.detach()
         for step_idx in range(self.num_steps):
@@ -384,22 +384,42 @@ class GETModel(nn.Module):
             gn_sq = (grad_X**2).sum(dim=-1)
             gn_sq_graph = _scatter_add_nd(gn_sq.new_zeros(num_graphs), batch_data.batch, gn_sq, dim=0)
 
-            X_tries = X_current.unsqueeze(0) - etas.view(-1, 1, 1) * grad_X.unsqueeze(0)
-            E_tries = self.get_layer.compute_energy(X_tries, batch_data, static_projections=static_projections)
-            E_target = E_t.unsqueeze(0) - armijo_c * etas.view(-1, 1) * gn_sq_graph.unsqueeze(0)
+            # Chunked evaluation to save VRAM and skip redundant work
+            best_idx = torch.full((num_graphs,), armijo_max_backtracks - 1, device=X.device, dtype=torch.long)
+            found_global = torch.zeros(num_graphs, device=X.device, dtype=torch.bool)
+            
+            for start_bt in range(0, armijo_max_backtracks, chunk_size):
+                end_bt = min(start_bt + chunk_size, armijo_max_backtracks)
+                etas = etas_all[start_bt:end_bt]
+                
+                # Evaluate current chunk
+                X_tries = X_current.unsqueeze(0) - etas.view(-1, 1, 1) * grad_X.unsqueeze(0)
+                E_tries = self.get_layer.compute_energy(X_tries, batch_data, static_projections=static_projections)
+                E_target = E_t.unsqueeze(0) - armijo_c * etas.view(-1, 1) * gn_sq_graph.unsqueeze(0)
+                
+                valid = (E_tries <= E_target)
+                found_chunk = valid.any(dim=0)
+                
+                # Update best indices for graphs that just found a valid step
+                update_mask = found_chunk & (~found_global)
+                if update_mask.any():
+                    chunk_best = valid.to(torch.long).argmax(dim=0)
+                    best_idx[update_mask] = start_bt + chunk_best[update_mask]
+                    found_global[update_mask] = True
+                
+                # Early exit if all graphs in batch found a valid step size
+                if found_global.all():
+                    break
 
-            valid = (E_tries <= E_target)
-            found = valid.any(dim=0)
-            best_idx = valid.to(torch.long).argmax(dim=0)
-            best_idx = torch.where(found, best_idx, E_tries.argmin(dim=0))
-
-            node_best_idx = best_idx[batch_data.batch]
-            X_current = X_tries[node_best_idx, torch.arange(X_current.size(0))]
+            # Final assignment
+            # Use etas_all to get the final accepted states
+            accepted_etas = etas_all[best_idx]
+            X_current = X_current - accepted_etas[batch_data.batch].view(-1, 1) * grad_X
 
             energy_trace.append(E_t.detach())
             stats['backtracks'].append(best_idx.float().mean().item())
-            stats['step_sizes'].append(etas[best_idx].mean().item())
-            stats['accepted'].append(found.float().mean().item())
+            stats['step_sizes'].append(accepted_etas.mean().item())
+            stats['accepted'].append(found_global.float().mean().item())
             stats['steps'] = step_idx + 1
         return X_current, energy_trace, stats
 

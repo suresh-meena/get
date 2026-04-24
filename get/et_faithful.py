@@ -297,6 +297,7 @@ class ETFaithfulGraphModel(nn.Module):
         armijo_gamma=0.5,
         armijo_eta0=None,
         armijo_max_backtracks=25,
+        chunk_size=4,
     ):
         if self.training:
             raise ValueError("Armijo inference_mode is evaluation-only; call model.eval() first.")
@@ -308,13 +309,15 @@ class ETFaithfulGraphModel(nn.Module):
         solver_stats = self._init_solver_stats('armijo')
         x = x_aug
 
-        # Pre-compute dense modulation (treated as static during descent as in _solve_dynamics)
+        # Pre-compute dense modulation
         dense_cache = self._prepare_dense_cache(x, cls_indices, node_indices, batch_data)
         if dense_cache is None:
             dense_modulation = None
             dense_sizes = None
         else:
             dense_modulation, dense_sizes = dense_cache
+
+        etas_all = eta0 * (armijo_gamma ** torch.arange(armijo_max_backtracks, device=x.device, dtype=x.dtype))
 
         for block_idx in range(self.num_blocks):
             norm = self.norm_blocks[block_idx]
@@ -344,48 +347,47 @@ class ETFaithfulGraphModel(nn.Module):
                     solver_stats['accepted'].append(True)
                     continue
 
-                # Vectorized Armijo check
-                etas = eta0 * (armijo_gamma ** torch.arange(armijo_max_backtracks, device=x.device, dtype=x.dtype))
-                # x_tries shape: [num_backtracks, N_aug, D]
-                x_tries = x.detach().unsqueeze(0) - etas.view(-1, 1, 1) * grad_x.detach().unsqueeze(0)
+                # Chunked vectorized Armijo check
+                accepted_eta = 0.0
+                accepted_backtracks = armijo_max_backtracks
+                accepted_energy = float(e_t.detach().item())
+                accepted_state = x.detach()
+                found = False
                 
-                # Evaluate energies in one batched call
-                g_tries = norm(x_tries)
-                e_tries = core.energy(
-                    g_tries,
-                    c_aug,
-                    u_aug,
-                    None,
-                    self.mask_mode,
-                    dense_modulation=dense_modulation,
-                    dense_sizes=dense_sizes,
-                )
+                for start_bt in range(0, armijo_max_backtracks, chunk_size):
+                    end_bt = min(start_bt + chunk_size, armijo_max_backtracks)
+                    etas = etas_all[start_bt:end_bt]
+                    
+                    x_tries = x.detach().unsqueeze(0) - etas.view(-1, 1, 1) * grad_x.detach().unsqueeze(0)
+                    g_tries = norm(x_tries)
+                    e_tries = core.energy(
+                        g_tries,
+                        c_aug,
+                        u_aug,
+                        None,
+                        self.mask_mode,
+                        dense_modulation=dense_modulation,
+                        dense_sizes=dense_sizes,
+                    )
+                    
+                    rhs = e_t - armijo_c * etas * grad_norm_sq
+                    success = (e_tries <= rhs)
+                    
+                    success_indices = torch.nonzero(success).view(-1)
+                    if success_indices.numel() > 0:
+                        idx = int(success_indices[0].item())
+                        accepted_eta = float(etas[idx].item())
+                        accepted_backtracks = start_bt + idx
+                        accepted_energy = float(e_tries[idx].item())
+                        accepted_state = x_tries[idx]
+                        found = True
+                        break
                 
-                rhs = e_t - armijo_c * etas * grad_norm_sq
-                success = (e_tries <= rhs)
-                
-                # Find the first backtrack index that satisfied the condition
-                success_indices = torch.nonzero(success).view(-1)
-                if success_indices.numel() > 0:
-                    idx = int(success_indices[0].item())
-                    accepted = True
-                    accepted_eta = float(etas[idx].item())
-                    accepted_backtracks = idx
-                    accepted_energy = float(e_tries[idx].item())
-                    accepted_state = x_tries[idx]
-                else:
-                    # Fallback to current state
-                    accepted = False
-                    accepted_eta = 0.0
-                    accepted_backtracks = armijo_max_backtracks
-                    accepted_energy = float(e_t.detach().item())
-                    accepted_state = x.detach()
-
                 x = accepted_state
                 energy_trace.append(accepted_energy)
                 solver_stats['step_sizes'].append(accepted_eta)
                 solver_stats['backtracks'].append(accepted_backtracks)
-                solver_stats['accepted'].append(accepted)
+                solver_stats['accepted'].append(found)
         
         return x, energy_trace, solver_stats
 
