@@ -507,16 +507,26 @@ class GETModel(nn.Module):
                 return self.cls_readout(Z[cls_positions])
             batch = batch_data.batch
             num_graphs = int(batch.max().item() + 1)
-            batch_idx = batch.view(-1, 1).expand_as(Z)
+            
+            # Optimization: Use index_add_/index_reduce_ to avoid expanding batch indices to (N, D)
+            # This saves O(N*D) memory per call.
             counts = torch.bincount(batch, minlength=num_graphs).view(-1, 1).to(dtype=Z.dtype)
+            
             z_sum = torch.zeros(num_graphs, self.d, dtype=Z.dtype, device=Z.device)
-            z_sum.scatter_add_(0, batch_idx, Z)
+            z_sum.index_add_(0, batch, Z)
             z_mean = z_sum / counts.clamp_min(1.0)
+            
             z_max = torch.full((num_graphs, self.d), float('-inf'), dtype=Z.dtype, device=Z.device)
-            z_max.scatter_reduce_(0, batch_idx, Z, reduce="amax", include_self=False)
+            if hasattr(torch, "index_reduce_"):
+                z_max.index_reduce_(0, batch, Z, reduce="amax", include_self=False)
+            else:
+                # Fallback for older PyTorch versions
+                batch_idx = batch.view(-1, 1).expand_as(Z)
+                z_max.scatter_reduce_(0, batch_idx, Z, reduce="amax", include_self=False)
             z_max = torch.where(counts > 0, z_max, torch.zeros_like(z_max))
+            
             z_sq_sum = torch.zeros(num_graphs, self.d, dtype=Z.dtype, device=Z.device)
-            z_sq_sum.scatter_add_(0, batch_idx, Z**2)
+            z_sq_sum.index_add_(0, batch, Z**2)
             z_std = torch.sqrt(torch.relu((z_sq_sum / counts.clamp_min(1.0)) - z_mean**2) + 1e-6)
             return self.readout(torch.cat([z_mean, z_sum, z_max, z_std], dim=-1))
         raise ValueError(f"Unsupported task_level: {task_level}")
