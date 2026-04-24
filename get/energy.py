@@ -9,8 +9,8 @@ except (ImportError, OSError):
     pyg_scatter_lse = None
 
 
-def segment_logsumexp(x, segment_ids, num_segments, return_intermediates=False):
-    if pyg_scatter_lse is not None and not return_intermediates:
+def segment_logsumexp(x, segment_ids, num_segments):
+    if pyg_scatter_lse is not None:
         try:
             lse = pyg_scatter_lse(x, segment_ids, dim=-1, dim_size=num_segments)
             return torch.where(torch.isinf(lse) & (lse < 0), torch.zeros_like(lse), lse)
@@ -25,14 +25,12 @@ def segment_logsumexp(x, segment_ids, num_segments, return_intermediates=False):
     is_empty = is_empty_bool.to(dtype=x.dtype)
     denom = sum_exp + is_empty
     lse = torch.log(denom) + max_val
-    if return_intermediates:
-        return lse, exp_x, denom
     return lse
 
 
 def segment_softmax(x, segment_ids, num_segments):
-    lse, exp_x, denom = segment_logsumexp(x, segment_ids, num_segments, return_intermediates=True)
-    return exp_x / denom[..., segment_ids]
+    lse = segment_logsumexp(x, segment_ids, num_segments)
+    return torch.exp(x - lse[..., segment_ids])
 
 
 def _scatter_add_nd(grad_buffer, indices, src, dim):
@@ -110,14 +108,14 @@ def compute_pairwise_energy(G, c_2, u_2, batch, num_graphs, params, projections,
         ell_2 = ell_2 + a_2
 
     beta_2 = inverse_temperature(params, 'beta_2', beta_max=beta_max)
-    lse_2, exp_x, denom = segment_logsumexp(beta_2 * ell_2, c_2, num_nodes, return_intermediates=True)
+    lse_2 = segment_logsumexp(beta_2 * ell_2, c_2, num_nodes)
     # Energy per graph: [..., num_graphs]
     graph_lse = _scatter_add_nd(ell_2.new_zeros((*ell_2.shape[:-1], num_graphs)), batch, lse_2, dim=-1)
     E = (lambda_2 / beta_2) * graph_lse
     if not return_grad:
         return E
 
-    probs = exp_x / denom[..., c_2]
+    probs = torch.exp(beta_2 * ell_2 - lse_2[..., c_2])
     coeff = lambda_2 * probs / scale
     grad_Q2 = _pairwise_pullback_fused(coeff, Q2, K2, c_2, u_2, num_nodes)
     grad_K2 = _pairwise_pullback_fused(coeff, K2, Q2, u_2, c_2, num_nodes)
@@ -156,14 +154,14 @@ def compute_motif_energy(G, c_3, u_3, v_3, t_tau, batch, num_graphs, params, pro
     scale = (R * d) ** 0.5
     ell_3 = fused_motif_dot(Q3[..., c_3, :, :], K3[..., u_3, :, :], K3[..., v_3, :, :], T_tau_selected) / scale
     beta_3 = inverse_temperature(params, 'beta_3', beta_max=beta_max)
-    lse_3, exp_x, denom = segment_logsumexp(beta_3 * ell_3, c_3, num_nodes, return_intermediates=True)
+    lse_3 = segment_logsumexp(beta_3 * ell_3, c_3, num_nodes)
     # Energy per graph
     graph_lse = _scatter_add_nd(ell_3.new_zeros((*ell_3.shape[:-1], num_graphs)), batch, lse_3, dim=-1)
     E = (lambda_3 / beta_3) * graph_lse
     if not return_grad:
         return E
 
-    probs = exp_x / denom[..., c_3]
+    probs = torch.exp(beta_3 * ell_3 - lse_3[..., c_3])
     coeff = (lambda_3 * probs / scale).unsqueeze(-1).unsqueeze(-1)
     src_Q = coeff * (K3[..., u_3, :, :] * K3[..., v_3, :, :] + T_tau_selected)
     src_Ku = coeff * (Q3[..., c_3, :, :] * K3[..., v_3, :, :])

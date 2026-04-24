@@ -217,7 +217,7 @@ class ETAttentionCore(nn.Module):
             vals = betas[:, None] * logits
             vals_reshaped = vals.view(num_trials, num_heads, -1).transpose(1, 2)
             vals_mixed = torch.matmul(vals_reshaped, self.Hw).transpose(1, 2).reshape(-1, logits.size(1))
-            lse, exp_x, denom = segment_logsumexp(vals_mixed, c_aug, num_tokens, return_intermediates=True)
+            lse = segment_logsumexp(vals_mixed, c_aug, num_tokens)
             e = -(lse.view(num_trials, num_heads, num_tokens).sum(dim=-1) / self.betas.unsqueeze(0)).sum(dim=-1)
             if not return_grad:
                 return e
@@ -226,12 +226,12 @@ class ETAttentionCore(nn.Module):
             logits = (q_sel * k_sel).sum(dim=-1).transpose(0, 1)
             vals = self.betas[:, None] * logits
             vals_mixed = torch.matmul(vals.transpose(0, 1), self.Hw).transpose(0, 1)
-            lse, exp_x, denom = segment_logsumexp(vals_mixed, c_aug, num_tokens, return_intermediates=True)
+            lse = segment_logsumexp(vals_mixed, c_aug, num_tokens)
             e = (-(lse.sum(dim=-1) / self.betas).sum())
             if not return_grad:
                 return e
             
-        probs = exp_x / denom[:, c_aug]
+        probs = torch.exp(vals_mixed - lse[:, c_aug])
         if is_batched:
             grad_vals_mixed = - (probs / betas[:, None])
             grad_vals = torch.matmul(grad_vals_mixed.view(num_trials, num_heads, -1).transpose(1, 2), self.Hw.t()).transpose(1, 2).reshape(-1, logits.size(1))
@@ -382,6 +382,48 @@ class ETGraphMaskModulator(nn.Module):
         if ef.size(-1) > in_features:
             return ef[..., :in_features]
         return torch.cat([ef, torch.zeros(*ef.shape[:-1], in_features - ef.size(-1), dtype=ef.dtype, device=ef.device)], dim=-1)
+
+    def forward(self, x, batch_data=None):
+        if batch_data is None:
+            # Assume x is dense [B, N, D] or [N, D]
+            return self.dense_modulation(x, None) if x.dim() == 2 else self.dense_modulation_batched(x, None)
+            
+        num_nodes = x.size(0)
+        c2 = batch_data.c_2
+        u2 = batch_data.u_2
+        edge_attr = getattr(batch_data, "aligned_edge_attr", getattr(batch_data, "edge_attr", None))
+        
+        ptr = batch_data.ptr
+        num_graphs = ptr.numel() - 1
+        max_n = torch.diff(ptr).max().item()
+        
+        x_dense = x.new_zeros((num_graphs, max_n, self.d))
+        node_batch = batch_data.batch
+        node_local = torch.arange(num_nodes, device=x.device) - ptr[node_batch]
+        x_dense[node_batch, node_local] = x
+        
+        if edge_attr is not None:
+            feat_dim = edge_attr.size(-1)
+            e_dense = x.new_zeros((num_graphs, max_n, max_n, feat_dim))
+            edge_batch = node_batch[c2]
+            src_local = c2 - ptr[edge_batch]
+            dst_local = u2 - ptr[edge_batch]
+            e_dense[edge_batch, src_local, dst_local] = edge_attr.to(dtype=x.dtype)
+        else:
+            e_dense = x.new_zeros((num_graphs, max_n, max_n, 1))
+            edge_batch = node_batch[c2]
+            src_local = c2 - ptr[edge_batch]
+            dst_local = u2 - ptr[edge_batch]
+            e_dense[edge_batch, src_local, dst_local] = 1.0
+            
+        dense_mod = self.dense_modulation_batched(x_dense, e_dense)
+        
+        edge_batch = node_batch[c2]
+        src_local = c2 - ptr[edge_batch]
+        dst_local = u2 - ptr[edge_batch]
+        sparse_mod = dense_mod[edge_batch, :, src_local, dst_local]
+        
+        return sparse_mod.transpose(0, 1)
 
     def dense_modulation(self, x_local, edge_features):
         inner = (x_local @ x_local.transpose(0, 1)).unsqueeze(0).unsqueeze(0)

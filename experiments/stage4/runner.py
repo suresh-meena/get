@@ -10,15 +10,15 @@ import statistics
 from types import SimpleNamespace
 import sys
 
-import torch
-from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
-
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from experiments.common import (
+import torch  # noqa: E402
+from torch.utils.data import DataLoader  # noqa: E402
+from tqdm.auto import tqdm  # noqa: E402
+
+from experiments.common import (  # noqa: E402
     build_dataloader_kwargs,
     load_tu_dataset,
     set_seed,
@@ -26,7 +26,7 @@ from experiments.common import (
     build_ego_graph_dataset,
     get_num_params,
 )
-from get import ETFaithful, FullGET, PairwiseGET, collate_get_batch, CachedGraphDataset
+from get import ETFaithful, FullGET, PairwiseGET, collate_get_batch, CachedGraphDataset  # noqa: E402
 
 try:
     from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
@@ -431,14 +431,15 @@ def _train_graph_classification(
 
         model.eval()
         y_true, y_pred = [], []
+        
+        import inspect
+        forward_kwargs = {'task_level': "graph"}
+        if 'inference_mode' in inspect.signature(model.forward).parameters:
+            forward_kwargs['inference_mode'] = 'armijo'
+            
         with torch.no_grad():
             for batch in test_loader:
                 batch = batch.to(device)
-                # Use Armijo at test time as per paper recommendation
-                forward_kwargs = {'task_level': "graph"}
-                import inspect
-                if 'inference_mode' in inspect.signature(model.forward).parameters:
-                    forward_kwargs['inference_mode'] = 'armijo'
                 
                 logits, _ = model(batch, **forward_kwargs)
                 preds = logits.argmax(dim=-1)
@@ -500,7 +501,7 @@ def _train_graph_binary_with_val(
     model_name = model_name or model.__class__.__name__
     opt = _build_optimizer(model, lr=lr, wd=weight_decay)
     if use_weighted_bce and len(train_ds) > 0:
-        y = torch.tensor([float(g["y"].view(-1)[0].item()) for g in train_ds], dtype=torch.float32)
+        y = torch.tensor([g["y"].view(-1)[0] for g in train_ds], dtype=torch.float32)
         pos = float((y > 0.5).sum().item())
         neg = float((y <= 0.5).sum().item())
         if pos > 0 and neg > 0:
@@ -583,24 +584,24 @@ def _train_graph_binary_with_val(
             model.eval()
             run_on_cpu = False
             cpu_model = None
+            
+            import inspect
+            base_forward_kwargs = {'task_level': "graph"}
+            if 'inference_mode' in inspect.signature(model.forward).parameters:
+                base_forward_kwargs['inference_mode'] = 'armijo'
+                
             with torch.no_grad():
                 for b in loader:
-                    # Use Armijo at test time as per paper recommendation
-                    forward_kwargs = {'task_level': "graph"}
-                    import inspect
-                    if 'inference_mode' in inspect.signature(model.forward).parameters:
-                        forward_kwargs['inference_mode'] = 'armijo'
-
                     if run_on_cpu:
                         b_cpu = b.to("cpu")
-                        logits, _ = cpu_model(b_cpu, **forward_kwargs)
+                        logits, _ = cpu_model(b_cpu, **base_forward_kwargs)
                         prob = torch.sigmoid(logits.view(-1))
                         ys.extend(b_cpu.y.view(-1).float().cpu().tolist())
                         ps.extend(prob.cpu().tolist())
                         continue
                     try:
                         b_dev = b.to(device)
-                        logits, _ = model(b_dev, **forward_kwargs)
+                        logits, _ = model(b_dev, **base_forward_kwargs)
                         prob = torch.sigmoid(logits.view(-1))
                         ys.extend(b_dev.y.view(-1).float().cpu().tolist())
                         ps.extend(prob.cpu().tolist())
@@ -614,7 +615,7 @@ def _train_graph_binary_with_val(
                             print("Warning: CUDA OOM in eval; switching remaining eval batches to CPU.")
                         run_on_cpu = True
                         b_cpu = b.to("cpu")
-                        logits, _ = cpu_model(b_cpu, **forward_kwargs)
+                        logits, _ = cpu_model(b_cpu, **base_forward_kwargs)
                         prob = torch.sigmoid(logits.view(-1))
                         ys.extend(b_cpu.y.view(-1).float().cpu().tolist())
                         ps.extend(prob.cpu().tolist())
@@ -1103,3 +1104,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+SystemExit(main())

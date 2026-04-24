@@ -8,38 +8,75 @@ from tqdm.auto import tqdm
 
 @njit
 def _numba_edges_to_csr(num_nodes, edges_arr):
-    """Directly build CSR from edge array in Numba."""
-    indptr = np.zeros(num_nodes + 1, dtype=np.int64)
-    for i in range(edges_arr.shape[0]):
-        u, v = edges_arr[i, 0], edges_arr[i, 1]
-        if u == v or u >= num_nodes or v >= num_nodes:
-            continue
-        indptr[u + 1] += 1
-        indptr[v + 1] += 1
+    """Directly build CSR from edge array in Numba.
+    Ensures simple undirected graph: symmetric, no self-loops, no duplicates, sorted.
+    """
+    # 1. Collect all valid directed edges
+    num_input = edges_arr.shape[0]
+    # At most 2 * num_input directed edges
+    u_arr = np.empty(2 * num_input, dtype=np.int64)
+    v_arr = np.empty(2 * num_input, dtype=np.int64)
     
+    count = 0
+    for i in range(num_input):
+        u = edges_arr[i, 0]
+        v = edges_arr[i, 1]
+        if u != v and u < num_nodes and v < num_nodes:
+            u_arr[count] = u
+            v_arr[count] = v
+            count += 1
+            u_arr[count] = v
+            v_arr[count] = u
+            count += 1
+            
+    # 2. Sort by (u, v) to remove duplicates
+    # Since Numba doesn't have an easy lexsort, we can sort a packed array if num_nodes is small enough,
+    # but to be safe, we'll build a CSR with duplicates and then deduplicate inplace.
+    
+    indptr = np.zeros(num_nodes + 1, dtype=np.int64)
+    for i in range(count):
+        indptr[u_arr[i] + 1] += 1
+        
     for i in range(num_nodes):
         indptr[i + 1] += indptr[i]
         
-    indices = np.empty(indptr[num_nodes], dtype=np.int64)
+    indices_raw = np.empty(count, dtype=np.int64)
     curr_idx = indptr[:-1].copy()
-    for i in range(edges_arr.shape[0]):
-        u, v = edges_arr[i, 0], edges_arr[i, 1]
-        if u == v or u >= num_nodes or v >= num_nodes:
-            continue
-        indices[curr_idx[u]] = v
+    for i in range(count):
+        u = u_arr[i]
+        indices_raw[curr_idx[u]] = v_arr[i]
         curr_idx[u] += 1
-        indices[curr_idx[v]] = u
-        curr_idx[v] += 1
         
+    # Deduplicate and sort
+    new_indptr = np.zeros(num_nodes + 1, dtype=np.int64)
+    # worst case size is count
+    indices = np.empty(count, dtype=np.int64)
+    
+    valid_count = 0
     for i in range(num_nodes):
-        indices[indptr[i]:indptr[i+1]].sort()
-        
-    return indptr, indices
+        start = indptr[i]
+        end = indptr[i+1]
+        new_indptr[i] = valid_count
+        if end > start:
+            nbrs = indices_raw[start:end]
+            nbrs.sort()
+            # keep unique
+            indices[valid_count] = nbrs[0]
+            valid_count += 1
+            for j in range(1, len(nbrs)):
+                if nbrs[j] != nbrs[j-1]:
+                    indices[valid_count] = nbrs[j]
+                    valid_count += 1
+    new_indptr[num_nodes] = valid_count
+    
+    return new_indptr, indices[:valid_count]
 
 
 @njit
 def _numba_motif_extraction(indptr, indices, max_motifs):
     """Numba-accelerated motif extraction with budget logic."""
+    if max_motifs == 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int32)
     num_nodes = len(indptr) - 1
     
     # Pass 1: Count total motifs to allocate arrays

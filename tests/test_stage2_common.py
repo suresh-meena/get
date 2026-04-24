@@ -53,7 +53,9 @@ def test_build_dataloader_kwargs_device_aware_defaults():
     assert "persistent_workers" not in cpu_kwargs
     assert "prefetch_factor" not in cpu_kwargs
 
-    assert cuda_kwargs["num_workers"] == 2
+    import os
+    expected_workers = min(os.cpu_count() or 4, 8)
+    assert cuda_kwargs["num_workers"] == expected_workers
     assert cuda_kwargs["pin_memory"] is True
     assert cuda_kwargs["persistent_workers"] is True
-    assert cuda_kwargs["prefetch_factor"] == 2
+    assert cuda_kwargs["prefetch_factor"] == 4

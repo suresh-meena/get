@@ -3,13 +3,13 @@
   "dataset": "synth",
   "summary": {
     "0.4": {
-      "fullget_mean": 1.0,
+      "fullget_mean": 0.5,
       "fullget_std": 0.0,
-      "fullget_f1_mean": 1.0,
+      "fullget_f1_mean": 0.35714285714285715,
       "fullget_f1_std": 0.0,
-      "et_faithful_mean": 0.611111111111111,
+      "et_faithful_mean": 0.3888888888888889,
       "et_faithful_std": 0.0,
-      "et_faithful_f1_mean": 0.5,
+      "et_faithful_f1_mean": 0.4,
       "et_faithful_f1_std": 0.0
     }
   },
@@ -17,34 +17,14 @@
     "0.4": [
       {
         "seed": 123,
-        "fullget_auc": 1.0,
-        "fullget_f1": 1.0,
-        "et_faithful_auc": 0.611111111111111,
-        "et_faithful_f1": 0.5,
+        "fullget_auc": 0.5,
+        "fullget_f1": 0.35714285714285715,
+        "et_faithful_auc": 0.3888888888888889,
+        "et_faithful_f1": 0.4,
         "histories": {
           "fullget": {
             "train_loss": [
-              1.8841605186462402
-            ],
-            "val_auc": [
-              1.0
-            ],
-            "val_f1": [
-              0.4444444444444444
-            ],
-            "test_auc": [
-              1.0
-            ],
-            "test_f1": [
-              1.0
-            ],
-            "bad_batches": [
-              0.0
-            ]
-          },
-          "et_faithful": {
-            "train_loss": [
-              1.1162107288837433
+              6.486693501472473
             ],
             "val_auc": [
               0.75
@@ -53,13 +33,33 @@
               0.4444444444444444
             ],
             "test_auc": [
-              0.611111111111111
+              0.5
             ],
             "test_f1": [
-              0.5
+              0.35714285714285715
             ],
             "bad_batches": [
               0.0
+            ]
+          },
+          "et_faithful": {
+            "train_loss": [
+              0.0
+            ],
+            "val_auc": [
+              0.625
+            ],
+            "val_f1": [
+              0.4444444444444444
+            ],
+            "test_auc": [
+              0.3888888888888889
+            ],
+            "test_f1": [
+              0.4
+            ],
+            "bad_batches": [
+              2.0
             ]
           }
         }

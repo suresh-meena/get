@@ -232,10 +232,12 @@ class GETLayer(nn.Module):
 
 
 class GETModel(nn.Module):
-    def __init__(self, in_dim, d=256, num_classes=1, num_steps=8, tol=1e-4, compile=False, eta=0.05, eta_max=0.25, dropout=0.1, num_heads=1, head_dim=None, encoder_hidden_mult=2, readout_hidden_mult=2, pe_k=0, rwse_k=0, num_motif_types=2, use_cls_token=False, cls_self_loop=True, **layer_kwargs):
+    def __init__(self, in_dim, d=256, num_classes=1, num_steps=8, num_blocks=1, share_block_weights=False, tol=1e-4, compile=False, eta=0.05, eta_max=0.25, dropout=0.1, num_heads=1, head_dim=None, encoder_hidden_mult=2, readout_hidden_mult=2, pe_k=0, rwse_k=0, num_motif_types=2, use_cls_token=False, cls_self_loop=True, **layer_kwargs):
         super().__init__()
         self.d = d
         self.num_steps = num_steps
+        self.num_blocks = int(max(1, num_blocks))
+        self.share_block_weights = bool(share_block_weights)
         self.tol = float(tol)
         self.eta_max = eta_max
         self.pe_k = pe_k
@@ -249,7 +251,11 @@ class GETModel(nn.Module):
             self.rwse_proj = nn.Linear(rwse_k, d)
 
         self.node_encoder = StableMLP(in_dim, d, hidden_dim=max(d, encoder_hidden_mult * d), dropout=dropout, final_norm=True)
-        self.get_layer = GETLayer(d, num_motif_types=num_motif_types, num_heads=num_heads, head_dim=head_dim, **layer_kwargs)
+        if self.share_block_weights:
+            shared_layer = GETLayer(d, num_motif_types=num_motif_types, num_heads=num_heads, head_dim=head_dim, **layer_kwargs)
+            self.get_layers = nn.ModuleList([shared_layer for _ in range(self.num_blocks)])
+        else:
+            self.get_layers = nn.ModuleList([GETLayer(d, num_motif_types=num_motif_types, num_heads=num_heads, head_dim=head_dim, **layer_kwargs) for _ in range(self.num_blocks)])
 
         eta = min(max(float(eta), 1e-4), eta_max - 1e-4)
         self.eta_logit = nn.Parameter(torch.logit(torch.tensor(eta / eta_max)))
@@ -272,7 +278,8 @@ class GETModel(nn.Module):
 
         if compile and hasattr(torch, "compile"):
             try:
-                self.get_layer.energy_and_grad = torch.compile(self.get_layer.energy_and_grad, dynamic=True)
+                for layer in self.get_layers:
+                    layer.energy_and_grad = torch.compile(layer.energy_and_grad, dynamic=True)
                 self._run_fixed_solver = torch.compile(self._run_fixed_solver, dynamic=True)
                 print("INFO:    Successfully compiled GrET inference solvers.")
             except Exception:
@@ -313,18 +320,21 @@ class GETModel(nn.Module):
         raise ValueError(f"Unsupported task_level: {task_level}")
 
     def _build_static_projections(self, batch_data):
-        static_projections = {}
-        if hasattr(batch_data, 'edge_attr') and batch_data.edge_attr is not None:
-            static_projections['a_2'] = self.get_layer.edge_mlp(batch_data.edge_attr)
-        if self.get_layer.use_memory and self.get_layer.K > 0:
-            static_projections['Km'] = torch.einsum("kd, hzd -> ...hkz", self.get_layer.B_mem, self.get_layer.W_Km)
-        if self.get_layer.use_motif and self.get_layer.T_tau is not None and batch_data.t_tau.numel() > 0:
-            t_tau = batch_data.t_tau
-            T_params = self.get_layer.T_tau
-            if t_tau.max() >= T_params.size(0):
-                t_tau = torch.clamp(t_tau, max=T_params.size(0) - 1)
-            static_projections['T_tau_selected'] = T_params[t_tau].transpose(0, 1)
-        return static_projections
+        static_projections_list = []
+        for layer in self.get_layers:
+            static_projections = {}
+            if hasattr(batch_data, 'edge_attr') and batch_data.edge_attr is not None:
+                static_projections['a_2'] = layer.edge_mlp(batch_data.edge_attr)
+            if layer.use_memory and layer.K > 0:
+                static_projections['Km'] = torch.einsum("kd, hzd -> ...hkz", layer.B_mem, layer.W_Km)
+            if layer.use_motif and layer.T_tau is not None and batch_data.t_tau.numel() > 0:
+                t_tau = batch_data.t_tau
+                T_params = layer.T_tau
+                if t_tau.max() >= T_params.size(0):
+                    t_tau = torch.clamp(t_tau, max=T_params.size(0) - 1)
+                static_projections['T_tau_selected'] = T_params[t_tau].transpose(0, 1)
+            static_projections_list.append(static_projections)
+        return static_projections_list
 
     def _augment_with_cls_token(self, X, batch_data):
         if not self.use_cls_token:
@@ -354,39 +364,41 @@ class GETModel(nn.Module):
             X.add_(self.rwse_proj(batch_data.rwse))
 
         X, solver_batch, cls_positions = self._augment_with_cls_token(X, batch_data)
-        static_projections = self._build_static_projections(solver_batch)
+        static_projections_list = self._build_static_projections(solver_batch)
         if inference_mode == 'fixed':
-            X, energy_trace, stats = self._run_fixed_solver(X, solver_batch, static_projections)
+            X, energy_trace, stats = self._run_fixed_solver(X, solver_batch, static_projections_list, training_mode=self.training)
         elif inference_mode == 'armijo':
-            X, energy_trace, stats = self._run_armijo_solver(X, solver_batch, static_projections, **kwargs)
+            X, energy_trace, stats = self._run_armijo_solver(X, solver_batch, static_projections_list, **kwargs)
         else:
             raise ValueError(f"Unknown mode: {inference_mode}")
         out = self._readout(X, solver_batch, task_level, cls_positions)
         return (out, energy_trace, stats) if return_solver_stats else (out, energy_trace)
 
-    def _run_fixed_solver(self, X, solver_batch, static_projections, training_mode=True):
+    def _run_fixed_solver(self, X, solver_batch, static_projections_list, training_mode=True):
         energy_trace = []
         eta = self.eta
         X_current = X
         check_freq = 4
         
-        for step_idx in range(self.num_steps):
-            X_prev = X_current.detach().clone() if (self.tol > 0 and step_idx % check_freq == 0) else None
-            
-            # Use the layer's forward which now returns next state and energy
-            X_next, E = self.get_layer(X_current, solver_batch, eta, static_projections, is_training=training_mode)
-            energy_trace.append(E.detach())
-            X_current = X_next
-            
-            if self.tol > 0 and X_prev is not None:
-                # Tolerance check every 4 steps to reduce sync stalls
-                with torch.no_grad():
-                    diff = torch.norm(X_current - X_prev) / (torch.norm(X_prev) + 1e-6)
-                    if diff < self.tol:
-                        break
+        for block_idx, layer in enumerate(self.get_layers):
+            static_projections = static_projections_list[block_idx]
+            for step_idx in range(self.num_steps):
+                X_prev = X_current.detach().clone() if (self.tol > 0 and step_idx % check_freq == 0) else None
+                
+                # Use the layer's forward which now returns next state and energy
+                X_next, E = layer(X_current, solver_batch, eta, static_projections, is_training=training_mode)
+                energy_trace.append(E.detach())
+                X_current = X_next
+                
+                if self.tol > 0 and X_prev is not None:
+                    # Tolerance check every 4 steps to reduce sync stalls
+                    with torch.no_grad():
+                        diff = torch.norm(X_current - X_prev) / (torch.norm(X_prev) + 1e-6)
+                        if diff < self.tol:
+                            break
         return X_current, energy_trace, {}
 
-    def _run_armijo_solver(self, X, batch_data, static_projections, armijo_c=0.1, armijo_gamma=0.5, armijo_eta0=0.2, armijo_max_backtracks=25, chunk_size=4):
+    def _run_armijo_solver(self, X, batch_data, static_projections_list, armijo_c=0.1, armijo_gamma=0.5, armijo_eta0=0.2, armijo_max_backtracks=25, chunk_size=4):
         num_graphs = int(batch_data.batch.max().item() + 1)
         energy_trace = []
         stats = {'backtracks': [], 'steps': 0, 'step_sizes': [], 'accepted': []}
@@ -396,54 +408,56 @@ class GETModel(nn.Module):
         etas_all = eta0 * (armijo_gamma ** torch.arange(armijo_max_backtracks, device=X.device, dtype=X.dtype))
 
         X_current = X.detach()
-        for step_idx in range(self.num_steps):
-            E_t, grad_X = self.get_layer.energy_and_grad(X_current, batch_data, static_projections=static_projections, create_graph=False)
-            if self.tol > 0:
-                gnorm = torch.norm(grad_X) / (torch.norm(X_current) + 1e-6)
-                if gnorm < self.tol:
-                    break
+        for block_idx, layer in enumerate(self.get_layers):
+            static_projections = static_projections_list[block_idx]
+            for step_idx in range(self.num_steps):
+                E_t, grad_X = layer.energy_and_grad(X_current, batch_data, static_projections=static_projections, create_graph=False)
+                if self.tol > 0:
+                    gnorm = torch.norm(grad_X) / (torch.norm(X_current) + 1e-6)
+                    if gnorm < self.tol:
+                        break
 
-            gn_sq = (grad_X**2).sum(dim=-1)
-            gn_sq_graph = _scatter_add_nd(gn_sq.new_zeros(num_graphs), batch_data.batch, gn_sq, dim=0)
+                gn_sq = (grad_X**2).sum(dim=-1)
+                gn_sq_graph = _scatter_add_nd(gn_sq.new_zeros(num_graphs), batch_data.batch, gn_sq, dim=0)
 
-            # Chunked evaluation to save VRAM and skip redundant work
-            best_idx = torch.full((num_graphs,), armijo_max_backtracks - 1, device=X.device, dtype=torch.long)
-            found_global = torch.zeros(num_graphs, device=X.device, dtype=torch.bool)
-            
-            for start_bt in range(0, armijo_max_backtracks, chunk_size):
-                end_bt = min(start_bt + chunk_size, armijo_max_backtracks)
-                etas = etas_all[start_bt:end_bt]
+                # Chunked evaluation to save VRAM and skip redundant work
+                best_idx = torch.full((num_graphs,), armijo_max_backtracks - 1, device=X.device, dtype=torch.long)
+                found_global = torch.zeros(num_graphs, device=X.device, dtype=torch.bool)
                 
-                # Evaluate current chunk
-                X_tries = X_current.unsqueeze(0) - etas.view(-1, 1, 1) * grad_X.unsqueeze(0)
-                E_tries = self.get_layer.compute_energy(X_tries, batch_data, static_projections=static_projections)
-                E_target = E_t.unsqueeze(0) - armijo_c * etas.view(-1, 1) * gn_sq_graph.unsqueeze(0)
-                
-                valid = (E_tries <= E_target)
-                found_chunk = valid.any(dim=0)
-                
-                # Update best indices for graphs that just found a valid step
-                update_mask = found_chunk & (~found_global)
-                if update_mask.any():
-                    chunk_best = valid.to(torch.long).argmax(dim=0)
-                    best_idx[update_mask] = start_bt + chunk_best[update_mask]
-                    found_global[update_mask] = True
-                
-                # Early exit if all graphs in batch found a valid step size
-                if found_global.all():
-                    break
+                for start_bt in range(0, armijo_max_backtracks, chunk_size):
+                    end_bt = min(start_bt + chunk_size, armijo_max_backtracks)
+                    etas = etas_all[start_bt:end_bt]
+                    
+                    # Evaluate current chunk
+                    X_tries = X_current.unsqueeze(0) - etas.view(-1, 1, 1) * grad_X.unsqueeze(0)
+                    E_tries = layer.compute_energy(X_tries, batch_data, static_projections=static_projections)
+                    E_target = E_t.unsqueeze(0) - armijo_c * etas.view(-1, 1) * gn_sq_graph.unsqueeze(0)
+                    
+                    valid = (E_tries <= E_target)
+                    found_chunk = valid.any(dim=0)
+                    
+                    # Update best indices for graphs that just found a valid step
+                    update_mask = found_chunk & (~found_global)
+                    if update_mask.any():
+                        chunk_best = valid.to(torch.long).argmax(dim=0)
+                        best_idx[update_mask] = start_bt + chunk_best[update_mask]
+                        found_global[update_mask] = True
+                    
+                    # Early exit if all graphs in batch found a valid step size
+                    if found_global.all():
+                        break
 
-            # Final assignment
-            # Use etas_all to get the final accepted states
-            accepted_etas = etas_all[best_idx]
-            # In-place update to reduce memory pressure
-            X_current.sub_(accepted_etas[batch_data.batch].view(-1, 1) * grad_X)
+                # Final assignment
+                # Use etas_all to get the final accepted states
+                accepted_etas = etas_all[best_idx]
+                # In-place update to reduce memory pressure
+                X_current.sub_(accepted_etas[batch_data.batch].view(-1, 1) * grad_X)
 
-            energy_trace.append(E_t.detach())
-            stats['backtracks'].append(best_idx.float().mean().item())
-            stats['step_sizes'].append(accepted_etas.mean().item())
-            stats['accepted'].append(found_global.float().mean().item())
-            stats['steps'] = step_idx + 1
+                energy_trace.append(E_t.detach())
+                stats['backtracks'].append(best_idx.float().mean().item())
+                stats['step_sizes'].append(accepted_etas.mean().item())
+                stats['accepted'].append(found_global.float().mean().item())
+                stats['steps'] += 1
         return X_current, energy_trace, stats
 
 

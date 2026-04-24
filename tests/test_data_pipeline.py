@@ -1,3 +1,5 @@
+import numpy as np
+from get.data import _numba_edges_to_csr
 import torch
 
 from get.data import align_pairwise_edge_attr, collate_get_batch, get_incidence_matrices
@@ -8,9 +10,13 @@ def test_incidence_deterministic_under_edge_order_shuffle():
     edges_a = [(0, 1), (0, 2), (1, 2), (2, 3)]
     edges_b = [(2, 3), (1, 2), (0, 2), (0, 1)]
 
-    out_a = get_incidence_matrices(num_nodes, edges_a, max_motifs_per_node=2)
-    out_b = get_incidence_matrices(num_nodes, edges_b, max_motifs_per_node=2)
+    edges_arr_a = np.ascontiguousarray(np.array(edges_a, dtype=np.int64).reshape(-1, 2))
+    indptr_a, indices_a = _numba_edges_to_csr(num_nodes, edges_arr_a)
+    out_a = get_incidence_matrices(num_nodes, indptr_a, indices_a, max_motifs_per_node=2)
 
+    edges_arr_b = np.ascontiguousarray(np.array(edges_b, dtype=np.int64).reshape(-1, 2))
+    indptr_b, indices_b = _numba_edges_to_csr(num_nodes, edges_arr_b)
+    out_b = get_incidence_matrices(num_nodes, indptr_b, indices_b, max_motifs_per_node=2)
     for ta, tb in zip(out_a, out_b):
         assert torch.equal(ta, tb)
 
@@ -20,8 +26,10 @@ def test_motif_budget_keeps_boundary_ties():
     num_nodes = 5
     edges = [(0, 1), (0, 2), (0, 3), (0, 4), (1, 2), (3, 4)]
 
+    edges_arr = np.ascontiguousarray(np.array(edges, dtype=np.int64).reshape(-1, 2))
+    indptr, indices = _numba_edges_to_csr(num_nodes, edges_arr)
     c_2, u_2, c_3, u_3, v_3, t_tau = get_incidence_matrices(
-        num_nodes, edges, max_motifs_per_node=1
+        num_nodes, indptr, indices, max_motifs_per_node=1
     )
     assert c_2.numel() > 0 and u_2.numel() > 0
 
@@ -35,8 +43,10 @@ def test_motif_budget_keeps_boundary_ties():
 def test_zero_motif_budget_disables_motif_extraction():
     num_nodes = 6
     edges = [(0, 1), (0, 2), (0, 3), (1, 2), (2, 3)]
+    edges_arr = np.ascontiguousarray(np.array(edges, dtype=np.int64).reshape(-1, 2))
+    indptr, indices = _numba_edges_to_csr(num_nodes, edges_arr)
     _c_2, _u_2, c_3, u_3, v_3, t_tau = get_incidence_matrices(
-        num_nodes, edges, max_motifs_per_node=0
+        num_nodes, indptr, indices, max_motifs_per_node=0
     )
     assert c_3.numel() == 0
     assert u_3.numel() == 0

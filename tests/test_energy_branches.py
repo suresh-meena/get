@@ -95,21 +95,21 @@ def test_energy_decomposition_matches_total():
     model.eval()
 
     X = model.node_encoder(batch.x).detach().requires_grad_(True)
-    G = model.get_layer.layernorm(X)
+    G = model.get_layers[0].layernorm(X)
     static_projections = model._build_static_projections(batch)
-    projections = model.get_layer._build_projections(G, static_projections=static_projections)
+    projections = model.get_layers[0]._build_projections(G, static_projections=static_projections[0])
 
-    e_total = model.get_layer.compute_energy(X, batch, static_projections=static_projections)
+    e_total = model.get_layers[0].compute_energy(X, batch, static_projections=static_projections[0])
 
-    e_quad = compute_quadratic_energy(X)
+    num_graphs = 1
+    e_quad = compute_quadratic_energy(X, batch.batch, num_graphs)
     
-    # We need head-flattened params for internal energy calls
-    flat_params, flat_projs = model.get_layer._get_flat_params_and_projections(G, projections)
-    e_att2 = compute_pairwise_energy(G.unsqueeze(0), batch.c_2, batch.u_2, flat_params, flat_projs, X.size(0))
-    e_att3 = compute_motif_energy(
-        G.unsqueeze(0), batch.c_3, batch.u_3, batch.v_3, batch.t_tau, flat_params, flat_projs, X.size(0)
-    )
-    e_mem = compute_memory_energy(G.unsqueeze(0), flat_params, flat_projs)
+    params = model.get_layers[0].get_params_dict()
+    params['num_heads'] = 1
+    e_att2 = compute_pairwise_energy(G, batch.c_2, batch.u_2, batch.batch, num_graphs, params, projections, X.size(0))
+    e_att3 = compute_motif_energy(G, batch.c_3, batch.u_3, batch.v_3, batch.t_tau, batch.batch, num_graphs, params, projections, X.size(0))
+    e_mem = compute_memory_energy(G, batch.batch, num_graphs, params, projections)
+    
     e_recomposed = e_quad - e_att2 - e_att3 - e_mem
 
     assert torch.allclose(e_total, e_recomposed, atol=1e-9, rtol=1e-6)
@@ -121,25 +121,22 @@ def test_motif_and_memory_disable_to_zero():
     model.eval()
 
     X = model.node_encoder(batch.x).detach().requires_grad_(True)
-    G = model.get_layer.layernorm(X)
-    params = model.get_layer.get_params_dict()
+    G = model.get_layers[0].layernorm(X)
+    params = model.get_layers[0].get_params_dict()
     params_local = dict(params)
     params_local["use_pairwise"] = False
     params_local["use_motif"] = False
     params_local["use_memory"] = False
-    # Mock flattened params
-    params_local['d'] = 8 
+    params_local['num_heads'] = 1
     
     static_projections = model._build_static_projections(batch)
-    projections = model.get_layer._build_projections(G, static_projections=static_projections)
-    _, flat_projs = model.get_layer._get_flat_params_and_projections(G, projections)
+    projections = model.get_layers[0]._build_projections(G, static_projections=static_projections[0])
 
-    e_att2 = compute_pairwise_energy(G.unsqueeze(0), batch.c_2, batch.u_2, params_local, flat_projs, X.size(0))
-    e_att3 = compute_motif_energy(
-        G.unsqueeze(0), batch.c_3, batch.u_3, batch.v_3, batch.t_tau, params_local, flat_projs, X.size(0)
-    )
-    e_mem = compute_memory_energy(G.unsqueeze(0), params_local, flat_projs)
-    e_entropy = compute_memory_entropy(G.unsqueeze(0), params_local, flat_projs)
+    num_graphs = 1
+    e_att2 = compute_pairwise_energy(G, batch.c_2, batch.u_2, batch.batch, num_graphs, params_local, projections, X.size(0))
+    e_att3 = compute_motif_energy(G, batch.c_3, batch.u_3, batch.v_3, batch.t_tau, batch.batch, num_graphs, params_local, projections, X.size(0))
+    e_mem = compute_memory_energy(G, batch.batch, num_graphs, params_local, projections)
+    e_entropy = compute_memory_entropy(G, params_local, projections)
 
     assert torch.allclose(e_att2, torch.zeros((), dtype=torch.float64), atol=1e-12)
     assert torch.allclose(e_att3, torch.zeros((), dtype=torch.float64), atol=1e-12)
@@ -160,7 +157,7 @@ def test_motif_only_ablation_disables_pairwise_and_memory():
         lambda_2=0.0,
         lambda_m=0.0,
     )
-    params = model.get_layer.get_params_dict()
+    params = model.get_layers[0].get_params_dict()
 
     assert params["use_pairwise"] is False
     assert params["use_motif"] is True

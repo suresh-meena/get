@@ -25,19 +25,19 @@ def test_inheritance_hopfield_reduction():
 
     with torch.no_grad():
         X = model.node_encoder(batch.x)
-        G = model.get_layer.layernorm(X)
-        params = model.get_layer.get_params_dict()
+        G = model.get_layers[0].layernorm(X)
+        params = model.get_layers[0].get_params_dict()
         params['num_heads'] = 1
 
-        E_total = model.get_layer.compute_energy(X, batch)
+        E_total = model.get_layers[0].compute_energy(X, batch)
         
         # Manual term
         # E_Hop = 0.5||x||^2 - 1/beta * log(sum(exp(beta * x^T b_a)))
-        beta_m = torch.nn.functional.softplus(model.get_layer.beta_m) + 1e-8
-        lambda_m = torch.nn.functional.softplus(model.get_layer.lambda_m) + 1e-8
+        beta_m = torch.nn.functional.softplus(model.get_layers[0].beta_m) + 1e-8
+        lambda_m = torch.nn.functional.softplus(model.get_layers[0].lambda_m) + 1e-8
         
-        Qm = G @ model.get_layer.W_Qm[0].t()
-        Km = model.get_layer.B_mem @ model.get_layer.W_Km[0].t()
+        Qm = G @ model.get_layers[0].W_Qm[0].t()
+        Km = model.get_layers[0].B_mem @ model.get_layers[0].W_Km[0].t()
         scale = d ** 0.5
         scores = (Qm @ Km.t()) / scale
         E_manual = 0.5 * (X**2).sum() - (lambda_m / beta_m) * torch.logsumexp(beta_m * scores, dim=-1).sum()
@@ -68,20 +68,24 @@ def test_inheritance_et_reduction():
 
     with torch.no_grad():
         X = model.node_encoder(batch.x)
-        G = model.get_layer.layernorm(X)
-        params = model.get_layer.get_params_dict()
+        G = model.get_layers[0].layernorm(X)
+        params = model.get_layers[0].get_params_dict()
         params['num_heads'] = 1
 
-        E_total = model.get_layer.compute_energy(X, batch)
+        E_total = model.get_layers[0].compute_energy(X, batch)
         
         # Manual attention-based energy
-        Q = G @ model.get_layer.W_Q2[0].t()
-        K = G @ model.get_layer.W_K2[0].t()
+        Q = G @ model.get_layers[0].W_Q2[0].t()
+        K = G @ model.get_layers[0].W_K2[0].t()
         scale = d ** 0.5
         scores = (Q @ K.t()) / scale
-        
-        beta_2 = torch.nn.functional.softplus(model.get_layer.beta_2) + 1e-8
-        lambda_2 = torch.nn.functional.softplus(model.get_layer.lambda_2) + 1e-8
+
+        # Mask out self-loops to match GET's graph-local sparse computation
+        mask = torch.eye(num_nodes, device="cuda", dtype=torch.bool)
+        scores = scores.masked_fill(mask, float('-inf'))
+
+        beta_2 = torch.nn.functional.softplus(model.get_layers[0].beta_2) + 1e-8
+        lambda_2 = torch.nn.functional.softplus(model.get_layers[0].lambda_2) + 1e-8
         E_manual = 0.5 * (X**2).sum() - (lambda_2 / beta_2) * torch.logsumexp(beta_2 * scores, dim=-1).sum()
         
         assert torch.allclose(E_total, E_manual, atol=1e-7)
@@ -106,11 +110,11 @@ def test_multi_head_energy_averaging():
 
     with torch.no_grad():
         X = model.node_encoder(batch.x)
-        G = model.get_layer.layernorm(X)
-        E_total = model.get_layer.compute_energy(X, batch)
+        G = model.get_layers[0].layernorm(X)
+        E_total = model.get_layers[0].compute_energy(X, batch)
         
-        projections = model.get_layer._build_projections(G, batch_data=batch)
-        params = model.get_layer.get_params_dict()
+        projections = model.get_layers[0]._build_projections(G, batch_data=batch)
+        params = model.get_layers[0].get_params_dict()
         params['num_heads'] = num_heads
 
         E_total_backend = compute_energy_GET(

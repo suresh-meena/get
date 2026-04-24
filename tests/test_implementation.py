@@ -27,7 +27,7 @@ def test_finite_difference():
     # Function to check: energy computation given X
     def energy_func(X):
         # We need to manually apply layernorm here to treat X as the input variable
-        E = model.get_layer.compute_energy(X, batch)
+        E = model.get_layers[0].compute_energy(X, batch)
         return E
 
     X = batch.x.clone().requires_grad_(True)
@@ -51,7 +51,7 @@ def test_equivariance():
     model.eval()
     
     X_orig = batch_orig.x.clone().requires_grad_(True)
-    E_orig = model.get_layer.compute_energy(X_orig, batch_orig)
+    E_orig = model.get_layers[0].compute_energy(X_orig, batch_orig)
     grad_orig = torch.autograd.grad(E_orig, X_orig)[0]
     
     # Permute graph
@@ -64,7 +64,7 @@ def test_equivariance():
     batch_perm = collate_get_batch([{'x': x_perm, 'edges': edges_perm}])
     X_perm = batch_perm.x.clone().requires_grad_(True)
     
-    E_perm = model.get_layer.compute_energy(X_perm, batch_perm)
+    E_perm = model.get_layers[0].compute_energy(X_perm, batch_perm)
     grad_perm = torch.autograd.grad(E_perm, X_perm)[0]
     
     # Check energy invariance
@@ -85,7 +85,7 @@ def test_monotone_descent():
         batch = collate_get_batch([g])
         X = batch.x.clone().requires_grad_(True)
         
-        E_0 = model.get_layer.compute_energy(X, batch)
+        E_0 = model.get_layers[0].compute_energy(X, batch)
         grad_X = torch.autograd.grad(E_0, X)[0]
         
         # Backtracking line search
@@ -96,7 +96,7 @@ def test_monotone_descent():
         
         while True:
             X_1 = X - eta * grad_X
-            E_1 = model.get_layer.compute_energy(X_1, batch)
+            E_1 = model.get_layers[0].compute_energy(X_1, batch)
             
             if E_1 <= E_0 - c * eta * grad_norm_sq + 1e-8:
                 # Armijo condition satisfied
