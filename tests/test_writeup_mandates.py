@@ -1,7 +1,6 @@
 import torch
-import torch.nn as nn
 from get import GETModel, FullGET, PairwiseGET, collate_get_batch
-from get.energy import compute_energy_GET, compute_energy_and_grad_GET
+from get.energy import compute_energy_GET
 
 def test_inheritance_hopfield_reduction():
     """

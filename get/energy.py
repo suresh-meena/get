@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 from .fused_ops import segment_reduce_1d, fused_motif_dot
 
 try:
@@ -46,11 +45,11 @@ def _scatter_add_nd(grad_buffer, indices, src, dim):
             return pyg_scatter(src, indices, dim=dim, dim_size=grad_buffer.size(dim), reduce="sum")
         except Exception:
             pass
-            
+
     # Permute target dimension to the front
     perm = list(range(src.dim()))
     perm[0], perm[dim] = perm[dim], perm[0]
-    
+
     src_p = src.permute(perm)
     # index_add_ only requires 1D indices for the front dimension
     return grad_buffer.permute(perm).index_add_(0, indices, src_p).permute(perm)
@@ -92,18 +91,24 @@ def compute_pairwise_energy(G, c_2, u_2, batch, num_graphs, params, projections,
     d = params['d']
     beta_max = params.get('beta_max', None)
     if not params.get('use_pairwise', True):
-        return (G.new_zeros((*G.shape[:-2], num_graphs)), (G.new_zeros(G.shape), G.new_zeros(G.shape))) if return_grad else G.new_zeros((*G.shape[:-2], num_graphs))
+        zero_E = G.new_zeros((*G.shape[:-2], num_graphs))
+        return (zero_E, (G.new_zeros(G.shape), G.new_zeros(G.shape))) if return_grad else zero_E
+
     lambda_2 = positive_param(params, 'lambda_2')
     if (torch.is_tensor(lambda_2) and lambda_2 <= 1e-6) or (not torch.is_tensor(lambda_2) and lambda_2 <= 1e-6) or c_2.numel() == 0:
-        return (G.new_zeros((*G.shape[:-2], num_graphs)), (G.new_zeros(G.shape), G.new_zeros(G.shape))) if return_grad else G.new_zeros((*G.shape[:-2], num_graphs))
+        zero_E = G.new_zeros((*G.shape[:-2], num_graphs))
+        return (zero_E, (G.new_zeros(G.shape), G.new_zeros(G.shape))) if return_grad else zero_E
+
     Q2, K2 = projections['Q2'], projections['K2']
     scale = d ** 0.5
     ell_2 = _pairwise_dot_fused(Q2, K2, c_2, u_2, num_nodes, scale)
     if params.get("pairwise_symmetric", False):
         ell_2 = ell_2 + _pairwise_dot_fused(Q2, K2, u_2, c_2, num_nodes, scale)
+
     a_2 = projections.get('a_2')
     if a_2 is not None:
         ell_2 = ell_2 + a_2
+
     beta_2 = inverse_temperature(params, 'beta_2', beta_max=beta_max)
     lse_2, exp_x, denom = segment_logsumexp(beta_2 * ell_2, c_2, num_nodes, return_intermediates=True)
     # Energy per graph: [..., num_graphs]
@@ -111,6 +116,7 @@ def compute_pairwise_energy(G, c_2, u_2, batch, num_graphs, params, projections,
     E = (lambda_2 / beta_2) * graph_lse
     if not return_grad:
         return E
+
     probs = exp_x / denom[..., c_2]
     coeff = lambda_2 * probs / scale
     grad_Q2 = _pairwise_pullback_fused(coeff, Q2, K2, c_2, u_2, num_nodes)
@@ -118,6 +124,7 @@ def compute_pairwise_energy(G, c_2, u_2, batch, num_graphs, params, projections,
     if params.get("pairwise_symmetric", False):
         grad_Q2 = grad_Q2 + _pairwise_pullback_fused(coeff, Q2, K2, u_2, c_2, num_nodes)
         grad_K2 = grad_K2 + _pairwise_pullback_fused(coeff, K2, Q2, c_2, u_2, num_nodes)
+
     return E, (grad_Q2, grad_K2)
 
 
@@ -127,15 +134,20 @@ def compute_motif_energy(G, c_3, u_3, v_3, t_tau, batch, num_graphs, params, pro
     beta_max = params.get('beta_max', None)
     if not params.get('use_motif', True):
         dummy = G.new_zeros((*G.shape[:-1], R, d))
-        return (G.new_zeros((*G.shape[:-2], num_graphs)), (dummy, dummy)) if return_grad else G.new_zeros((*G.shape[:-2], num_graphs))
+        zero_E = G.new_zeros((*G.shape[:-2], num_graphs))
+        return (zero_E, (dummy, dummy)) if return_grad else zero_E
+
     lambda_3 = positive_param(params, 'lambda_3')
     if (torch.is_tensor(lambda_3) and lambda_3 <= 1e-6) or (not torch.is_tensor(lambda_3) and lambda_3 <= 1e-6) or c_3.numel() == 0:
         dummy = G.new_zeros((*G.shape[:-1], R, d))
-        return (G.new_zeros((*G.shape[:-2], num_graphs)), (dummy, dummy)) if return_grad else G.new_zeros((*G.shape[:-2], num_graphs))
+        zero_E = G.new_zeros((*G.shape[:-2], num_graphs))
+        return (zero_E, (dummy, dummy)) if return_grad else zero_E
+
     Q3, K3 = projections['Q3'], projections['K3']
     T_params = params['T_tau']
     if t_tau.numel() > 0 and t_tau.max() >= T_params.size(0):
         t_tau = torch.clamp(t_tau, max=T_params.size(0) - 1)
+
     T_tau_selected = T_params[t_tau].transpose(0, 1)  # [H, L, R, d_h]
     scale = (R * d) ** 0.5
     ell_3 = fused_motif_dot(Q3[..., c_3, :, :], K3[..., u_3, :, :], K3[..., v_3, :, :], T_tau_selected) / scale
@@ -146,14 +158,17 @@ def compute_motif_energy(G, c_3, u_3, v_3, t_tau, batch, num_graphs, params, pro
     E = (lambda_3 / beta_3) * graph_lse
     if not return_grad:
         return E
+
     probs = exp_x / denom[..., c_3]
     coeff = (lambda_3 * probs / scale).unsqueeze(-1).unsqueeze(-1)
     src_Q = coeff * (K3[..., u_3, :, :] * K3[..., v_3, :, :] + T_tau_selected)
     src_Ku = coeff * (Q3[..., c_3, :, :] * K3[..., v_3, :, :])
     src_Kv = coeff * (Q3[..., c_3, :, :] * K3[..., u_3, :, :])
+
     grad_Q3 = _scatter_add_nd(torch.zeros_like(Q3), c_3, src_Q, dim=-3)
     grad_K3 = _scatter_add_nd(torch.zeros_like(K3), u_3, src_Ku, dim=-3)
     grad_K3 = grad_K3 + _scatter_add_nd(torch.zeros_like(K3), v_3, src_Kv, dim=-3)
+
     return E, (grad_Q3, grad_K3)
 
 
@@ -161,10 +176,14 @@ def compute_memory_energy(G, batch, num_graphs, params, projections, return_grad
     d = params['d']
     beta_max = params.get('beta_max', None)
     if not params.get('use_memory', True):
-        return (G.new_zeros((*G.shape[:-2], num_graphs)), (G.new_zeros(G.shape), None)) if return_grad else G.new_zeros((*G.shape[:-2], num_graphs))
+        zero_E = G.new_zeros((*G.shape[:-2], num_graphs))
+        return (zero_E, (G.new_zeros(G.shape), None)) if return_grad else zero_E
+
     lambda_m = positive_param(params, 'lambda_m')
     if (torch.is_tensor(lambda_m) and lambda_m <= 1e-6) or (not torch.is_tensor(lambda_m) and lambda_m <= 1e-6) or params.get('K', 0) <= 0:
-        return (G.new_zeros((*G.shape[:-2], num_graphs)), (G.new_zeros(G.shape), None)) if return_grad else G.new_zeros((*G.shape[:-2], num_graphs))
+        zero_E = G.new_zeros((*G.shape[:-2], num_graphs))
+        return (zero_E, (G.new_zeros(G.shape), None)) if return_grad else zero_E
+
     Qm, Km = projections['Qm'], projections['Km']
     scale = d ** 0.5
     beta_m = inverse_temperature(params, 'beta_m', beta_max=beta_max)
@@ -174,43 +193,49 @@ def compute_memory_energy(G, batch, num_graphs, params, projections, return_grad
     E = (lambda_m / beta_m) * _scatter_add_nd(lse_m.new_zeros((*lse_m.shape[:-1], num_graphs)), batch, lse_m, dim=-1)
     if not return_grad:
         return E
+
     probs = torch.softmax(beta_m * Lm, dim=-1)
     grad_Qm = (lambda_m / scale) * (probs @ Km)
     return E, (grad_Qm, None)
 
 
 def compute_energy_GET(X, G, c_2, u_2, c_3, u_3, v_3, t_tau, batch, params, projections=None):
-    num_nodes = X.size(-2)
     num_graphs = int(batch.max().item() + 1)
+    num_nodes = X.size(-2)
     E_quad = compute_quadratic_energy(X, batch, num_graphs)
     E_att2 = compute_pairwise_energy(G, c_2, u_2, batch, num_graphs, params, projections, num_nodes)
     E_att3 = compute_motif_energy(G, c_3, u_3, v_3, t_tau, batch, num_graphs, params, projections, num_nodes)
     E_mem = compute_memory_energy(G, batch, num_graphs, params, projections)
+
     if E_att2.dim() > E_quad.dim():
         E_att2 = E_att2.mean(dim=-2)
     if E_att3.dim() > E_quad.dim():
         E_att3 = E_att3.mean(dim=-2)
     if E_mem.dim() > E_quad.dim():
         E_mem = E_mem.mean(dim=-2)
+
     return E_quad - E_att2 - E_att3 - E_mem
 
 
 def compute_energy_and_grad_GET(X, G, c_2, u_2, c_3, u_3, v_3, t_tau, batch, params, projections=None):
-    num_nodes = X.size(-2)
     num_graphs = int(batch.max().item() + 1)
+    num_nodes = X.size(-2)
     E_quad = compute_quadratic_energy(X, batch, num_graphs)
     E_att2, (gQ2, gK2) = compute_pairwise_energy(G, c_2, u_2, batch, num_graphs, params, projections, num_nodes, return_grad=True)
     E_att3, (gQ3, gK3) = compute_motif_energy(G, c_3, u_3, v_3, t_tau, batch, num_graphs, params, projections, num_nodes, return_grad=True)
     E_mem, (gQm, _) = compute_memory_energy(G, batch, num_graphs, params, projections, return_grad=True)
     H = params.get('num_heads', 1)
     grads = {
-        'grad_Q2': gQ2/H, 'grad_K2': gK2/H,
-        'grad_Q3': gQ3/H, 'grad_K3': gK3/H,
-        'grad_Qm': (gQm/H) if gQm is not None else None
+        'grad_Q2': gQ2 / H,
+        'grad_K2': gK2 / H,
+        'grad_Q3': gQ3 / H,
+        'grad_K3': gK3 / H,
+        'grad_Qm': (gQm / H) if gQm is not None else None
     }
     E2 = E_att2.mean(dim=-2) if E_att2.dim() > E_quad.dim() else E_att2
     E3 = E_att3.mean(dim=-2) if E_att3.dim() > E_quad.dim() else E_att3
     Em = E_mem.mean(dim=-2) if E_mem.dim() > E_quad.dim() else E_mem
+
     return E_quad - E2 - E3 - Em, X, grads
 
 
