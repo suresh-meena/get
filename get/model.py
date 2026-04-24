@@ -220,10 +220,11 @@ class GETLayer(nn.Module):
 
 
 class GETModel(nn.Module):
-    def __init__(self, in_dim, d=256, num_classes=1, num_steps=8, compile=False, eta=0.05, eta_max=0.25, dropout=0.1, num_heads=1, head_dim=None, encoder_hidden_mult=2, readout_hidden_mult=2, pe_k=0, rwse_k=0, num_motif_types=2, use_cls_token=False, cls_self_loop=True, **layer_kwargs):
+    def __init__(self, in_dim, d=256, num_classes=1, num_steps=8, tol=1e-4, compile=False, eta=0.05, eta_max=0.25, dropout=0.1, num_heads=1, head_dim=None, encoder_hidden_mult=2, readout_hidden_mult=2, pe_k=0, rwse_k=0, num_motif_types=2, use_cls_token=False, cls_self_loop=True, **layer_kwargs):
         super().__init__()
         self.d = d
         self.num_steps = num_steps
+        self.tol = float(tol)
         self.eta_max = eta_max
         self.pe_k = pe_k
         self.rwse_k = rwse_k
@@ -337,16 +338,26 @@ class GETModel(nn.Module):
         energy_trace = []
         eta = self.eta
         for _ in range(self.num_steps):
+            X_prev = X
             X, E = self.get_layer(X, solver_batch, eta, static_projections, is_training=training_mode)
             energy_trace.append(E.detach())
+            if self.tol > 0:
+                with torch.no_grad():
+                    diff = torch.norm(X - X_prev) / (torch.norm(X_prev) + 1e-6)
+                    if diff < self.tol:
+                        break
         return X, energy_trace, {}
 
     def _run_armijo_solver(self, X, batch_data, static_projections, armijo_c=0.1, armijo_gamma=0.5, armijo_eta0=0.2, armijo_max_backtracks=25):
         energy_trace = []
         stats = {'backtracks': [], 'steps': 0, 'step_sizes': [], 'accepted': []}
         eta0 = armijo_eta0
-        for _ in range(self.num_steps):
+        for step_idx in range(self.num_steps):
             E_t, grad_X = self.get_layer.energy_and_grad(X, batch_data, static_projections=static_projections, create_graph=False)
+            if self.tol > 0:
+                gnorm = torch.norm(grad_X) / (torch.norm(X) + 1e-6)
+                if gnorm < self.tol:
+                    break
             grad_norm_sq = (grad_X**2).sum(dim=-1)
             etas = eta0 * (armijo_gamma ** torch.arange(armijo_max_backtracks, device=X.device, dtype=X.dtype))
             X_tries = X.detach().unsqueeze(0) - etas.view(-1, 1, 1) * grad_X.detach().unsqueeze(0)
@@ -365,6 +376,7 @@ class GETModel(nn.Module):
             stats['backtracks'].append(best_idx.float().mean().item())
             stats['step_sizes'].append(etas[best_idx].mean().item())
             stats['accepted'].append(found.float().mean().item())
+            stats['steps'] = step_idx + 1
         return X, energy_trace, stats
 
 
