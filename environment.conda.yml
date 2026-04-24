@@ -21,6 +21,7 @@ dependencies:
   - pydantic
   - dgl
   - torch-geometric=2.6.1
+  - ruff
   - pip:
       - torchdata==0.7.1
       - pygod==1.1.0

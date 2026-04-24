@@ -2,8 +2,6 @@ import torch
 import torch.nn as nn
 
 from .et_core import ETCoreBlock, ETGraphMaskModulator, EnergyLayerNorm
-from .utils import laplacian_pe_from_adjacency
-from .model import StableMLP
 
 
 class ETFaithfulGraphModel(nn.Module):
@@ -22,7 +20,8 @@ class ETFaithfulGraphModel(nn.Module):
         num_heads=1,
         head_dim=None,
         pe_k=16,
-        eta=0.05,
+        rwse_k=0,
+        eta=0.1,
         eta_max=0.25,
         K=32,
         allow_self=False,
@@ -34,10 +33,10 @@ class ETFaithfulGraphModel(nn.Module):
         readout_hidden_mult=2,
         et_official_mode=False,
         num_blocks=1,
-        mask_mode="sparse",
+        mask_mode="official_dense",
         node_cap=None,
         dense_kernel_size=3,  # compatibility placeholder for CLI
-        share_block_weights=True,
+        share_block_weights=False,
     ):
         super().__init__()
         del dense_kernel_size
@@ -47,6 +46,7 @@ class ETFaithfulGraphModel(nn.Module):
         self.num_heads = int(num_heads)
         self.head_dim = int(head_dim or d)
         self.pe_k = int(pe_k)
+        self.rwse_k = int(rwse_k)
         self.allow_self = bool(allow_self)
         self.noise_std = float(noise_std)
         self.grad_clip_norm = grad_clip_norm
@@ -60,14 +60,12 @@ class ETFaithfulGraphModel(nn.Module):
         if self.mask_mode not in {"sparse", "official_dense"}:
             raise ValueError(f"Unsupported mask_mode: {self.mask_mode}")
 
-        self.node_encoder = StableMLP(
-            in_dim,
-            d,
-            hidden_dim=max(d, encoder_hidden_mult * d),
-            dropout=dropout,
-            final_norm=True,
-        )
-        self.pe_proj = nn.Linear(self.pe_k, d)
+        # Match the reference ET graph code: a linear projection in and a
+        # linear classifier out, with the recurrent energy descent carrying the
+        # capacity of the model.
+        self.node_encoder = nn.Linear(in_dim, d)
+        self.pe_proj = nn.Linear(self.pe_k, d) if self.pe_k > 0 else None
+        self.rwse_proj = nn.Linear(self.rwse_k, d) if self.rwse_k > 0 else None
         self.cls_token = nn.Parameter(torch.zeros(1, d))
 
         self.norm_blocks = nn.ModuleList([EnergyLayerNorm(d, use_bias=True, eps=1e-5) for _ in range(self.num_blocks)])
@@ -91,24 +89,8 @@ class ETFaithfulGraphModel(nn.Module):
         self.eta_max = float(eta_max)
         self.eta_logit = nn.Parameter(torch.logit(torch.tensor(eta / self.eta_max)))
 
-        self.readout = nn.Sequential(
-            nn.Linear(d, readout_hidden_mult * d),
-            nn.GELU(),
-            nn.LayerNorm(readout_hidden_mult * d),
-            nn.Dropout(dropout),
-            nn.Linear(readout_hidden_mult * d, d),
-            nn.GELU(),
-            nn.LayerNorm(d),
-            nn.Dropout(dropout),
-            nn.Linear(d, num_classes),
-        )
-        self.node_readout = nn.Sequential(
-            nn.Linear(d, d),
-            nn.GELU(),
-            nn.LayerNorm(d),
-            nn.Dropout(dropout),
-            nn.Linear(d, num_classes),
-        )
+        self.readout = nn.Linear(d, num_classes)
+        self.node_readout = nn.Linear(d, num_classes)
 
         nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
 
@@ -120,252 +102,320 @@ class ETFaithfulGraphModel(nn.Module):
         ptr = batch_data.ptr
         c2 = batch_data.c_2
         u2 = batch_data.u_2
-        pe_cls = getattr(batch_data, "pe_cls", None)
-        pe_cls_ptr = getattr(batch_data, "pe_cls_ptr", None)
+        num_graphs = ptr.numel() - 1
+        num_nodes = z_nodes.size(0)
+        device = z_nodes.device
 
-        token_chunks = []
-        center_ids = []
-        nbr_ids = []
-        cls_positions = []
-        node_positions = []
-        graph_chunks = []
+        # 1. Integrate CLS tokens
+        # Each graph gets one CLS token at the start of its node block
+        # New node order: [CLS_0, G0_nodes, CLS_1, G1_nodes, ...]
+        # Actually, simpler to put all CLS tokens after all nodes, or use original node indexing + offset
+        
+        # New approach: X_aug = [z_nodes, cls_tokens_batched]
+        cls_tokens = self.cls_token.expand(num_graphs, -1)
+        X_aug = torch.cat([z_nodes, cls_tokens], dim=0)
+        
+        # Mapping from original node index to augmented node index
+        # Nodes 0..N-1 stay 0..N-1. CLS tokens are N..N+num_graphs-1
+        cls_indices = torch.arange(num_nodes, num_nodes + num_graphs, device=device)
+        node_batch = batch_data.batch
+        node_cls_indices = cls_indices[node_batch]
+        
+        # 2. Vectorized augmented edges
+        # Original edges
+        c_aug_list = [c2]
+        u_aug_list = [u2]
+        
+        # CLS <-> Node edges
+        # node_indices <-> node_cls_indices
+        node_indices = torch.arange(num_nodes, device=device)
+        c_aug_list.extend([node_indices, node_cls_indices])
+        u_aug_list.extend([node_cls_indices, node_indices])
+        
+        # CLS self-loops
+        if self.allow_self:
+            c_aug_list.append(cls_indices)
+            u_aug_list.append(cls_indices)
+            # Original nodes self-loops
+            c_aug_list.append(node_indices)
+            u_aug_list.append(node_indices)
+        else:
+            # CLS needs self-loop even if others don't? (ET convention)
+            c_aug_list.append(cls_indices)
+            u_aug_list.append(cls_indices)
 
-        offset = 0
-        for g_idx in range(ptr.numel() - 1):
-            start = int(ptr[g_idx].item())
-            end = int(ptr[g_idx + 1].item())
-            n = end - start
-            if n <= 0:
-                continue
-            if self.node_cap is not None and n > self.node_cap:
-                n = self.node_cap
+        c_aug = torch.cat(c_aug_list, dim=0)
+        u_aug = torch.cat(u_aug_list, dim=0)
+        
+        # 3. Handle PE (Laplacian PE requires adjacency)
+        # Vectorized PE computation for augmented graphs is hard without a loop,
+        # but we can at least keep the rest vectorized.
+        # If PE is already provided in batch_data, we use it.
+        if hasattr(batch_data, "pe") and batch_data.pe is not None:
+            pe = batch_data.pe
+            # Pad PE for CLS tokens
+            pe_cls = pe.new_zeros((num_graphs, pe.size(-1)))
+            pe_aug = torch.cat([pe, pe_cls], dim=0)
+            if self.pe_proj is not None:
+                X_aug = X_aug + self.pe_proj(pe_aug.to(dtype=X_aug.dtype))
 
-            z_g = z_nodes[start : start + n]
-            adj = torch.zeros((n, n), dtype=torch.bool, device=z_nodes.device)
-            mask = (c2 >= start) & (c2 < end)
-            if bool(mask.any()):
-                src = c2[mask] - start
-                dst = u2[mask] - start
-                valid = (src < n) & (dst < n)
-                if bool(valid.any()):
-                    adj[src[valid], dst[valid]] = True
+        # RWSE
+        if self.rwse_proj is not None and hasattr(batch_data, "rwse") and batch_data.rwse is not None:
+            rwse = batch_data.rwse
+            rwse_cls = rwse.new_zeros((num_graphs, rwse.size(-1)))
+            rwse_aug = torch.cat([rwse, rwse_cls], dim=0)
+            X_aug = X_aug + self.rwse_proj(rwse_aug.to(dtype=X_aug.dtype))
 
-            adj_aug = torch.zeros((n + 1, n + 1), dtype=torch.bool, device=z_nodes.device)
-            adj_aug[1:, 1:] = adj
-            adj_aug[0, 1:] = True
-            adj_aug[1:, 0] = True
-            if self.allow_self:
-                adj_aug.fill_diagonal_(True)
+        # Return info needed for the solver
+        # We don't need 'graph_chunks' if we use the sparse energy function
+        return X_aug, c_aug, u_aug, cls_indices, node_indices, None
 
-            if (
-                pe_cls is not None
-                and pe_cls_ptr is not None
-                and not self.allow_self
-                and int(pe_cls_ptr[g_idx + 1].item()) > int(pe_cls_ptr[g_idx].item())
-            ):
-                pe = pe_cls[int(pe_cls_ptr[g_idx].item()) : int(pe_cls_ptr[g_idx + 1].item())]
-            else:
-                pe = laplacian_pe_from_adjacency(adj_aug, k=self.pe_k, training=self.training)
-            z_cls = self.cls_token.expand(1, -1)
-            z_aug = torch.cat([z_cls, z_g], dim=0) + self.pe_proj(pe.to(dtype=z_g.dtype))
-            token_chunks.append(z_aug)
+    def _prepare_dense_cache(self, x, cls_indices, node_indices, batch_data):
+        if self.mask_mode != "official_dense" or self.mask_modulator is None:
+            return None
+        
+        # x is [N_aug, D]. We need to reshape it into [B, max_n_aug, D]
+        ptr = batch_data.ptr
+        num_graphs = ptr.numel() - 1
+        num_original_nodes = ptr[-1].item()
+        
+        # Max nodes in augmented graph: max(n_orig) + 1 (for CLS)
+        max_n_orig = torch.diff(ptr).max().item()
+        max_n_aug = int(max_n_orig + 1)
+        
+        # Prepare dense x_batch
+        x_dense = x.new_zeros((num_graphs, max_n_aug, self.d))
+        
+        # Map original nodes
+        node_batch = batch_data.batch
+        node_local = torch.arange(num_original_nodes, device=x.device) - ptr[node_batch]
+        # Augmented nodes have CLS at local 0, and original nodes at local 1..n
+        x_dense[node_batch, node_local + 1] = x[node_indices]
+        # Map CLS tokens to local 0
+        x_dense[torch.arange(num_graphs, device=x.device), 0] = x[cls_indices]
+        
+        edge_attr = getattr(batch_data, "edge_attr", None)
+        c2 = batch_data.c_2
+        u2 = batch_data.u_2
+        
+        if edge_attr is not None:
+            feat_dim = edge_attr.size(-1)
+            e_dense = x.new_zeros((num_graphs, max_n_aug, max_n_aug, feat_dim))
+            # Original edges
+            edge_batch = node_batch[c2]
+            src_local = c2 - ptr[edge_batch] + 1
+            dst_local = u2 - ptr[edge_batch] + 1
+            e_dense[edge_batch, src_local, dst_local] = edge_attr.to(dtype=x.dtype)
+            
+            # CLS <-> Node edges in e_dense (local 0 <-> 1..n)
+            # We use zeros or a specific value for CLS edges? Default ET code uses 1.0 or specific features.
+            # Here we follow the logic that CLS is fully connected.
+            e_dense[:, 0, :, :] = 1.0
+            e_dense[:, :, 0, :] = 1.0
+        else:
+            e_dense = x.new_zeros((num_graphs, max_n_aug, max_n_aug, 1))
+            edge_batch = node_batch[c2]
+            src_local = c2 - ptr[edge_batch] + 1
+            dst_local = u2 - ptr[edge_batch] + 1
+            e_dense[edge_batch, src_local, dst_local] = 1.0
+            e_dense[:, 0, :, :] = 1.0
+            e_dense[:, :, 0, :] = 1.0
 
-            src_idx, dst_idx = torch.nonzero(adj_aug, as_tuple=True)
-            center_ids.append(src_idx + offset)
-            nbr_ids.append(dst_idx + offset)
-            cls_positions.append(offset)
-            node_positions.append(torch.arange(offset + 1, offset + n + 1, device=z_nodes.device, dtype=torch.long))
-            graph_chunks.append({"start": offset, "size": n + 1, "adj": adj_aug, "orig_start": start})
-            offset += n + 1
+        dense_modulation = self.mask_modulator.dense_modulation_batched(x_dense, e_dense)
+        sizes = torch.diff(ptr) + 1
+        return dense_modulation, sizes
 
-        x_aug = torch.cat(token_chunks, dim=0)
-        c_aug = torch.cat(center_ids, dim=0)
-        u_aug = torch.cat(nbr_ids, dim=0)
-        cls_pos = torch.tensor(cls_positions, dtype=torch.long, device=z_nodes.device)
-        node_pos = torch.cat(node_positions, dim=0)
-        return x_aug, c_aug, u_aug, cls_pos, node_pos, graph_chunks
-
-    def _solve_dynamics(self, x_aug, c_aug, u_aug, graph_chunks, batch_data):
+    def _solve_dynamics(self, x_aug, c_aug, u_aug, cls_indices, node_indices, batch_data):
         energy_trace = []
         step = self.eta
         x = x_aug
-        dense_cache = None
+        
+        # Initial dense cache if needed
+        dense_cache = self._prepare_dense_cache(x, cls_indices, node_indices, batch_data)
+        if dense_cache is None:
+            dense_modulation = None
+            dense_sizes = None
+        else:
+            dense_modulation, dense_sizes = dense_cache
 
-        if self.mask_mode == "official_dense" and self.mask_modulator is not None:
-            edge_attr = getattr(batch_data, "edge_attr", None)
-            c2 = batch_data.c_2.to(device=x.device)
-            u2 = batch_data.u_2.to(device=x.device)
-            ptr = batch_data.ptr.to(device=x.device)
-            bsz = len(graph_chunks)
-            max_n = max(int(chunk["size"]) for chunk in graph_chunks)
-            feat_dim = int(edge_attr.size(-1)) if edge_attr is not None else 1
+        # Solver loop
+        for block_idx in range(self.num_blocks):
+            norm = self.norm_blocks[block_idx]
+            core = self.core_blocks[block_idx]
+            for _ in range(self.num_steps):
+                g = norm(x)
+                # Analytical gradient call
+                e, grad_g = core.energy_and_grad(
+                    g,
+                    c_aug,
+                    u_aug,
+                    None, # graph_chunks is no longer used
+                    mask_mode=self.mask_mode,
+                    dense_modulation=dense_modulation,
+                    dense_sizes=dense_sizes,
+                )
+                
+                # Pull back through norm
+                grad_x = norm.backward(x, grad_g)
 
-            # Static plan for copying token states into padded dense tensors.
-            sizes = torch.tensor([int(chunk["size"]) for chunk in graph_chunks], dtype=torch.long, device=x.device)
+                noise = None
+                if self.training and self.noise_std > 0:
+                    noise = torch.randn_like(grad_x) * self.noise_std
+                if self.grad_clip_norm is not None:
+                    gnorm = grad_x.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+                    grad_x = grad_x * (self.grad_clip_norm / gnorm).clamp(max=1.0)
 
-            if bsz > 0 and max_n > 0:
-                batch_grid = torch.arange(bsz, dtype=torch.long, device=x.device)[:, None].expand(bsz, max_n)
-                local_grid = torch.arange(max_n, dtype=torch.long, device=x.device)[None, :].expand(bsz, max_n)
-                valid_grid = local_grid < sizes[:, None]
-                x_batch_ids = batch_grid[valid_grid]
-                x_local_ids = local_grid[valid_grid]
-                x_source_ids = torch.arange(x.size(0), dtype=torch.long, device=x.device)
-            else:
-                x_batch_ids = torch.empty((0,), dtype=torch.long, device=x.device)
-                x_local_ids = torch.empty((0,), dtype=torch.long, device=x.device)
-                x_source_ids = torch.empty((0,), dtype=torch.long, device=x.device)
+                x_next = x - step * grad_x
+                if noise is not None:
+                    x_next = x_next + torch.sqrt(step.clamp_min(1e-8)) * noise
+                if self.state_clip_norm is not None:
+                    snorm = x_next.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+                    x_next = x_next * (self.state_clip_norm / snorm).clamp(max=1.0)
 
-            if edge_attr is not None:
-                if c2.numel() > 0:
-                    graph_ids = torch.bucketize(c2, ptr[1:-1], right=True)
-                    edge_starts = ptr[graph_ids]
-                    edge_ends = ptr[graph_ids + 1]
-                    edge_mask = (u2 >= edge_starts) & (u2 < edge_ends)
-                else:
-                    graph_ids = c2.new_empty((0,), dtype=torch.long)
-                    edge_starts = c2.new_empty((0,), dtype=torch.long)
-                    edge_mask = c2.new_empty((0,), dtype=torch.bool)
-
-                if bool(edge_mask.any()):
-                    edge_global_ids = torch.nonzero(edge_mask, as_tuple=False).reshape(-1).to(dtype=torch.long, device=x.device)
-                    edge_batch_ids = graph_ids[edge_mask].to(dtype=torch.long, device=x.device)
-                    edge_src_ids = (c2[edge_mask] - edge_starts[edge_mask] + 1).to(dtype=torch.long, device=x.device)
-                    edge_dst_ids = (u2[edge_mask] - edge_starts[edge_mask] + 1).to(dtype=torch.long, device=x.device)
-                else:
-                    edge_batch_ids = torch.empty((0,), dtype=torch.long, device=x.device)
-                    edge_src_ids = torch.empty((0,), dtype=torch.long, device=x.device)
-                    edge_dst_ids = torch.empty((0,), dtype=torch.long, device=x.device)
-                    edge_global_ids = torch.empty((0,), dtype=torch.long, device=x.device)
-                edge_static_template = None
-            else:
-                edge_static_template = x.new_zeros((bsz, max_n, max_n, 1))
-                for i, chunk in enumerate(graph_chunks):
-                    size = int(chunk["size"])
-                    adj_local = chunk["adj"].to(dtype=x.dtype)
-                    edge_static_template[i, :size, :size, 0] = adj_local
-                edge_batch_ids = edge_src_ids = edge_dst_ids = edge_global_ids = None
-
-            if edge_attr is not None:
-                edge_batch_static = None
-            else:
-                edge_batch_static = edge_static_template
-
-            dense_cache = {
-                "bsz": bsz,
-                "max_n": max_n,
-                "feat_dim": feat_dim,
-                "sizes": sizes,
-                "x_batch": x.new_zeros((bsz, max_n, x.size(-1))),
-                "x_batch_ids": x_batch_ids,
-                "x_local_ids": x_local_ids,
-                "x_source_ids": x_source_ids,
-                "edge_attr": edge_attr,
-                "edge_batch": None if edge_attr is not None else edge_static_template,
-                "edge_batch_ids": edge_batch_ids,
-                "edge_src_ids": edge_src_ids,
-                "edge_dst_ids": edge_dst_ids,
-                "edge_global_ids": edge_global_ids,
-                "edge_static_template": edge_static_template,
-                "edge_batch_static": edge_batch_static,
-            }
-
-        with torch.enable_grad():
-            for block_idx in range(self.num_blocks):
-                norm = self.norm_blocks[block_idx]
-                core = self.core_blocks[block_idx]
-                for _ in range(self.num_steps):
-                    if not self.training:
-                        x = x.detach()
-                    if not x.requires_grad:
-                        x = x.requires_grad_(True)
-
-                    # Official ET update uses grad wrt g, then updates x directly.
-                    g = norm(x)
-                    dense_modulation = None
-                    dense_x_batch = None
-                    if dense_cache is not None:
-                        bsz = dense_cache["bsz"]
-                        max_n = dense_cache["max_n"]
-                        feat_dim = dense_cache["feat_dim"]
-                        sizes = dense_cache["sizes"]
-                        edge_attr = dense_cache["edge_attr"]
-                        x_batch = dense_cache["x_batch"]
-                        x_batch.zero_()
-                        x_batch_ids = dense_cache["x_batch_ids"]
-                        x_local_ids = dense_cache["x_local_ids"]
-                        x_source_ids = dense_cache["x_source_ids"]
-                        if x_batch_ids.numel() > 0:
-                            x_batch[x_batch_ids, x_local_ids] = x[x_source_ids]
-                        x_batch = x_batch.requires_grad_(True)
-
-                        if edge_attr is not None:
-                            edge_batch = x.new_zeros((bsz, max_n, max_n, feat_dim))
-                            edge_batch_ids = dense_cache["edge_batch_ids"]
-                            if edge_batch_ids.numel() > 0:
-                                edge_src_ids = dense_cache["edge_src_ids"]
-                                edge_dst_ids = dense_cache["edge_dst_ids"]
-                                edge_global_ids = dense_cache["edge_global_ids"]
-                                edge_batch[edge_batch_ids, edge_src_ids, edge_dst_ids, :] = edge_attr[edge_global_ids].to(
-                                    dtype=x.dtype, device=x.device
-                                )
-                        else:
-                            edge_batch = dense_cache["edge_batch"]
-
-                        dense_modulation = self.mask_modulator.dense_modulation_batched(x_batch, edge_batch)  # [B, H, N, N]
-                        g = norm(x_batch)
-                        dense_x_batch = x_batch
-                    e = core.energy(
-                        g,
-                        c_aug,
-                        u_aug,
-                        graph_chunks,
-                        self.mask_mode,
-                        dense_modulation=dense_modulation,
-                    )
-                    if dense_x_batch is not None:
-                        grad_x_batch = torch.autograd.grad(e, dense_x_batch, create_graph=self.training)[0]
-                        grad_g = x.new_zeros(x.shape)
-                        grad_g[x_source_ids] = grad_x_batch[x_batch_ids, x_local_ids]
-                    else:
-                        grad_g = torch.autograd.grad(e, g, create_graph=self.training)[0]
-
-                    if self.training and self.noise_std > 0:
-                        grad_g = grad_g + torch.randn_like(grad_g) * self.noise_std
-                    if self.grad_clip_norm is not None:
-                        gnorm = grad_g.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-                        grad_g = grad_g * (self.grad_clip_norm / gnorm).clamp(max=1.0)
-
-                    x_next = x - step * grad_g
-                    if self.state_clip_norm is not None:
-                        snorm = x_next.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-                        x_next = x_next * (self.state_clip_norm / snorm).clamp(max=1.0)
-
-                    energy_trace.append(float(e.detach().item()))
-                    x = x_next
+                energy_trace.append(float(e.detach().item()))
+                x = x_next
         return x, energy_trace
 
-    def forward(self, batch_data, task_level="graph", return_solver_stats=False):
+    def _init_solver_stats(self, inference_mode):
+        return {
+            'mode': inference_mode,
+            'step_sizes': [],
+            'backtracks': [],
+            'accepted': [],
+            'grad_norms': [],
+        }
+
+    def _run_armijo_solver(
+        self,
+        x_aug,
+        c_aug,
+        u_aug,
+        cls_indices,
+        node_indices,
+        batch_data,
+        armijo_c=1e-4,
+        armijo_gamma=0.5,
+        armijo_eta0=None,
+        armijo_max_backtracks=25,
+    ):
+        if self.training:
+            raise ValueError("Armijo inference_mode is evaluation-only; call model.eval() first.")
+        
+        eta0 = float(self.eta.detach().item()) if armijo_eta0 is None else float(armijo_eta0)
+        eta0 = max(eta0, 1e-8)
+
+        energy_trace = []
+        solver_stats = self._init_solver_stats('armijo')
+        x = x_aug
+
+        # Pre-compute dense modulation (treated as static during descent as in _solve_dynamics)
+        dense_cache = self._prepare_dense_cache(x, cls_indices, node_indices, batch_data)
+        if dense_cache is None:
+            dense_modulation = None
+            dense_sizes = None
+        else:
+            dense_modulation, dense_sizes = dense_cache
+
+        for block_idx in range(self.num_blocks):
+            norm = self.norm_blocks[block_idx]
+            core = self.core_blocks[block_idx]
+
+            for _ in range(self.num_steps):
+                g = norm(x)
+                e_t, grad_g = core.energy_and_grad(
+                    g,
+                    c_aug,
+                    u_aug,
+                    None,
+                    self.mask_mode,
+                    dense_modulation=dense_modulation,
+                    dense_sizes=dense_sizes,
+                )
+                grad_x = norm.backward(x, grad_g)
+
+                grad_norm_sq = (grad_x ** 2).sum()
+                grad_norm = float(torch.sqrt(grad_norm_sq).detach().item())
+                solver_stats['grad_norms'].append(grad_norm)
+
+                if grad_norm_sq.detach().item() <= 1e-16:
+                    energy_trace.append(float(e_t.detach().item()))
+                    solver_stats['step_sizes'].append(0.0)
+                    solver_stats['backtracks'].append(0)
+                    solver_stats['accepted'].append(True)
+                    continue
+
+                # Vectorized Armijo check
+                etas = eta0 * (armijo_gamma ** torch.arange(armijo_max_backtracks, device=x.device, dtype=x.dtype))
+                # x_tries shape: [num_backtracks, N_aug, D]
+                x_tries = x.detach().unsqueeze(0) - etas.view(-1, 1, 1) * grad_x.detach().unsqueeze(0)
+                
+                # Evaluate energies in one batched call
+                g_tries = norm(x_tries)
+                e_tries = core.energy(
+                    g_tries,
+                    c_aug,
+                    u_aug,
+                    None,
+                    self.mask_mode,
+                    dense_modulation=dense_modulation,
+                    dense_sizes=dense_sizes,
+                )
+                
+                rhs = e_t - armijo_c * etas * grad_norm_sq
+                success = (e_tries <= rhs)
+                
+                # Find the first backtrack index that satisfied the condition
+                success_indices = torch.nonzero(success).view(-1)
+                if success_indices.numel() > 0:
+                    idx = int(success_indices[0].item())
+                    accepted = True
+                    accepted_eta = float(etas[idx].item())
+                    accepted_backtracks = idx
+                    accepted_energy = float(e_tries[idx].item())
+                    accepted_state = x_tries[idx]
+                else:
+                    # Fallback to current state
+                    accepted = False
+                    accepted_eta = 0.0
+                    accepted_backtracks = armijo_max_backtracks
+                    accepted_energy = float(e_t.detach().item())
+                    accepted_state = x.detach()
+
+                x = accepted_state
+                energy_trace.append(accepted_energy)
+                solver_stats['step_sizes'].append(accepted_eta)
+                solver_stats['backtracks'].append(accepted_backtracks)
+                solver_stats['accepted'].append(accepted)
+        
+        return x, energy_trace, solver_stats
+
+    def forward(self, batch_data, task_level="graph", inference_mode='fixed', return_solver_stats=False):
         x = batch_data.x
         if x.dim() == 1:
             x = x.view(-1, 1).float()
+        x = x.to(dtype=self.cls_token.dtype)
 
         z_nodes = self.node_encoder(x)
         x_aug, c_aug, u_aug, cls_pos, node_pos, graph_chunks = self._build_augmented_graph(batch_data, z_nodes)
-        x_final, energy_trace = self._solve_dynamics(x_aug, c_aug, u_aug, graph_chunks, batch_data)
-        g_final = self.norm_blocks[-1](x_final)
+        
+        if inference_mode == 'fixed':
+            x_final, energy_trace = self._solve_dynamics(x_aug, c_aug, u_aug, cls_pos, node_pos, batch_data)
+            solver_stats = {'mode': 'fixed', 'energy_trace': energy_trace}
+        elif inference_mode == 'armijo':
+            x_final, energy_trace, solver_stats = self._run_armijo_solver(x_aug, c_aug, u_aug, cls_pos, node_pos, batch_data)
+        else:
+            raise ValueError(f"Unsupported inference_mode: {inference_mode}")
 
-        solver_stats = {
-            "energy_trace": energy_trace,
-            "memory_entropy": self.core_blocks[-1].hn.entropy(g_final),
-        }
+        g_final = self.norm_blocks[-1](x_final)
+        solver_stats["memory_entropy"] = self.core_blocks[-1].hn.entropy(g_final)
 
         if task_level == "graph":
-            out = self.readout(g_final[cls_pos])
+            out = self.readout(x_final[cls_pos])
             if return_solver_stats:
                 return out, energy_trace, solver_stats
             return out, energy_trace
         if task_level == "node":
-            out = self.node_readout(g_final[node_pos])
+            out = self.node_readout(x_final[node_pos])
             if return_solver_stats:
                 return out, energy_trace, solver_stats
             return out, energy_trace

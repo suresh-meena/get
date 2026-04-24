@@ -2,7 +2,7 @@ import torch
 import os
 import hashlib
 from tqdm.auto import tqdm
-from .utils import laplacian_pe_from_adjacency
+from .utils import laplacian_pe_from_adjacency, rwse_from_adjacency
 
 
 def _build_undirected_adjacency(num_nodes, edges_list):
@@ -84,6 +84,13 @@ def get_cls_augmented_laplacian_pe(num_nodes, edges_list, k=16):
     cls_edges.extend((i, cls_idx) for i in range(num_nodes))
     cls_edges.extend((cls_idx, i) for i in range(num_nodes))
     return get_laplacian_pe(num_nodes + 1, cls_edges, k=k)
+
+def get_rwse(num_nodes, edges_list, k=16):
+    adj = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
+    for u, v in edges_list:
+        adj[int(u), int(v)] = 1.0
+        adj[int(v), int(u)] = 1.0
+    return rwse_from_adjacency(adj, k=k)
 
 def get_incidence_matrices(num_nodes, edges_list, max_motifs_per_node=None):
     """
@@ -220,28 +227,29 @@ def add_structural_node_features(
 
 class CachedGraphDataset:
     """Wrapper to compute and cache motif incidence matrices to disk."""
-    def __init__(self, dataset, cache_dir=".cache/get_data", name="dataset", max_motifs=None, pe_k=0):
+    def __init__(self, dataset, cache_dir=".cache/get_data", name="dataset", max_motifs=None, pe_k=0, rwse_k=0):
         self.dataset = dataset
         self.cache_dir = cache_dir
         self.name = name
         self.max_motifs = max_motifs
         self.pe_k = pe_k
+        self.rwse_k = rwse_k
         os.makedirs(cache_dir, exist_ok=True)
         
         sample_str = str([g.get('edges', [])[:5] for g in dataset[:5]])
-        hash_val = hashlib.md5((name + str(max_motifs) + str(pe_k) + sample_str + str(len(dataset))).encode()).hexdigest()[:8]
+        hash_val = hashlib.md5((name + str(max_motifs) + str(pe_k) + str(rwse_k) + sample_str + str(len(dataset))).encode()).hexdigest()[:8]
         self.cache_path = os.path.join(cache_dir, f"{name}_{hash_val}.pt")
         
         if os.path.exists(self.cache_path):
             print(
                 f"Loading cached dataset from {self.cache_path} "
-                f"(max_motifs={self.max_motifs}, pe_k={self.pe_k})"
+                f"(max_motifs={self.max_motifs}, pe_k={self.pe_k}, rwse_k={self.rwse_k})"
             )
             self.cached_data = torch.load(self.cache_path, weights_only=False)
         else:
             print(
                 f"Processing and caching dataset to {self.cache_path} "
-                f"(max_motifs={self.max_motifs}, pe_k={self.pe_k})..."
+                f"(max_motifs={self.max_motifs}, pe_k={self.pe_k}, rwse_k={self.rwse_k})..."
             )
             self.cached_data = self._process_all()
             torch.save(self.cached_data, self.cache_path)
@@ -263,6 +271,9 @@ class CachedGraphDataset:
                 item['pe'] = get_laplacian_pe(num_nodes, g['edges'], self.pe_k)
                 item['pe_cls'] = get_cls_augmented_laplacian_pe(num_nodes, g['edges'], self.pe_k)
             
+            if self.rwse_k > 0:
+                item['rwse'] = get_rwse(num_nodes, g['edges'], self.rwse_k)
+            
             if 'edge_attr' in g:
                 item['aligned_edge_attr'] = align_pairwise_edge_attr(g['edges'], g['edge_attr'], c_2, u_2)
             
@@ -278,7 +289,7 @@ class CachedGraphDataset:
 
 class GETBatch:
     """A data class representing a batch of graphs for the GET model."""
-    def __init__(self, x, c_2, u_2, c_3, u_3, v_3, t_tau, batch, ptr, y=None, edge_attr=None, pe=None, pe_cls=None, pe_cls_ptr=None):
+    def __init__(self, x, c_2, u_2, c_3, u_3, v_3, t_tau, batch, ptr, y=None, edge_attr=None, pe=None, pe_cls=None, pe_cls_ptr=None, rwse=None):
         self.x = x
         self.c_2 = c_2
         self.u_2 = u_2
@@ -293,6 +304,7 @@ class GETBatch:
         self.pe = pe
         self.pe_cls = pe_cls
         self.pe_cls_ptr = pe_cls_ptr
+        self.rwse = rwse
         self.num_nodes = x.size(0)
 
     def to(self, device, non_blocking=False):
@@ -315,6 +327,8 @@ class GETBatch:
             self.pe_cls = self.pe_cls.to(device, non_blocking=non_blocking)
         if self.pe_cls_ptr is not None:
             self.pe_cls_ptr = self.pe_cls_ptr.to(device, non_blocking=non_blocking)
+        if self.rwse is not None:
+            self.rwse = self.rwse.to(device, non_blocking=non_blocking)
         return self
 
 def collate_get_batch(graph_list, max_motifs=None):
@@ -335,6 +349,7 @@ def collate_get_batch(graph_list, max_motifs=None):
     pe_list = []
     pe_cls_list = []
     pe_cls_ptr_list = [0]
+    rwse_list = []
     
     node_offset = 0
     
@@ -378,6 +393,9 @@ def collate_get_batch(graph_list, max_motifs=None):
         if 'pe_cls' in g:
             pe_cls_list.append(g['pe_cls'])
             pe_cls_ptr_list.append(pe_cls_ptr_list[-1] + g['pe_cls'].size(0))
+        
+        if 'rwse' in g:
+            rwse_list.append(g['rwse'])
             
         node_offset += num_nodes
         
@@ -395,5 +413,6 @@ def collate_get_batch(graph_list, max_motifs=None):
     pe = torch.cat(pe_list, dim=0) if pe_list else None
     pe_cls = torch.cat(pe_cls_list, dim=0) if pe_cls_list else None
     pe_cls_ptr = torch.tensor(pe_cls_ptr_list, dtype=torch.long) if pe_cls_list else None
+    rwse = torch.cat(rwse_list, dim=0) if rwse_list else None
     
-    return GETBatch(x, c_2, u_2, c_3, u_3, v_3, t_tau, batch, ptr, y, edge_attr, pe=pe, pe_cls=pe_cls, pe_cls_ptr=pe_cls_ptr)
+    return GETBatch(x, c_2, u_2, c_3, u_3, v_3, t_tau, batch, ptr, y, edge_attr, pe=pe, pe_cls=pe_cls, pe_cls_ptr=pe_cls_ptr, rwse=rwse)

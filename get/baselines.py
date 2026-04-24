@@ -1,5 +1,6 @@
 from .model import GETModel
 from .et_faithful import ETFaithfulGraphModel
+from .registry import register_model
 import torch
 import torch.nn as nn
 
@@ -44,61 +45,41 @@ class GINBaseline(nn.Module):
             return out, None
 
 
-def PairwiseGET(in_dim, d, num_classes, **kwargs):
+@register_model("pairwise")
+@register_model("pairwiseget")
+def PairwiseGET(in_dim, d=256, num_classes=1, **kwargs):
     """Pairwise-only baseline (lambda_3=0, lambda_m=0)"""
-    beta_2 = kwargs.pop('beta_2', 5.0)
     return GETModel(
         in_dim,
         d,
         num_classes,
         lambda_3=0.0,
         lambda_m=0.0,
-        beta_2=beta_2,
         use_motif=False,
         use_memory=False,
         **kwargs,
     )
 
 
-def MotifOnlyGET(in_dim, d, num_classes, **kwargs):
-    """Motif-only ablation (pairwise and memory branches disabled)."""
-    return GETModel(
-        in_dim,
-        d,
-        num_classes,
-        lambda_2=0.0,
-        lambda_m=0.0,
-        use_pairwise=False,
-        use_motif=True,
-        use_memory=False,
-        **kwargs,
-    )
-
-
-def FullGET(in_dim, d, num_classes, 
-            lambda_2=1.0, lambda_3=0.5, lambda_m=1.0, 
-            beta_2=1.0, beta_3=1.0, beta_m=1.0, **kwargs):
+@register_model("full")
+@register_model("fullget")
+def FullGET(in_dim, d=256, num_classes=1,
+            lambda_2=1.0, lambda_3=0.5, lambda_m=1.0,
+            beta_2=1.0, beta_3=1.0, beta_m=1.0, num_motif_types=2, **kwargs):
     """Full GET model with motif and memory branches active"""
     return GETModel(in_dim, d, num_classes, 
                     lambda_2=lambda_2, lambda_3=lambda_3, lambda_m=lambda_m, 
-                    beta_2=beta_2, beta_3=beta_3, beta_m=beta_m, **kwargs)
+                    beta_2=beta_2, beta_3=beta_3, beta_m=beta_m, num_motif_types=num_motif_types, **kwargs)
 
 
-def MemoryOnlyGET(in_dim, d, num_classes, **kwargs):
-    """Memory-only baseline (pairwise and motif branches disabled)."""
-    return GETModel(
-        in_dim,
-        d,
-        num_classes,
-        lambda_2=0.0,
-        lambda_3=0.0,
-        use_pairwise=False,
-        use_motif=False,
-        use_memory=True,
-        **kwargs,
-    )
-
-
+@register_model("etfaithful")
+@register_model("etfaithfulgraphmodel")
 def ETFaithful(in_dim, d, num_classes, **kwargs):
     """Paper-inspired ET with CLS token, Laplacian PE, masked energy attention, and HN memory."""
     return ETFaithfulGraphModel(in_dim, d, num_classes, **kwargs)
+
+
+@register_model("gin")
+@register_model("ginbaseline")
+def _build_gin(in_dim, d, num_classes, **kwargs):
+    return GINBaseline(in_dim, d, num_classes, **kwargs)

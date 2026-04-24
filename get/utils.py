@@ -1,6 +1,24 @@
 import torch
 import torch.optim as optim
 
+def rwse_from_adjacency(adj, k):
+    n = int(adj.size(0))
+    if k <= 0:
+        return adj.new_zeros((n, 0), dtype=torch.float32)
+    if n == 0:
+        return adj.new_zeros((n, k), dtype=torch.float32)
+    
+    a = adj.to(dtype=torch.float32)
+    deg = a.sum(dim=1, keepdim=True).clamp_min(1.0)
+    p = a / deg
+    
+    rwse = []
+    p_curr = p
+    for _ in range(k):
+        rwse.append(torch.diagonal(p_curr))
+        p_curr = torch.matmul(p_curr, p)
+        
+    return torch.stack(rwse, dim=-1)
 
 def laplacian_pe_from_adjacency(adj, k, training=False):
     n = int(adj.size(0))
@@ -14,9 +32,9 @@ def laplacian_pe_from_adjacency(adj, k, training=False):
     inv_sqrt_deg = torch.zeros_like(deg)
     valid = deg > 0
     inv_sqrt_deg[valid] = deg[valid].pow(-0.5)
-    l = torch.eye(n, device=adj.device, dtype=torch.float32) - (inv_sqrt_deg[:, None] * a * inv_sqrt_deg[None, :])
+    lap = torch.eye(n, device=adj.device, dtype=torch.float32) - (inv_sqrt_deg[:, None] * a * inv_sqrt_deg[None, :])
 
-    evals, evecs = torch.linalg.eigh(l)
+    evals, evecs = torch.linalg.eigh(lap)
     order = torch.argsort(evals)
     evecs = evecs[:, order]
     use = evecs[:, 1 : 1 + k]
@@ -56,31 +74,19 @@ def maybe_compile_model(model, enabled, model_name=None):
 
     name = model_name or model.__class__.__name__
     
-    if _is_get_model(model):
-        print(
-            f"Warning: skipping torch.compile for {name}; GET training requires double-backward "
-            "through the energy gradient and torch.compile/aot_autograd does not support this path reliably yet."
-        )
-        return model
-
     if not hasattr(torch, "compile"):
         print(f"Warning: torch.compile is unavailable; running {name} without compilation.")
         return model
 
     try:
-        backend = None
+        backend = "inductor"
         if torch.cuda.is_available():
-            major, _minor = torch.cuda.get_device_capability()
-            # Triton kernels require newer GPUs; use aot_eager as a safe compiled fallback.
+            major, _ = torch.cuda.get_device_capability()
             if major < 7:
                 backend = "aot_eager"
 
-        if backend is not None:
-            compiled_model = torch.compile(model, backend=backend)
-            print(f"Enabled torch.compile for {name} (backend={backend}).")
-        else:
-            compiled_model = torch.compile(model)
-            print(f"Enabled torch.compile for {name}.")
+        compiled_model = torch.compile(model, backend=backend)
+        print(f"Enabled torch.compile for {name} (backend={backend}).")
         return compiled_model
     except Exception as exc:
         print(f"Warning: torch.compile failed for {name}: {exc}")
