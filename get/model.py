@@ -63,12 +63,8 @@ class GETLayer(nn.Module):
         self.beta_3 = nn.Parameter(_inv_softplus(beta_3))
         self.beta_m = nn.Parameter(_inv_softplus(beta_m))
 
-        if self.norm_style == "et":
-            self.layernorm = EnergyLayerNorm(d, use_bias=True, eps=1e-5)
-        elif self.norm_style == "standard":
-            self.layernorm = nn.LayerNorm(d, eps=1e-5)
-        else:
-            raise ValueError(f"Unsupported norm_style: {self.norm_style}")
+        # Always use EnergyLayerNorm to maintain theoretical guarantees and analytical pullback
+        self.layernorm = EnergyLayerNorm(d, use_bias=True, eps=1e-5)
 
         self.W_Q2 = nn.Parameter(torch.empty(self.num_heads, self.head_dim, d))
         self.W_K2 = nn.Parameter(torch.empty(self.num_heads, self.head_dim, d))

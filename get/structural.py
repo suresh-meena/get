@@ -1,8 +1,51 @@
 from __future__ import annotations
 
-from collections import deque
+import numpy as np
+from numba import njit
 
 import torch
+
+
+def _adj_to_csr_structural(adj):
+    num_nodes = len(adj)
+    indptr = np.zeros(num_nodes + 1, dtype=np.int64)
+    for i, neighbors in enumerate(adj):
+        indptr[i+1] = indptr[i] + len(neighbors)
+    indices = np.empty(indptr[-1], dtype=np.int64)
+    for i, neighbors in enumerate(adj):
+        indices[indptr[i]:indptr[i+1]] = sorted(neighbors)
+    return indptr, indices
+
+
+@njit
+def _numba_msbfs(indptr, indices, max_distance, unreachable):
+    num_nodes = len(indptr) - 1
+    dist = np.full((num_nodes, num_nodes), unreachable, dtype=np.int64)
+    
+    for src in range(num_nodes):
+        dist[src, src] = 0
+        q = np.empty(num_nodes, dtype=np.int64)
+        head = 0
+        tail = 0
+        
+        q[tail] = src
+        tail += 1
+        
+        while head < tail:
+            u = q[head]
+            head += 1
+            
+            d_u = dist[src, u]
+            if max_distance > 0 and d_u >= max_distance:
+                continue
+                
+            for i in range(indptr[u], indptr[u+1]):
+                v = indices[i]
+                if dist[src, v] == unreachable:
+                    dist[src, v] = d_u + 1
+                    q[tail] = v
+                    tail += 1
+    return dist
 
 
 def build_undirected_adjacency(num_nodes: int, edges_list: list[tuple[int, int]]) -> list[set[int]]:
@@ -20,22 +63,13 @@ def build_undirected_adjacency(num_nodes: int, edges_list: list[tuple[int, int]]
 def shortest_path_distances(num_nodes: int, edges_list: list[tuple[int, int]], max_distance: int | None = None) -> torch.Tensor:
     adj = build_undirected_adjacency(num_nodes, edges_list)
     n = int(num_nodes)
+    m_dist = int(max_distance) if max_distance is not None else -1
     unreachable = n if max_distance is None else int(max_distance) + 1
-    dist = torch.full((n, n), unreachable, dtype=torch.long)
-    for src in range(n):
-        dist[src, src] = 0
-        q = deque([src])
-        while q:
-            node = q.popleft()
-            if max_distance is not None and int(dist[src, node].item()) >= int(max_distance):
-                continue
-            for nbr in adj[node]:
-                if int(dist[src, nbr].item()) > int(dist[src, node].item()) + 1:
-                    dist[src, nbr] = dist[src, node] + 1
-                    q.append(nbr)
-    if max_distance is not None:
-        dist = dist.clamp(max=int(max_distance) + 1)
-    return dist
+    
+    indptr, indices = _adj_to_csr_structural(adj)
+    dist_np = _numba_msbfs(indptr, indices, m_dist, unreachable)
+    
+    return torch.from_numpy(dist_np)
 
 
 def degree_centrality(num_nodes: int, edges_list: list[tuple[int, int]]) -> torch.Tensor:

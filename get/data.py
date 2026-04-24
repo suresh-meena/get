@@ -1,8 +1,111 @@
 import torch
 import os
 import hashlib
+import numpy as np
+from numba import njit
 from tqdm.auto import tqdm
 from .utils import laplacian_pe_from_adjacency, rwse_from_adjacency
+
+
+def _adj_to_csr(adj):
+    """Convert adjacency list of sets to CSR format."""
+    num_nodes = len(adj)
+    indptr = np.zeros(num_nodes + 1, dtype=np.int64)
+    for i, neighbors in enumerate(adj):
+        indptr[i+1] = indptr[i] + len(neighbors)
+    indices = np.empty(indptr[-1], dtype=np.int64)
+    for i, neighbors in enumerate(adj):
+        indices[indptr[i]:indptr[i+1]] = sorted(neighbors)
+    return indptr, indices
+
+
+@njit
+def _numba_motif_extraction(indptr, indices, max_motifs):
+    """Numba-accelerated motif extraction with budget logic."""
+    num_nodes = len(indptr) - 1
+    
+    # Pass 1: Count total motifs to allocate arrays
+    total_motifs = 0
+    for i in range(num_nodes):
+        start, end = indptr[i], indptr[i+1]
+        deg = end - start
+        if deg < 2:
+            continue
+        
+        nbrs = indices[start:end]
+        num_tri = 0
+        num_wed = 0
+        for p in range(deg):
+            u = nbrs[p]
+            u_start, u_end = indptr[u], indptr[u+1]
+            u_nbrs = indices[u_start:u_end]
+            for q in range(p + 1, deg):
+                v = nbrs[q]
+                # binary search for triangle check
+                idx = np.searchsorted(u_nbrs, v)
+                if idx < len(u_nbrs) and u_nbrs[idx] == v:
+                    num_tri += 1
+                else:
+                    num_wed += 1
+        
+        if max_motifs > 0:
+            if num_tri >= max_motifs:
+                total_motifs += num_tri
+            else:
+                total_motifs += num_tri + num_wed
+        else:
+            total_motifs += num_tri + num_wed
+
+    # Allocate output buffers
+    c3 = np.empty(total_motifs, dtype=np.int64)
+    u3 = np.empty(total_motifs, dtype=np.int64)
+    v3 = np.empty(total_motifs, dtype=np.int64)
+    tt = np.empty(total_motifs, dtype=np.int32)
+    
+    curr = 0
+    for i in range(num_nodes):
+        start, end = indptr[i], indptr[i+1]
+        deg = end - start
+        if deg < 2:
+            continue
+        
+        nbrs = indices[start:end]
+        num_tri = 0
+        for p in range(deg):
+            u = nbrs[p]
+            u_start, u_end = indptr[u], indptr[u+1]
+            u_nbrs = indices[u_start:u_end]
+            for q in range(p + 1, deg):
+                v = nbrs[q]
+                idx = np.searchsorted(u_nbrs, v)
+                if idx < len(u_nbrs) and u_nbrs[idx] == v:
+                    num_tri += 1
+        
+        keep_wedges = True
+        if max_motifs > 0 and num_tri >= max_motifs:
+            keep_wedges = False
+            
+        # Two passes to ensure sorting: Triangles (1) then Wedges (0)
+        for is_tri_pass in (1, 0):
+            if is_tri_pass == 0 and not keep_wedges:
+                continue
+            for p in range(deg):
+                u = nbrs[p]
+                u_start, u_end = indptr[u], indptr[u+1]
+                u_nbrs = indices[u_start:u_end]
+                for q in range(p + 1, deg):
+                    v = nbrs[q]
+                    idx = np.searchsorted(u_nbrs, v)
+                    is_tri = (idx < len(u_nbrs) and u_nbrs[idx] == v)
+                    
+                    if (is_tri and is_tri_pass == 1) or (not is_tri and is_tri_pass == 0):
+                        c3[curr] = i
+                        u3[curr] = u
+                        v3[curr] = v
+                        tt[curr] = 1 if is_tri else 0
+                        curr += 1
+                        
+    return c3, u3, v3, tt
 
 
 def _build_undirected_adjacency(num_nodes, edges_list):
@@ -15,60 +118,9 @@ def _build_undirected_adjacency(num_nodes, edges_list):
     return adj
 
 
-def _extract_pairwise_indices(adj):
-    c_2 = []
-    u_2 = []
-    for center, neighbors in enumerate(adj):
-        for nbr in sorted(neighbors):
-            c_2.append(center)
-            u_2.append(nbr)
-    return c_2, u_2
-
-
-def _apply_motif_budget_with_ties(node_motifs, max_motifs_per_node):
-    if max_motifs_per_node is None or len(node_motifs) <= max_motifs_per_node:
-        return node_motifs
-    if max_motifs_per_node <= 0:
-        return []
-    threshold_score = node_motifs[max_motifs_per_node - 1][3]
-    return [m for m in node_motifs if m[3] >= threshold_score]
-
-
-def _extract_motif_indices(adj, max_motifs_per_node=None):
-    if max_motifs_per_node is not None and max_motifs_per_node <= 0:
-        return [], [], [], []
-
-    c_3 = []
-    u_3 = []
-    v_3 = []
-    t_tau = []
-
-    for center, neighbors_set in enumerate(adj):
-        neighbors = sorted(neighbors_set)
-        if len(neighbors) < 2:
-            continue
-
-        node_motifs = []
-        for pos, left_i in enumerate(neighbors):
-            nbrs_left = adj[left_i]
-            for right_i in neighbors[pos + 1 :]:
-                motif_type = 1 if right_i in nbrs_left else 0
-                node_motifs.append((center, left_i, right_i, motif_type))
-
-        node_motifs.sort(key=lambda x: (-x[3], x[1], x[2]))
-        node_motifs = _apply_motif_budget_with_ties(node_motifs, max_motifs_per_node)
-
-        for center_i, left_i, right_i, motif_type in node_motifs:
-            c_3.append(center_i)
-            u_3.append(left_i)
-            v_3.append(right_i)
-            t_tau.append(motif_type)
-
-    return c_3, u_3, v_3, t_tau
-
-
 def _to_long_tensor(values):
     return torch.tensor(values, dtype=torch.long)
+
 
 def get_laplacian_pe(num_nodes, edges_list, k=16):
     adj = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
@@ -85,12 +137,14 @@ def get_cls_augmented_laplacian_pe(num_nodes, edges_list, k=16):
     cls_edges.extend((cls_idx, i) for i in range(num_nodes))
     return get_laplacian_pe(num_nodes + 1, cls_edges, k=k)
 
+
 def get_rwse(num_nodes, edges_list, k=16):
     adj = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
     for u, v in edges_list:
         adj[int(u), int(v)] = 1.0
         adj[int(v), int(u)] = 1.0
     return rwse_from_adjacency(adj, k=k)
+
 
 def get_incidence_matrices(num_nodes, edges_list, max_motifs_per_node=None):
     """
@@ -107,8 +161,15 @@ def get_incidence_matrices(num_nodes, edges_list, max_motifs_per_node=None):
         t_tau: Motif types (0 for open wedge, 1 for closed triangle) (1D tensor)
     """
     adj = _build_undirected_adjacency(num_nodes, edges_list)
-    c_2, u_2 = _extract_pairwise_indices(adj)
-    c_3, u_3, v_3, t_tau = _extract_motif_indices(adj, max_motifs_per_node=max_motifs_per_node)
+    indptr, indices = _adj_to_csr(adj)
+    
+    # Pairwise: vectorized repeat for center indices
+    c_2 = np.repeat(np.arange(num_nodes), np.diff(indptr))
+    u_2 = indices
+    
+    # Motifs: Numba-accelerated extraction
+    m_limit = int(max_motifs_per_node) if max_motifs_per_node is not None else -1
+    c_3, u_3, v_3, t_tau = _numba_motif_extraction(indptr, indices, m_limit)
 
     return (
         _to_long_tensor(c_2),
@@ -116,7 +177,7 @@ def get_incidence_matrices(num_nodes, edges_list, max_motifs_per_node=None):
         _to_long_tensor(c_3),
         _to_long_tensor(u_3),
         _to_long_tensor(v_3),
-        _to_long_tensor(t_tau),
+        torch.as_tensor(t_tau, dtype=torch.int32),
     )
 
 
@@ -171,6 +232,37 @@ def align_pairwise_edge_attr(edges_list, edge_attr, c_2, u_2):
     return sorted_attr[pos]
 
 
+@njit
+def _numba_count_motifs(indptr, indices):
+    """Count triangles and open wedges per node using CSR."""
+    num_nodes = len(indptr) - 1
+    counts = np.zeros((num_nodes, 2), dtype=np.float32)
+    
+    for i in range(num_nodes):
+        start, end = indptr[i], indptr[i+1]
+        deg = end - start
+        if deg < 2:
+            continue
+            
+        nbrs = indices[start:end]
+        tri_count = 0
+        wed_count = 0
+        for p in range(deg):
+            u = nbrs[p]
+            u_start, u_end = indptr[u], indptr[u+1]
+            u_nbrs = indices[u_start:u_end]
+            for q in range(p + 1, deg):
+                v = nbrs[q]
+                idx = np.searchsorted(u_nbrs, v)
+                if idx < len(u_nbrs) and u_nbrs[idx] == v:
+                    tri_count += 1
+                else:
+                    wed_count += 1
+        counts[i, 0] = wed_count
+        counts[i, 1] = tri_count
+    return counts
+
+
 def add_structural_node_features(
     graph,
     include_degree=True,
@@ -183,7 +275,7 @@ def add_structural_node_features(
 
     num_nodes = graph["x"].size(0)
     adj = _build_undirected_adjacency(num_nodes, graph["edges"])
-
+    
     features = []
     if include_degree:
         degree = torch.tensor(
@@ -194,25 +286,9 @@ def add_structural_node_features(
         features.append(degree.view(-1, 1))
 
     if include_motif_counts:
-        open_wedges = []
-        triangles = []
-        for i in range(num_nodes):
-            open_count = 0
-            tri_count = 0
-            neighbors = sorted(adj[i])
-            for pos, j in enumerate(neighbors):
-                for k in neighbors[pos + 1 :]:
-                    if k in adj[j]:
-                        tri_count += 1
-                    else:
-                        open_count += 1
-            open_wedges.append(open_count)
-            triangles.append(tri_count)
-        motif_counts = torch.tensor(
-            list(zip(open_wedges, triangles)),
-            dtype=graph["x"].dtype,
-            device=graph["x"].device,
-        )
+        indptr, indices = _adj_to_csr(adj)
+        counts = _numba_count_motifs(indptr, indices)
+        motif_counts = torch.from_numpy(counts).to(dtype=graph["x"].dtype, device=graph["x"].device)
         features.append(motif_counts)
 
     structural = torch.cat(features, dim=-1).to(device=graph["x"].device)
