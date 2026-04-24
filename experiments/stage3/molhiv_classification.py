@@ -34,7 +34,11 @@ def load_molhiv(root="data/OGB"):
                 continue
             x = d.x.float() if d.x is not None else torch.ones(d.num_nodes, 1)
             edge_attr = d.edge_attr.float() if d.edge_attr is not None else None
-            item = {"x": x, "edges": list(zip(d.edge_index[0].tolist(), d.edge_index[1].tolist())), "y": torch.tensor([float(y[0].item())], dtype=torch.float32)}
+            item = {
+                "x": x,
+                "edge_index": d.edge_index.to(dtype=torch.long).contiguous(),
+                "y": torch.tensor([float(y[0].item())], dtype=torch.float32),
+            }
             if edge_attr is not None:
                 item["edge_attr"] = edge_attr
             out.append(item)

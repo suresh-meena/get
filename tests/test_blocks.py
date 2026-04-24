@@ -67,6 +67,7 @@ def test_model_blocks_armijo():
     assert stats['steps'] == 4
     
 def test_model_blocks_gradients():
+    torch.manual_seed(0)
     model = GETModel(
         in_dim=4, d=16, num_blocks=2, share_block_weights=False,
         use_pairwise=True, use_motif=True, use_memory=True, num_steps=1
@@ -80,6 +81,34 @@ def test_model_blocks_gradients():
     for name, param in model.named_parameters():
         if param.requires_grad and param.grad is not None:
             assert not torch.isnan(param.grad).any(), f"NaN grad in {name}"
+
+
+def test_shared_block_static_projections_are_reused(monkeypatch):
+    model = GETModel(
+        in_dim=4,
+        d=16,
+        num_blocks=3,
+        share_block_weights=True,
+        use_pairwise=True,
+        use_motif=False,
+        use_memory=False,
+        num_heads=1,
+    )
+    batch = get_dummy_batch()
+    batch.edge_attr = torch.randn(batch.c_2.numel(), 3)
+
+    calls = {"edge_mlp": 0}
+    original_forward = model.get_layers[0].edge_mlp.forward
+
+    def counted_forward(*args, **kwargs):
+        calls["edge_mlp"] += 1
+        return original_forward(*args, **kwargs)
+
+    monkeypatch.setattr(model.get_layers[0].edge_mlp, "forward", counted_forward)
+
+    model._build_static_projections(batch)
+
+    assert calls["edge_mlp"] == 1
             
 if __name__ == "__main__":
     pytest.main([__file__])

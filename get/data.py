@@ -198,6 +198,159 @@ def _to_long_tensor(values):
     return torch.tensor(values, dtype=torch.long)
 
 
+def _is_integer_tensor(tensor):
+    return tensor.dtype in {
+        torch.int8,
+        torch.uint8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    }
+
+
+def _update_cache_hash(hasher, value):
+    if torch.is_tensor(value):
+        tensor = value.detach().cpu().contiguous()
+        hasher.update(f"tensor:{tuple(tensor.shape)}:{tensor.dtype}".encode())
+        hasher.update(tensor.numpy().tobytes())
+        return
+    if isinstance(value, np.ndarray):
+        array = np.ascontiguousarray(value)
+        hasher.update(f"ndarray:{array.shape}:{array.dtype}".encode())
+        hasher.update(array.tobytes())
+        return
+    if isinstance(value, dict):
+        hasher.update(f"dict:{len(value)}".encode())
+        for key in sorted(value.keys(), key=lambda item: str(item)):
+            hasher.update(f"key:{key}".encode())
+            _update_cache_hash(hasher, value[key])
+        return
+    if isinstance(value, (list, tuple)):
+        hasher.update(f"{type(value).__name__}:{len(value)}".encode())
+        for item in value:
+            _update_cache_hash(hasher, item)
+        return
+    if hasattr(value, "__dict__"):
+        _update_cache_hash(hasher, vars(value))
+        return
+    if value is None:
+        hasher.update(b"None")
+        return
+    hasher.update(repr(value).encode())
+
+
+def _graph_dataset_cache_fingerprint(dataset, name, max_motifs, pe_k, rwse_k):
+    hasher = hashlib.md5()
+    for part in (name, max_motifs, pe_k, rwse_k, len(dataset)):
+        hasher.update(repr(part).encode())
+        hasher.update(b"|")
+    for index in range(len(dataset)):
+        hasher.update(f"graph:{index}".encode())
+        _update_cache_hash(hasher, dataset[index])
+    return hasher.hexdigest()[:8]
+
+
+def validate_get_batch(batch):
+    """Raise a clear ValueError when a GET batch has shape or dtype mismatches."""
+    required_tensors = ["x", "c_2", "u_2", "c_3", "u_3", "v_3", "t_tau", "batch", "ptr"]
+    for name in required_tensors:
+        if not hasattr(batch, name):
+            raise ValueError(f"GET batch is missing required field '{name}'.")
+
+    x = batch.x
+    if not torch.is_tensor(x):
+        raise ValueError("GET batch x must be a tensor.")
+    if x.dim() != 2:
+        raise ValueError(f"GET batch x must be 2D [num_nodes, feat_dim], got shape {tuple(x.shape)}.")
+    if not x.dtype.is_floating_point:
+        raise ValueError(f"GET batch x must be floating point, got {x.dtype}.")
+
+    num_nodes = int(x.size(0))
+
+    for name in ["c_2", "u_2", "c_3", "u_3", "v_3", "batch", "ptr", "t_tau"]:
+        tensor = getattr(batch, name)
+        if not torch.is_tensor(tensor):
+            raise ValueError(f"GET batch field '{name}' must be a tensor.")
+        if not _is_integer_tensor(tensor):
+            raise ValueError(f"GET batch field '{name}' must be an integer tensor, got {tensor.dtype}.")
+
+    if batch.batch.numel() != num_nodes:
+        raise ValueError(
+            f"GET batch.batch has {batch.batch.numel()} entries but x has {num_nodes} nodes."
+        )
+    if batch.ptr.numel() < 2:
+        raise ValueError("GET batch.ptr must contain at least [0, num_nodes].")
+    if int(batch.ptr[0].item()) != 0:
+        raise ValueError("GET batch.ptr must start at 0.")
+    if int(batch.ptr[-1].item()) != num_nodes:
+        raise ValueError(
+            f"GET batch.ptr ends at {int(batch.ptr[-1].item())}, but x has {num_nodes} nodes."
+        )
+    if bool((batch.ptr[1:] < batch.ptr[:-1]).any()):
+        raise ValueError("GET batch.ptr must be nondecreasing.")
+
+    if batch.c_2.numel() != batch.u_2.numel():
+        raise ValueError("GET batch pairwise incidence tensors c_2 and u_2 must have the same length.")
+    if batch.c_3.numel() != batch.u_3.numel() or batch.c_3.numel() != batch.v_3.numel():
+        raise ValueError("GET batch motif incidence tensors c_3, u_3, and v_3 must have the same length.")
+    if batch.t_tau.numel() != batch.c_3.numel():
+        raise ValueError("GET batch t_tau length must match the number of motifs.")
+
+    for name, tensor in [("c_2", batch.c_2), ("u_2", batch.u_2), ("c_3", batch.c_3), ("u_3", batch.u_3), ("v_3", batch.v_3)]:
+        if tensor.numel() > 0:
+            min_index = int(tensor.min().item())
+            max_index = int(tensor.max().item())
+            if min_index < 0 or max_index >= num_nodes:
+                raise ValueError(
+                    f"GET batch field '{name}' contains node indices outside [0, {num_nodes - 1}]."
+                )
+
+    if getattr(batch, "edge_attr", None) is not None:
+        edge_attr = batch.edge_attr
+        if not torch.is_tensor(edge_attr):
+            raise ValueError("GET batch edge_attr must be a tensor when present.")
+        if not edge_attr.dtype.is_floating_point:
+            raise ValueError(f"GET batch edge_attr must be floating point, got {edge_attr.dtype}.")
+        if edge_attr.size(0) != batch.c_2.numel():
+            raise ValueError(
+                f"GET batch edge_attr has {edge_attr.size(0)} rows but c_2 has {batch.c_2.numel()} incidences."
+            )
+        if edge_attr.dtype != x.dtype:
+            raise ValueError(
+                f"GET batch edge_attr dtype {edge_attr.dtype} does not match x dtype {x.dtype}."
+            )
+
+    for name in ("pe", "rwse"):
+        tensor = getattr(batch, name, None)
+        if tensor is None:
+            continue
+        if not torch.is_tensor(tensor):
+            raise ValueError(f"GET batch field '{name}' must be a tensor when present.")
+        if tensor.size(0) != num_nodes:
+            raise ValueError(
+                f"GET batch field '{name}' has {tensor.size(0)} rows but x has {num_nodes} nodes."
+            )
+        if tensor.dtype != x.dtype:
+            raise ValueError(f"GET batch field '{name}' dtype {tensor.dtype} does not match x dtype {x.dtype}.")
+
+    pe_cls = getattr(batch, "pe_cls", None)
+    pe_cls_ptr = getattr(batch, "pe_cls_ptr", None)
+    if pe_cls is not None:
+        if not torch.is_tensor(pe_cls):
+            raise ValueError("GET batch pe_cls must be a tensor when present.")
+        if pe_cls.dtype != x.dtype:
+            raise ValueError(f"GET batch pe_cls dtype {pe_cls.dtype} does not match x dtype {x.dtype}.")
+        if pe_cls_ptr is not None:
+            if not torch.is_tensor(pe_cls_ptr):
+                raise ValueError("GET batch pe_cls_ptr must be a tensor when present.")
+            if int(pe_cls_ptr[-1].item()) != pe_cls.size(0):
+                raise ValueError(
+                    f"GET batch pe_cls_ptr ends at {int(pe_cls_ptr[-1].item())}, but pe_cls has {pe_cls.size(0)} rows."
+                )
+
+    return batch
+
+
 @njit
 def _numba_build_sparse_laplacian(num_nodes, indptr, indices):
     """Build sparse symmetric normalized Laplacian in CSR format."""
@@ -351,23 +504,48 @@ def get_incidence_matrices(num_nodes, indptr, indices, max_motifs_per_node=None)
     )
 
 
-def align_pairwise_edge_attr(edges_list, edge_attr, c_2, u_2):
+def _edge_source_to_tensor(edge_source, device=None):
+    if torch.is_tensor(edge_source):
+        edges_tensor = edge_source.to(device=device, dtype=torch.long)
+        if edges_tensor.dim() != 2:
+            raise ValueError("edge_index must be a 2D tensor with shape [2, E] or [E, 2].")
+        if edges_tensor.size(0) == 2 and edges_tensor.size(1) != 2:
+            edges_tensor = edges_tensor.t()
+        elif edges_tensor.size(-1) != 2:
+            raise ValueError("edge_index must have shape [2, E] or [E, 2].")
+        return edges_tensor.contiguous()
+
+    edges_tensor = torch.as_tensor(edge_source, dtype=torch.long, device=device)
+    if edges_tensor.numel() == 0:
+        return edges_tensor.reshape(0, 2)
+    if edges_tensor.dim() == 2 and edges_tensor.size(-1) == 2:
+        return edges_tensor.contiguous()
+    if edges_tensor.dim() == 2 and edges_tensor.size(0) == 2:
+        return edges_tensor.t().contiguous()
+    return edges_tensor.reshape(-1, 2).contiguous()
+
+
+def _graph_edge_source(graph):
+    return graph['edge_index'] if 'edge_index' in graph else graph['edges']
+
+
+def align_pairwise_edge_attr(edge_source, edge_attr, c_2, u_2):
     if edge_attr is None:
         return None
     if edge_attr.size(0) == c_2.numel():
         return edge_attr
-    if edge_attr.size(0) != len(edges_list):
+    edges_tensor = _edge_source_to_tensor(edge_source, device=c_2.device)
+    if edge_attr.size(0) != edges_tensor.size(0):
         raise ValueError(
             "edge_attr must have one row per undirected input edge or one row per "
             f"directed pairwise incidence; got {edge_attr.size(0)} rows for "
-            f"{len(edges_list)} edges and {c_2.numel()} incidences."
+            f"{edges_tensor.size(0)} edges and {c_2.numel()} incidences."
         )
 
     if c_2.numel() == 0:
         return edge_attr.new_empty((0, *edge_attr.shape[1:]))
 
     # Vectorized max node ID and key generation
-    edges_tensor = torch.as_tensor(edges_list, dtype=torch.long, device=c_2.device)
     max_node_id = max(
         int(edges_tensor.max().item()) if edges_tensor.numel() > 0 else -1,
         int(c_2.max().item()) if c_2.numel() > 0 else -1,
@@ -445,8 +623,7 @@ class CachedGraphDataset:
         self.rwse_k = rwse_k
         os.makedirs(cache_dir, exist_ok=True)
         
-        sample_str = str([g.get('edges', [])[:5] for g in dataset[:5]])
-        hash_val = hashlib.md5((name + str(max_motifs) + str(pe_k) + str(rwse_k) + sample_str + str(len(dataset))).encode()).hexdigest()[:8]
+        hash_val = _graph_dataset_cache_fingerprint(dataset, name, max_motifs, pe_k, rwse_k)
         self.cache_path = os.path.join(cache_dir, f"{name}_{hash_val}.pt")
         
         if os.path.exists(self.cache_path):
@@ -489,7 +666,9 @@ def _process_one_graph(g, max_motifs, pe_k, rwse_k):
     num_nodes = g['x'].size(0)
     
     # BUILD CSR ONCE
-    edges_arr = np.ascontiguousarray(np.array(g['edges'], dtype=np.int64).reshape(-1, 2))
+    edge_source = _graph_edge_source(g)
+    edges_tensor = _edge_source_to_tensor(edge_source)
+    edges_arr = np.ascontiguousarray(edges_tensor.detach().cpu().numpy().reshape(-1, 2))
     indptr, indices = _numba_edges_to_csr(num_nodes, edges_arr)
     
     c_2, u_2, c_3, u_3, v_3, t_tau = get_incidence_matrices(num_nodes, indptr, indices, max_motifs)
@@ -509,7 +688,7 @@ def _process_one_graph(g, max_motifs, pe_k, rwse_k):
         item['rwse'] = get_rwse(num_nodes, indptr, indices, rwse_k)
     
     if 'edge_attr' in g:
-        item['aligned_edge_attr'] = align_pairwise_edge_attr(g['edges'], g['edge_attr'], c_2, u_2)
+        item['aligned_edge_attr'] = align_pairwise_edge_attr(edge_source, g['edge_attr'], c_2, u_2)
     
     return item
 
@@ -589,7 +768,8 @@ def collate_get_batch(graph_list, max_motifs=None):
             # Incidence matrices not cached, will compute on the fly
             # This is slow, but we need the counts for pre-allocation
             num_n = g['x'].size(0)
-            e_arr = np.ascontiguousarray(np.array(g['edges'], dtype=np.int64).reshape(-1, 2))
+            edge_source = _graph_edge_source(g)
+            e_arr = np.ascontiguousarray(_edge_source_to_tensor(edge_source).detach().cpu().numpy().reshape(-1, 2))
             iptr, idc = _numba_edges_to_csr(num_n, e_arr)
             c_2, u_2, c_3, u_3, v_3, t_tau = get_incidence_matrices(num_n, iptr, idc, max_motifs)
             g['c_2'], g['u_2'], g['c_3'], g['u_3'], g['v_3'], g['t_tau'] = c_2, u_2, c_3, u_3, v_3, t_tau
@@ -663,7 +843,7 @@ def collate_get_batch(graph_list, max_motifs=None):
         if has_edge_attr:
             curr_attr = g.get('aligned_edge_attr')
             if curr_attr is None:
-                curr_attr = align_pairwise_edge_attr(g['edges'], g['edge_attr'], c2, u2)
+                curr_attr = align_pairwise_edge_attr(_graph_edge_source(g), g['edge_attr'], c2, u2)
             edge_attr[e_curr:e_end] = curr_attr
             
         if has_pe:

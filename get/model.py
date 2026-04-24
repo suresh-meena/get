@@ -321,21 +321,28 @@ class GETModel(nn.Module):
             return self.readout(torch.cat([z_mean, z_sum, z_max, z_std], dim=-1))
         raise ValueError(f"Unsupported task_level: {task_level}")
 
+    def _build_static_projections_for_layer(self, layer, batch_data):
+        static_projections = {}
+        if hasattr(batch_data, 'edge_attr') and batch_data.edge_attr is not None:
+            static_projections['a_2'] = layer.edge_mlp(batch_data.edge_attr)
+        if layer.use_memory and layer.K > 0:
+            static_projections['Km'] = torch.einsum("kd, hzd -> ...hkz", layer.B_mem, layer.W_Km)
+        if layer.use_motif and layer.T_tau is not None and batch_data.t_tau.numel() > 0:
+            t_tau = batch_data.t_tau
+            T_params = layer.T_tau
+            if t_tau.max() >= T_params.size(0):
+                t_tau = torch.clamp(t_tau, max=T_params.size(0) - 1)
+            static_projections['T_tau_selected'] = T_params[t_tau].transpose(0, 1)
+        return static_projections
+
     def _build_static_projections(self, batch_data):
+        if self.share_block_weights and len(self.get_layers) > 0:
+            static_projections = self._build_static_projections_for_layer(self.get_layers[0], batch_data)
+            return [dict(static_projections) for _ in range(self.num_blocks)]
+
         static_projections_list = []
         for layer in self.get_layers:
-            static_projections = {}
-            if hasattr(batch_data, 'edge_attr') and batch_data.edge_attr is not None:
-                static_projections['a_2'] = layer.edge_mlp(batch_data.edge_attr)
-            if layer.use_memory and layer.K > 0:
-                static_projections['Km'] = torch.einsum("kd, hzd -> ...hkz", layer.B_mem, layer.W_Km)
-            if layer.use_motif and layer.T_tau is not None and batch_data.t_tau.numel() > 0:
-                t_tau = batch_data.t_tau
-                T_params = layer.T_tau
-                if t_tau.max() >= T_params.size(0):
-                    t_tau = torch.clamp(t_tau, max=T_params.size(0) - 1)
-                static_projections['T_tau_selected'] = T_params[t_tau].transpose(0, 1)
-            static_projections_list.append(static_projections)
+            static_projections_list.append(self._build_static_projections_for_layer(layer, batch_data))
         return static_projections_list
 
     def _augment_with_cls_token(self, X, batch_data):
@@ -423,7 +430,8 @@ class GETModel(nn.Module):
                 gn_sq_graph = _scatter_add_nd(gn_sq.new_zeros(num_graphs), batch_data.batch, gn_sq, dim=0)
 
                 # Chunked evaluation to save VRAM and skip redundant work
-                best_idx = torch.full((num_graphs,), armijo_max_backtracks - 1, device=X.device, dtype=torch.long)
+                best_idx = torch.full((num_graphs,), armijo_max_backtracks, device=X.device, dtype=torch.long)
+                accepted_etas = torch.zeros(num_graphs, device=X.device, dtype=X.dtype)
                 found_global = torch.zeros(num_graphs, device=X.device, dtype=torch.bool)
                 
                 for start_bt in range(0, armijo_max_backtracks, chunk_size):
@@ -442,7 +450,9 @@ class GETModel(nn.Module):
                     update_mask = found_chunk & (~found_global)
                     if update_mask.any():
                         chunk_best = valid.to(torch.long).argmax(dim=0)
-                        best_idx[update_mask] = start_bt + chunk_best[update_mask]
+                        chosen = start_bt + chunk_best[update_mask]
+                        best_idx[update_mask] = chosen
+                        accepted_etas[update_mask] = etas_all[chosen]
                         found_global[update_mask] = True
                     
                     # Early exit if all graphs in batch found a valid step size
@@ -450,8 +460,6 @@ class GETModel(nn.Module):
                         break
 
                 # Final assignment
-                # Use etas_all to get the final accepted states
-                accepted_etas = etas_all[best_idx]
                 # In-place update to reduce memory pressure
                 X_current.sub_(accepted_etas[batch_data.batch].view(-1, 1) * grad_X)
 

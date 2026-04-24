@@ -221,7 +221,7 @@ class _BaseGraphWrapper(nn.Module):
         std = torch.sqrt(torch.relu((h.pow(2)).mean(dim=0) - mean.pow(2)) + 1e-6)
         return torch.cat([mean, summ, mx, std], dim=-1)
 
-    def _run_graph(self, h: torch.Tensor, chunk: _GraphChunk):
+    def _run_graph(self, h: torch.Tensor, chunk: _GraphChunk, bias: torch.Tensor | None = None):
         if self.use_virtual_node:
             h = torch.cat([h, self.virtual_token.to(dtype=h.dtype, device=h.device).expand(1, -1)], dim=0)
         n = int(h.size(0))
@@ -237,7 +237,6 @@ class _BaseGraphWrapper(nn.Module):
             if edge_attr is not None:
                 zero = edge_attr.new_zeros((2 * (n - 1), *edge_attr.shape[1:]))
                 edge_attr = torch.cat([edge_attr, zero], dim=0)
-        bias = self._graph_bias(chunk, n, h.device, h.dtype)
         for local_block, attn_block in zip(self.local_blocks, self.attn_blocks):
             if self.use_local:
                 h = local_block(h, edge_src, edge_dst, edge_attr=edge_attr)
@@ -252,7 +251,11 @@ class _BaseGraphWrapper(nn.Module):
         graph_outputs = []
         for chunk in chunks:
             h = h0[chunk.start : chunk.end]
-            h = self._run_graph(h, chunk)
+            bias = None
+            if self.use_spatial_bias:
+                bias_n = int(h.size(0)) + (1 if self.use_virtual_node else 0)
+                bias = self._graph_bias(chunk, bias_n, h.device, h.dtype)
+            h = self._run_graph(h, chunk, bias=bias)
             if self.use_virtual_node:
                 h_nodes = h[:-1]
             else:

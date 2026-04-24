@@ -10,7 +10,18 @@ def load_zinc_subset(root="data/ZINC"):
     train, val, test = ZINC(root=root, subset=True, split="train"), \
                        ZINC(root=root, subset=True, split="val"), \
                        ZINC(root=root, subset=True, split="test")
-    def to_dict(ds): return [{"x": d.x.float(), "edges": list(zip(d.edge_index[0].tolist(), d.edge_index[1].tolist())), "y": d.y, "edge_attr": d.edge_attr.float().view(-1, 1)} for d in ds]
+
+    def to_dict(ds):
+        return [
+            {
+                "x": d.x.float(),
+                "edge_index": d.edge_index.to(dtype=torch.long).contiguous(),
+                "y": d.y,
+                "edge_attr": d.edge_attr.float().contiguous().view(-1, 1),
+            }
+            for d in ds
+        ]
+
     return to_dict(train), to_dict(val), to_dict(test)
 
 def main():

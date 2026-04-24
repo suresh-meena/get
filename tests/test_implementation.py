@@ -143,6 +143,46 @@ def test_model_armijo_inference_mode():
         )
     print("Model Armijo inference mode check passed.")
 
+
+def test_armijo_solver_leaves_state_unchanged_when_no_step_is_accepted(monkeypatch):
+    print("Running Armijo no-update fallback check...")
+    graph = generate_random_graphs(1, n_min=8, n_max=8, d=4)[0]
+    batch = collate_get_batch([graph])
+    model = FullGET(in_dim=4, d=8, num_classes=1, num_steps=1, num_heads=1).to(torch.float64)
+    model.eval()
+
+    X = model.node_encoder(batch.x).detach()
+    static = model._build_static_projections(batch)
+    layer = model.get_layers[0]
+    original_compute_energy = layer.compute_energy
+
+    def forced_reject(candidate_X, batch_data, static_projections=None):
+        num_graphs = len(batch_data.ptr) - 1
+        if candidate_X.dim() == 3:
+            return torch.full((candidate_X.size(0), num_graphs), 1e6, dtype=candidate_X.dtype, device=candidate_X.device)
+        return torch.full((num_graphs,), 1e6, dtype=candidate_X.dtype, device=candidate_X.device)
+
+    monkeypatch.setattr(layer, "compute_energy", forced_reject)
+    try:
+        X_final, energy_trace, stats = model._run_armijo_solver(
+            X,
+            batch,
+            static,
+            armijo_c=0.1,
+            armijo_gamma=0.5,
+            armijo_eta0=10.0,
+            armijo_max_backtracks=1,
+            chunk_size=1,
+        )
+    finally:
+        monkeypatch.setattr(layer, "compute_energy", original_compute_energy)
+
+    assert torch.allclose(X_final, X)
+    assert stats['accepted'][0] == 0.0
+    assert stats['step_sizes'][0] == 0.0
+    assert len(energy_trace) == 1
+    print("Armijo no-update fallback check passed.")
+
 def test_get_cls_graph_readout():
     print("Running GET CLS Graph Readout Check...")
     graphs = generate_random_graphs(2, n_min=5, n_max=7, d=4)

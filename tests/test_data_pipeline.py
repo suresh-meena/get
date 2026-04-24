@@ -2,7 +2,7 @@ import numpy as np
 from get.data import _numba_edges_to_csr
 import torch
 
-from get.data import align_pairwise_edge_attr, collate_get_batch, get_incidence_matrices
+from get.data import _graph_dataset_cache_fingerprint, _process_one_graph, align_pairwise_edge_attr, collate_get_batch, get_incidence_matrices, validate_get_batch
 
 
 def test_incidence_deterministic_under_edge_order_shuffle():
@@ -68,9 +68,22 @@ def test_align_pairwise_edge_attr_matches_directed_incidence_order():
     assert torch.allclose(aligned, expected)
 
 
+def test_align_pairwise_edge_attr_accepts_edge_index_tensor():
+    edges = [(0, 1), (1, 2), (2, 0)]
+    edge_index = torch.tensor([[0, 1, 2], [1, 2, 0]], dtype=torch.long)
+    edge_attr = torch.tensor([[10.0, 0.0], [20.0, 1.0], [30.0, 2.0]])
+    c_2 = torch.tensor([0, 0, 1, 1, 2, 2], dtype=torch.long)
+    u_2 = torch.tensor([1, 2, 0, 2, 0, 1], dtype=torch.long)
+
+    aligned_from_list = align_pairwise_edge_attr(edges, edge_attr, c_2, u_2)
+    aligned_from_tensor = align_pairwise_edge_attr(edge_index, edge_attr, c_2, u_2)
+
+    assert torch.allclose(aligned_from_tensor, aligned_from_list)
+
+
 def test_collate_offsets_and_ptr_are_consistent():
-    g1 = {"x": torch.randn(3, 4), "edges": [(0, 1), (1, 2)], "y": torch.tensor([1.0])}
-    g2 = {"x": torch.randn(2, 4), "edges": [(0, 1)], "y": torch.tensor([0.0])}
+    g1 = {"x": torch.randn(3, 4), "edge_index": torch.tensor([[0, 1], [1, 2]], dtype=torch.long), "y": torch.tensor([1.0])}
+    g2 = {"x": torch.randn(2, 4), "edge_index": torch.tensor([[0], [1]], dtype=torch.long), "y": torch.tensor([0.0])}
 
     batch = collate_get_batch([g1, g2])
 
@@ -84,9 +97,91 @@ def test_collate_offsets_and_ptr_are_consistent():
         assert torch.all(batch.u_2[second_graph_mask] >= 3)
 
 
+def test_collate_accepts_edge_index_without_edges_list():
+    graph = {
+        "x": torch.randn(3, 4),
+        "edge_index": torch.tensor([[0, 1, 2], [1, 2, 0]], dtype=torch.long),
+        "edge_attr": torch.randn(3, 2),
+        "y": torch.tensor([1.0]),
+    }
+
+    batch = collate_get_batch([graph])
+
+    assert batch.c_2.numel() == 6
+    assert batch.edge_attr.shape == (6, 2)
+
+
+def test_process_one_graph_accepts_edge_index_tensor():
+    graph = {
+        "x": torch.randn(3, 4),
+        "edge_index": torch.tensor([[0, 1, 2], [1, 2, 0]], dtype=torch.long),
+        "edge_attr": torch.tensor([[1.0], [2.0], [3.0]]),
+        "y": torch.tensor([1.0]),
+    }
+
+    item = _process_one_graph(graph, max_motifs=0, pe_k=0, rwse_k=0)
+
+    assert item["c_2"].numel() == 6
+    assert item["u_2"].numel() == 6
+    assert item["aligned_edge_attr"].shape == (6, 1)
+
+
 def test_collate_rejects_empty_graph_list():
     try:
         collate_get_batch([])
         assert False, "Expected ValueError for empty graph list"
     except ValueError as exc:
         assert "graph_list" in str(exc)
+
+
+def test_dataset_cache_fingerprint_depends_on_full_content():
+    shared_prefix = [
+        {"x": torch.zeros(2, 1), "edges": [(0, 1)]},
+        {"x": torch.ones(2, 1), "edges": [(0, 1)]},
+        {"x": torch.full((2, 1), 2.0), "edges": [(0, 1)]},
+        {"x": torch.full((2, 1), 3.0), "edges": [(0, 1)]},
+        {"x": torch.full((2, 1), 4.0), "edges": [(0, 1)]},
+    ]
+    dataset_a = shared_prefix + [{"x": torch.full((2, 1), 5.0), "edges": [(0, 1)]}]
+    dataset_b = shared_prefix + [{"x": torch.full((2, 1), 9.0), "edges": [(0, 1)]}]
+
+    key_a = _graph_dataset_cache_fingerprint(dataset_a, "demo", 4, 2, 2)
+    key_b = _graph_dataset_cache_fingerprint(dataset_b, "demo", 4, 2, 2)
+
+    assert key_a != key_b
+
+
+def test_validate_get_batch_accepts_consistent_batch():
+    graph = {
+        "x": torch.randn(3, 4),
+        "edges": [(0, 1), (1, 2)],
+        "edge_attr": torch.randn(2, 4),
+        "pe": torch.randn(3, 2),
+        "rwse": torch.randn(3, 2),
+    }
+    batch = collate_get_batch([graph])
+
+    validate_get_batch(batch)
+
+
+def test_validate_get_batch_rejects_shape_and_dtype_mismatches():
+    graph = {
+        "x": torch.randn(3, 4),
+        "edges": [(0, 1), (1, 2)],
+        "edge_attr": torch.randn(2, 4),
+    }
+    batch = collate_get_batch([graph])
+
+    batch.edge_attr = torch.randn(batch.c_2.numel() + 1, 4)
+    try:
+        validate_get_batch(batch)
+        assert False, "Expected a shape mismatch to be rejected"
+    except ValueError as exc:
+        assert "edge_attr" in str(exc)
+
+    batch.edge_attr = torch.randn(batch.c_2.numel(), 4, dtype=torch.float64)
+    try:
+        validate_get_batch(batch)
+        assert False, "Expected a dtype mismatch to be rejected"
+    except ValueError as exc:
+        assert "dtype" in str(exc)

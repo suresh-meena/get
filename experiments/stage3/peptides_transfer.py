@@ -16,9 +16,13 @@ def load_peptides(task: str, root="data/LRGB"):
         for d in ds:
             x = d.x.float() if d.x is not None else torch.ones(d.num_nodes, 1)
             y = d.y.float().view(-1)
-            item = {"x": x, "edges": list(zip(d.edge_index[0].tolist(), d.edge_index[1].tolist())), "y": y.unsqueeze(0) if y.ndim == 0 else y.unsqueeze(0) if y.ndim == 1 else y}
+            item = {
+                "x": x,
+                "edge_index": d.edge_index.to(dtype=torch.long).contiguous(),
+                "y": y.unsqueeze(0) if y.ndim == 0 else y.unsqueeze(0) if y.ndim == 1 else y,
+            }
             if d.edge_attr is not None:
-                item["edge_attr"] = d.edge_attr.float()
+                item["edge_attr"] = d.edge_attr.float().contiguous()
             out.append(item)
         return out
     return _to_dict(tr), _to_dict(val), _to_dict(ts)

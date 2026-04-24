@@ -69,6 +69,16 @@ def _numba_rwse_sparse(indptr, indices, k, p_vec, p_next):
     return rwse
 
 
+@njit
+def _numba_csr_to_dense(num_nodes, indptr, indices, data):
+    """Build a dense matrix from CSR data in Numba."""
+    dense = np.zeros((num_nodes, num_nodes), dtype=np.float32)
+    for i in range(num_nodes):
+        for idx in range(indptr[i], indptr[i + 1]):
+            dense[i, indices[idx]] = data[idx]
+    return dense
+
+
 def rwse_from_adjacency(num_nodes, indptr, indices, k):
     """Compute RWSE directly from CSR."""
     if k <= 0:
@@ -98,12 +108,9 @@ def laplacian_pe_from_sparse_matrix(num_nodes, indptr, indices, data, k, trainin
         use = evecs[:, 1:k+1]
     except (ImportError, Exception):
         # Dense fallback
-        lap = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
-        for i in range(num_nodes):
-            for idx in range(indptr[i], indptr[i+1]):
-                lap[i, indices[idx]] = float(data[idx])
-        evals, evecs = torch.linalg.eigh(lap)
-        use = evecs[:, 1 : 1 + k].cpu().numpy()
+        lap = _numba_csr_to_dense(num_nodes, indptr, indices, np.asarray(data, dtype=np.float32))
+        evals, evecs = np.linalg.eigh(lap)
+        use = evecs[:, 1 : 1 + k]
 
     if use.shape[1] < k:
         use = np.concatenate([use, np.zeros((num_nodes, k - use.shape[1]), dtype=np.float32)], axis=1)

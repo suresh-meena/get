@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import accuracy_score, roc_auc_score, mean_absolute_error
 from tqdm.auto import tqdm
 
-from get import build_adamw_optimizer, collate_get_batch
+from get import build_adamw_optimizer, collate_get_batch, validate_get_batch
 
 def get_num_params(model):
     """Return formatted string of trainable parameter count."""
@@ -98,7 +98,7 @@ def split_grouped_dataset(dataset, split_key, seed, train_ratio=0.70, val_ratio=
     else:
         train_i, val_i, test_i = _partition_ids(ids, rng, train_ratio, val_ratio)
         train_ids = set(train_i)
-        val_ids = set(val_parts)
+        val_ids = set(val_i)
         test_ids = set(test_i)
 
     train_data = [g for g in dataset if g[split_key] in train_ids]
@@ -443,6 +443,7 @@ class GETTrainer:
         self.autocast_device_type = torch.device(self.device).type
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
         self.supports_armijo = 'inference_mode' in inspect.signature(self.model.forward).parameters
+        self.validate_batches = bool(kwargs.get('validate_batches', True))
         
         self.optimizer = build_adamw_optimizer(self.model, lr=self.lr, weight_decay=self.weight_decay)
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -512,6 +513,8 @@ class GETTrainer:
             return 0.0
         for batch in loader:
             batch = batch.to(self.device, non_blocking=True)
+            if self.validate_batches:
+                validate_get_batch(batch)
             self.optimizer.zero_grad()
             with torch.autocast(device_type=self.autocast_device_type, enabled=self.use_amp):
                 out, _ = self.model(batch, task_level='graph')
@@ -549,7 +552,10 @@ class GETTrainer:
             return metrics
         for batch in loader:
             batch = batch.to(self.device, non_blocking=True)
-            with torch.autocast(device_type=self.autocast_device_type, enabled=self.use_amp):
+            if self.validate_batches:
+                validate_get_batch(batch)
+            use_autocast = self.use_amp and not (inference_mode == 'armijo' and self.supports_armijo)
+            with torch.autocast(device_type=self.autocast_device_type, enabled=use_autocast):
                 # Use Armijo if requested and supported by the model
                 forward_kwargs = {'task_level': 'graph'}
                 if inference_mode == 'armijo' and self.supports_armijo:

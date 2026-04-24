@@ -182,18 +182,29 @@ def compute_metrics(logits, batch, xor=False):
     # Satisfied ratio is mean of satisfied across all clauses in batch
     global_satisfied_ratio = satisfied.mean().item()
     
-    # To find solved_accuracy, we need to check if all clauses in a graph are satisfied
+    # Solved accuracy is clause-wise "all satisfied" averaged over graphs.
+    num_graphs = len(batch.ptr) - 1
+    if num_graphs <= 0:
+        return global_satisfied_ratio, 0.0
+
+    clauses_per_graph, remainder = divmod(int(satisfied.numel()), int(num_graphs))
+    if clauses_per_graph <= 0:
+        return global_satisfied_ratio, 0.0
+
+    if remainder == 0:
+        solved_accuracy = satisfied.view(num_graphs, clauses_per_graph).all(dim=1).float().mean().item()
+        return global_satisfied_ratio, solved_accuracy
+
     solved_count = 0
     curr_c = 0
-    for g_idx in range(len(batch.ptr) - 1):
-        # In this dataset, graphs have 80 clauses. But we can derive it from the total parity count.
-        num_c = len(batch.global_xor_parity) // (len(batch.ptr) - 1) 
+    for _ in range(num_graphs):
+        num_c = clauses_per_graph
         g_satisfied = satisfied[curr_c : curr_c + num_c]
         if g_satisfied.all():
             solved_count += 1
         curr_c += num_c
-        
-    return global_satisfied_ratio, solved_count / (len(batch.ptr) - 1)
+
+    return global_satisfied_ratio, solved_count / num_graphs
 
 def train(model, train_loader, val_loader, test_loader, epochs, device, model_name=None, xor=False):
     import time

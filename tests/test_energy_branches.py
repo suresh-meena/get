@@ -164,6 +164,21 @@ def test_motif_only_ablation_disables_pairwise_and_memory():
     assert params["use_memory"] is False
 
 
+def test_scatter_add_nd_fallback_handles_mixed_dtypes(monkeypatch):
+    import get.energy as energy_mod
+
+    monkeypatch.setattr(energy_mod, "pyg_scatter", None)
+
+    grad_buffer = torch.zeros(3, 2, dtype=torch.float16)
+    indices = torch.tensor([0, 2], dtype=torch.long)
+    src = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
+
+    out = energy_mod._scatter_add_nd(grad_buffer, indices, src, dim=0)
+
+    expected = torch.tensor([[1.0, 2.0], [0.0, 0.0], [3.0, 4.0]], dtype=torch.float16)
+    assert torch.allclose(out, expected)
+
+
 if __name__ == "__main__":
     test_segment_logsumexp_empty_segment_behavior()
     test_energy_decomposition_matches_total()

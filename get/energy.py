@@ -49,6 +49,8 @@ def _scatter_add_nd(grad_buffer, indices, src, dim):
     perm[0], perm[dim] = perm[dim], perm[0]
 
     src_p = src.permute(perm)
+    if src_p.dtype != grad_buffer.dtype:
+        src_p = src_p.to(dtype=grad_buffer.dtype)
     # index_add_ only requires 1D indices for the front dimension
     return grad_buffer.permute(perm).index_add_(0, indices, src_p).permute(perm)
 

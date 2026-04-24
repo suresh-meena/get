@@ -3,6 +3,7 @@ from .data import (
     collate_get_batch as collate_get_batch,
     GETBatch as GETBatch,
     CachedGraphDataset as CachedGraphDataset,
+    validate_get_batch as validate_get_batch,
 )
 from .model import GETModel as GETModel
 from .et_core import (
@@ -52,6 +53,7 @@ __all__ = [
     "collate_get_batch",
     "GETBatch",
     "CachedGraphDataset",
+    "validate_get_batch",
     "GETModel",
     "EnergyLayerNorm",
     "ETAttentionCore",
