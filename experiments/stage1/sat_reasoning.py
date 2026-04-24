@@ -109,64 +109,91 @@ def generate_dataset(num_graphs, num_vars=20, num_clauses=80, xor=False, seed=42
         dataset.append(g)
     return dataset
 
-def compute_loss(logits, batch, xor=False, eps=1e-5):
-    total_loss = 0.0
-    for g_idx in range(len(batch.ptr) - 1):
-        n_vars = batch.num_vars[g_idx]
-        start = batch.ptr[g_idx]
-        var_logits = logits[start : start + n_vars].view(-1)
-        p = torch.sigmoid(var_logits)
-        c_tensor = batch.clauses[g_idx] 
-        v_idx = c_tensor[:, :, 0].to(device=logits.device)
-        s_val = c_tensor[:, :, 1].to(device=logits.device)
-        p_v = p[v_idx]
-        pi = torch.where(s_val == 1, p_v, 1.0 - p_v)
-        if xor:
-            m = 2 * p_v - 1
-            parity = batch.xor_parity[g_idx].to(device=logits.device)
-            sign_prod = torch.prod(torch.where(s_val == 1, m, -m), dim=1)
-            parity_sign = torch.where(parity == 1.0, -1.0, 1.0)
-            s_hat = 0.5 * (1.0 + parity_sign * sign_prod)
-        else:
-            s_hat = 1.0 - torch.prod(1.0 - pi, dim=1)
-        loss = -torch.log(s_hat + eps).mean()
-        total_loss += loss
-    return total_loss / max(1, len(batch.ptr) - 1)
-
 def custom_collate(graph_list):
     batch = collate_get_batch(graph_list, max_motifs=None)
-    batch.clauses = [g['clauses'] for g in graph_list]
-    batch.xor_parity = [g['xor_parity'] for g in graph_list]
-    batch.num_vars = [g['num_vars'] for g in graph_list]
+    
+    # Vectorized clause and parity gathering
+    clauses_list = []
+    xor_parity_list = []
+    var_offsets = []
+    
+    node_ptr = batch.ptr[:-1]
+    
+    for g_idx, g in enumerate(graph_list):
+        c = g['clauses'].clone()
+        # Offset variable indices in clause definitions to match concatenated batch.x
+        c[:, :, 0] += node_ptr[g_idx]
+        clauses_list.append(c)
+        xor_parity_list.append(g['xor_parity'])
+        var_offsets.append(node_ptr[g_idx])
+        
+    batch.global_clauses = torch.cat(clauses_list, dim=0)
+    batch.global_xor_parity = torch.cat(xor_parity_list, dim=0)
+    batch.var_offsets = torch.tensor(var_offsets, dtype=torch.long)
+    batch.num_vars_list = torch.tensor([g['num_vars'] for g in graph_list], dtype=torch.long)
+    
     return batch
 
+def compute_loss(logits, batch, xor=False, eps=1e-5):
+    # Fully vectorized loss computation
+    # logits: [TotalNodes, 1]
+    p = torch.sigmoid(logits.view(-1))
+    
+    c_tensor = batch.global_clauses.to(device=logits.device)
+    v_idx = c_tensor[:, :, 0]
+    s_val = c_tensor[:, :, 1]
+    
+    p_v = p[v_idx]
+    pi = torch.where(s_val == 1, p_v, 1.0 - p_v)
+    
+    if xor:
+        m = 2 * p_v - 1
+        parity = batch.global_xor_parity.to(device=logits.device)
+        sign_prod = torch.prod(torch.where(s_val == 1, m, -m), dim=1)
+        parity_sign = torch.where(parity == 1.0, -1.0, 1.0)
+        s_hat = 0.5 * (1.0 + parity_sign * sign_prod)
+    else:
+        s_hat = 1.0 - torch.prod(1.0 - pi, dim=1)
+        
+    loss = -torch.log(s_hat + eps).mean()
+    return loss
+
 def compute_metrics(logits, batch, xor=False):
-    satisfied_ratios = []
-    solved_counts = 0
+    # Fully vectorized metrics computation
+    p = (logits.view(-1) >= 0).float()
+    m = 2.0 * p - 1.0
+    
+    c_tensor = batch.global_clauses.to(device=logits.device)
+    v_idx = c_tensor[:, :, 0]
+    s_val = c_tensor[:, :, 1]
+    
+    p_v = p[v_idx]
+    lit = torch.where(s_val == 1, p_v, 1.0 - p_v)
+    
+    if xor:
+        m_v = m[v_idx]
+        parity = batch.global_xor_parity.to(device=logits.device)
+        sign_prod = torch.prod(torch.where(s_val == 1, m_v, -m_v), dim=1)
+        parity_sign = torch.where(parity == 1.0, -1.0, 1.0)
+        satisfied = (parity_sign * sign_prod > 0).float()
+    else:
+        satisfied = (lit.sum(dim=1) > 0).float()
+    
+    # Satisfied ratio is mean of satisfied across all clauses in batch
+    global_satisfied_ratio = satisfied.mean().item()
+    
+    # To find solved_accuracy, we need to check if all clauses in a graph are satisfied
+    solved_count = 0
+    curr_c = 0
     for g_idx in range(len(batch.ptr) - 1):
-        n_vars = batch.num_vars[g_idx]
-        start = batch.ptr[g_idx]
-        var_logits = logits[start : start + n_vars].view(-1)
-        m = (var_logits >= 0).float() * 2.0 - 1.0 
-        p = (var_logits >= 0).float() 
-        c_tensor = batch.clauses[g_idx] 
-        v_idx = c_tensor[:, :, 0] 
-        s_val = c_tensor[:, :, 1] 
-        p_v = p[v_idx]
-        lit = torch.where(s_val == 1, p_v, 1.0 - p_v)
-        if xor:
-            m_v = m[v_idx]
-            parity = batch.xor_parity[g_idx]
-            sign_prod = torch.prod(torch.where(s_val == 1, m_v, -m_v), dim=1)
-            parity_sign = torch.where(parity == 1.0, -1.0, 1.0)
-            satisfied = (parity_sign * sign_prod > 0).float()
-        else:
-            satisfied = (lit.sum(dim=1) > 0).float()
-        ratio = satisfied.mean().item()
-        satisfied_ratios.append(ratio)
-        if ratio >= 1.0 - 1e-9:
-            solved_counts += 1
-    return np.mean(satisfied_ratios), solved_counts / max(1, len(batch.ptr) - 1)
+        # In this dataset, graphs have 80 clauses. But we can derive it from the total parity count.
+        num_c = len(batch.global_xor_parity) // (len(batch.ptr) - 1) 
+        g_satisfied = satisfied[curr_c : curr_c + num_c]
+        if g_satisfied.all():
+            solved_count += 1
+        curr_c += num_c
+        
+    return global_satisfied_ratio, solved_count / (len(batch.ptr) - 1)
 
 def train(model, train_loader, val_loader, test_loader, epochs, device, model_name=None, xor=False):
     import time

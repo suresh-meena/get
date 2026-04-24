@@ -272,52 +272,30 @@ def _numba_augment_laplacian_cls(num_nodes, indptr, indices):
     return l_indptr, l_indices, l_data
 
 
-def get_laplacian_pe(num_nodes, edges_list, k=16):
-    edges_arr = np.ascontiguousarray(np.array(edges_list, dtype=np.int64))
-    indptr, indices = _numba_edges_to_csr(num_nodes, edges_arr)
-    
-    # Pass CSR to laplacian_pe_from_adjacency
+def get_laplacian_pe(num_nodes, indptr, indices, k=16):
+    # Directly use passed CSR
     from .utils import laplacian_pe_from_adjacency
     return laplacian_pe_from_adjacency(num_nodes, indptr, indices, k=k, training=False)
 
 
-def get_cls_augmented_laplacian_pe(num_nodes, edges_list, k=16):
-    edges_arr = np.ascontiguousarray(np.array(edges_list, dtype=np.int64))
-    indptr, indices = _numba_edges_to_csr(num_nodes, edges_arr)
-    
-    # Directly build the augmented sparse Laplacian
+def get_cls_augmented_laplacian_pe(num_nodes, indptr, indices, k=16):
+    # Directly build the augmented sparse Laplacian from passed CSR
     l_indptr, l_indices, l_data = _numba_augment_laplacian_cls(num_nodes, indptr, indices)
     
     from .utils import laplacian_pe_from_sparse_matrix
     return laplacian_pe_from_sparse_matrix(num_nodes + 1, l_indptr, l_indices, l_data, k=k, training=False)
 
 
-def get_rwse(num_nodes, edges_list, k=16):
-    edges_arr = np.ascontiguousarray(np.array(edges_list, dtype=np.int64))
-    indptr, indices = _numba_edges_to_csr(num_nodes, edges_arr)
-    
+def get_rwse(num_nodes, indptr, indices, k=16):
     from .utils import rwse_from_adjacency
     # Use optimized RWSE directly from CSR
     return rwse_from_adjacency(num_nodes, indptr, indices, k=k)
 
 
-def get_incidence_matrices(num_nodes, edges_list, max_motifs_per_node=None):
+def get_incidence_matrices(num_nodes, indptr, indices, max_motifs_per_node=None):
     """
-    Extracts the sparse support for pairwise and motif interactions from an edge list.
-    
-    Args:
-        num_nodes: Total number of nodes in the graph
-        edges_list: List of (u, v) pairs representing undirected edges
-        max_motifs_per_node: Maximum number of anchored motifs B to retain per node.
-        
-    Returns:
-        c_2, u_2: Pairwise center and neighbor indices (1D tensors)
-        c_3, u_3, v_3: Motif center, first neighbor, and second neighbor indices (1D tensors)
-        t_tau: Motif types (0 for open wedge, 1 for closed triangle) (1D tensor)
+    Extracts the sparse support for pairwise and motif interactions from CSR components.
     """
-    edges_arr = np.ascontiguousarray(np.array(edges_list, dtype=np.int64))
-    indptr, indices = _numba_edges_to_csr(num_nodes, edges_arr)
-    
     # Pairwise: vectorized repeat for center indices
     c_2 = np.repeat(np.arange(num_nodes), np.diff(indptr))
     u_2 = indices
@@ -472,7 +450,12 @@ class CachedGraphDataset:
 def _process_one_graph(g, max_motifs, pe_k, rwse_k):
     """Worker function for parallel processing."""
     num_nodes = g['x'].size(0)
-    c_2, u_2, c_3, u_3, v_3, t_tau = get_incidence_matrices(num_nodes, g['edges'], max_motifs)
+    
+    # BUILD CSR ONCE
+    edges_arr = np.ascontiguousarray(np.array(g['edges'], dtype=np.int64))
+    indptr, indices = _numba_edges_to_csr(num_nodes, edges_arr)
+    
+    c_2, u_2, c_3, u_3, v_3, t_tau = get_incidence_matrices(num_nodes, indptr, indices, max_motifs)
     
     item = dict(g)
     item['c_2'] = c_2
@@ -482,11 +465,11 @@ def _process_one_graph(g, max_motifs, pe_k, rwse_k):
     item['v_3'] = v_3
     item['t_tau'] = t_tau
     if pe_k > 0:
-        item['pe'] = get_laplacian_pe(num_nodes, g['edges'], pe_k)
-        item['pe_cls'] = get_cls_augmented_laplacian_pe(num_nodes, g['edges'], pe_k)
+        item['pe'] = get_laplacian_pe(num_nodes, indptr, indices, pe_k)
+        item['pe_cls'] = get_cls_augmented_laplacian_pe(num_nodes, indptr, indices, pe_k)
     
     if rwse_k > 0:
-        item['rwse'] = get_rwse(num_nodes, g['edges'], rwse_k)
+        item['rwse'] = get_rwse(num_nodes, indptr, indices, rwse_k)
     
     if 'edge_attr' in g:
         item['aligned_edge_attr'] = align_pairwise_edge_attr(g['edges'], g['edge_attr'], c_2, u_2)
@@ -568,7 +551,10 @@ def collate_get_batch(graph_list, max_motifs=None):
         else:
             # Incidence matrices not cached, will compute on the fly
             # This is slow, but we need the counts for pre-allocation
-            c_2, u_2, c_3, u_3, v_3, t_tau = get_incidence_matrices(num_nodes, g['edges'], max_motifs)
+            num_n = g['x'].size(0)
+            e_arr = np.ascontiguousarray(np.array(g['edges'], dtype=np.int64))
+            iptr, idc = _numba_edges_to_csr(num_n, e_arr)
+            c_2, u_2, c_3, u_3, v_3, t_tau = get_incidence_matrices(num_n, iptr, idc, max_motifs)
             g['c_2'], g['u_2'], g['c_3'], g['u_3'], g['v_3'], g['t_tau'] = c_2, u_2, c_3, u_3, v_3, t_tau
             total_edges_pair += c_2.numel()
             total_motifs += c_3.numel()

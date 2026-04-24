@@ -53,8 +53,8 @@ def _numba_sp_vec_mul(indptr, indices, deg_inv, p_vec):
 
 
 @njit
-def _numba_rwse_sparse(indptr, indices, k):
-    """Compute RWSE using sparse random walk with optimized memory usage."""
+def _numba_rwse_sparse(indptr, indices, k, p_vec, p_next):
+    """Compute RWSE using sparse random walk with pre-allocated workspace."""
     num_nodes = len(indptr) - 1
     rwse = np.zeros((num_nodes, k), dtype=np.float32)
     
@@ -64,21 +64,23 @@ def _numba_rwse_sparse(indptr, indices, k):
         if d > 0:
             deg_inv[i] = 1.0 / d
             
-    # For each start node, perform k-step random walk
     for start_node in range(num_nodes):
-        p_vec = np.zeros(num_nodes, dtype=np.float32)
+        # Reset workspace
+        p_vec.fill(0.0)
         p_vec[start_node] = 1.0
         
         for t in range(k):
-            # p_next = p_vec * P
-            p_next = np.zeros(num_nodes, dtype=np.float32)
+            p_next.fill(0.0)
             for u in range(num_nodes):
                 if p_vec[u] > 0:
                     prob_u = p_vec[u] * deg_inv[u]
                     for idx in range(indptr[u], indptr[u+1]):
                         v = indices[idx]
                         p_next[v] += prob_u
-            p_vec = p_next
+            # Swap p_vec and p_next to avoid copy
+            # (In Numba we can't easily swap references to input buffers, 
+            # so we copy back to p_vec)
+            p_vec[:] = p_next[:]
             rwse[start_node, t] = p_vec[start_node]
             
     return rwse
@@ -89,8 +91,11 @@ def rwse_from_adjacency(num_nodes, indptr, indices, k):
     if k <= 0:
         return torch.zeros((num_nodes, 0), dtype=torch.float32)
     
-    # Use the sparse-optimized version
-    rwse_np = _numba_rwse_sparse(indptr, indices, k)
+    # Pre-allocate workspace once per graph
+    p_vec = np.zeros(num_nodes, dtype=np.float32)
+    p_next = np.zeros(num_nodes, dtype=np.float32)
+    
+    rwse_np = _numba_rwse_sparse(indptr, indices, k, p_vec, p_next)
     return torch.from_numpy(rwse_np).to(dtype=torch.float32)
 
 

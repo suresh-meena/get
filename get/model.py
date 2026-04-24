@@ -291,19 +291,24 @@ class GETModel(nn.Module):
                 return self.cls_readout(Z[cls_positions])
             batch = batch_data.batch
             num_graphs = int(batch.max().item() + 1)
-            counts = torch.bincount(batch, minlength=num_graphs).view(-1, 1).to(dtype=Z.dtype)
+            counts = torch.bincount(batch, minlength=num_graphs).view(-1, 1).to(dtype=Z.dtype).clamp_min(1.0)
+            
             z_sum = torch.zeros(num_graphs, self.d, dtype=Z.dtype, device=Z.device)
             z_sum.index_add_(0, batch, Z)
-            z_mean = z_sum / counts.clamp_min(1.0)
+            z_mean = z_sum / counts
+            
             z_max = torch.full((num_graphs, self.d), float('-inf'), dtype=Z.dtype, device=Z.device)
             if hasattr(torch, "index_reduce_"):
                 z_max.index_reduce_(0, batch, Z, reduce="amax", include_self=False)
             else:
                 z_max.scatter_reduce_(0, batch.view(-1, 1).expand_as(Z), Z, reduce="amax", include_self=False)
             z_max = torch.where(counts > 0, z_max, torch.zeros_like(z_max))
+            
             z_sq_sum = torch.zeros(num_graphs, self.d, dtype=Z.dtype, device=Z.device)
             z_sq_sum.index_add_(0, batch, Z**2)
-            z_std = torch.sqrt(torch.relu((z_sq_sum / counts.clamp_min(1.0)) - z_mean**2) + 1e-6)
+            z_var = (z_sq_sum / counts) - z_mean**2
+            z_std = torch.sqrt(z_var.clamp_min(0.0) + 1e-6)
+            
             return self.readout(torch.cat([z_mean, z_sum, z_max, z_std], dim=-1))
         raise ValueError(f"Unsupported task_level: {task_level}")
 
@@ -344,9 +349,9 @@ class GETModel(nn.Module):
     def forward(self, batch_data, task_level='graph', inference_mode='fixed', return_solver_stats=False, **kwargs):
         X = self.node_encoder(batch_data.x)
         if self.pe_k > 0 and hasattr(batch_data, 'pe') and batch_data.pe is not None:
-            X = X + self.pe_proj(batch_data.pe)
+            X.add_(self.pe_proj(batch_data.pe))
         if self.rwse_k > 0 and hasattr(batch_data, 'rwse') and batch_data.rwse is not None:
-            X = X + self.rwse_proj(batch_data.rwse)
+            X.add_(self.rwse_proj(batch_data.rwse))
 
         X, solver_batch, cls_positions = self._augment_with_cls_token(X, batch_data)
         static_projections = self._build_static_projections(solver_batch)
