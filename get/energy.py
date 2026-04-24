@@ -10,14 +10,26 @@ except (ImportError, OSError):
 
 try:
     from torch_scatter import scatter as pyg_scatter
+    from torch_scatter import scatter_logsumexp as pyg_scatter_lse
 except (ImportError, OSError):
     pyg_scatter = None
+    pyg_scatter_lse = None
 
 def segment_logsumexp(x, segment_ids, num_segments, return_intermediates=False):
     """
     Computes log( 1[|N(i)|=0] + sum_j exp(x_j) ) efficiently.
     Supports optional batch dimension in x: [L] or [B, L].
     """
+    if pyg_scatter_lse is not None and not return_intermediates:
+        # Optimized single-pass CUDA kernel
+        dim = 1 if x.dim() == 2 else 0
+        lse = pyg_scatter_lse(x, segment_ids, dim=dim, dim_size=num_segments)
+        # Handle isolated nodes: ET paper uses log(1 + sum(exp)) if isolated, 
+        # which simplifies to log(1)=0 when the sum is empty.
+        # scatter_logsumexp returns -inf for empty segments.
+        return torch.where(torch.isinf(lse) & (lse < 0), torch.zeros_like(lse), lse)
+
+    # Fallback/Intermediates path (used for softmax)
     # 1. Find max per segment for numerical stability
     max_val, counts = segment_reduce_1d(x, segment_ids, num_segments, reduce="max")
     is_empty_bool = counts == 0
