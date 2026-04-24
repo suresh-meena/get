@@ -1,6 +1,7 @@
 import torch
+import torch.nn as nn
 from get import GETModel, FullGET, PairwiseGET, collate_get_batch
-from get.energy import compute_energy_GET
+from get.energy import compute_energy_GET, compute_energy_and_grad_GET
 
 def test_inheritance_hopfield_reduction():
     """
@@ -116,7 +117,7 @@ def test_multi_head_energy_averaging():
         E_total_backend = compute_energy_GET(
             X, G,
             batch.c_2, batch.u_2, batch.c_3, batch.u_3, batch.v_3, batch.t_tau,
-            params, projections
+            batch.batch, params, projections
         )
         assert torch.allclose(E_total, E_total_backend)
     print("  Multi-head energy averaging verified.")
