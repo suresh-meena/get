@@ -4,7 +4,6 @@ import hashlib
 import numpy as np
 from numba import njit
 from tqdm.auto import tqdm
-from .utils import laplacian_pe_from_adjacency, rwse_from_adjacency
 
 
 @njit
@@ -162,28 +161,142 @@ def _to_long_tensor(values):
     return torch.tensor(values, dtype=torch.long)
 
 
+@njit
+def _numba_build_sparse_laplacian(num_nodes, indptr, indices):
+    """Build sparse symmetric normalized Laplacian in CSR format."""
+    # L = I - D^-1/2 A D^-1/2
+    deg = np.zeros(num_nodes, dtype=np.float32)
+    for i in range(num_nodes):
+        deg[i] = indptr[i+1] - indptr[i]
+        
+    inv_sqrt_deg = np.zeros(num_nodes, dtype=np.float32)
+    for i in range(num_nodes):
+        if deg[i] > 0:
+            inv_sqrt_deg[i] = 1.0 / np.sqrt(deg[i])
+            
+    # Count non-zeros for L: entries of A + diagonals
+    nnz_a = indptr[num_nodes]
+    nnz_l = nnz_a + num_nodes
+    
+    l_indptr = np.zeros(num_nodes + 1, dtype=np.int64)
+    l_indices = np.empty(nnz_l, dtype=np.int64)
+    l_data = np.empty(nnz_l, dtype=np.float32)
+    
+    curr = 0
+    for i in range(num_nodes):
+        l_indptr[i] = curr
+        # Diagonal entry: 1.0 (if deg > 0)
+        l_indices[curr] = i
+        l_data[curr] = 1.0 if deg[i] > 0 else 0.0
+        curr += 1
+        
+        # Off-diagonal entries: - inv_sqrt_deg[i] * inv_sqrt_deg[j]
+        for idx in range(indptr[i], indptr[i+1]):
+            j = indices[idx]
+            if i == j:
+                continue
+            l_indices[curr] = j
+            l_data[curr] = - inv_sqrt_deg[i] * inv_sqrt_deg[j]
+            curr += 1
+    l_indptr[num_nodes] = curr
+    return l_indptr, l_indices, l_data
+
+
+@njit
+def _numba_augment_laplacian_cls(num_nodes, indptr, indices):
+    """
+    Augment a sparse normalized Laplacian with a CLS node.
+    The CLS node is fully connected to all original nodes.
+    """
+    # New size: N + 1
+    # CLS node adds: N new directed edges + 1 self-loop
+    # Each existing node adds: 1 directed edge to CLS
+    num_new_nodes = num_nodes + 1
+    cls_idx = num_nodes
+    
+    # Original degree in A (without CLS)
+    orig_deg_a = np.diff(indptr)
+    # New degree in A (with CLS and self-loops)
+    new_deg_a = orig_deg_a + 1
+    cls_deg_a = num_nodes # CLS connected to everyone
+    
+    inv_sqrt_deg = np.zeros(num_new_nodes, dtype=np.float32)
+    for i in range(num_nodes):
+        if new_deg_a[i] > 0:
+            inv_sqrt_deg[i] = 1.0 / np.sqrt(new_deg_a[i])
+    if cls_deg_a > 0:
+        inv_sqrt_deg[cls_idx] = 1.0 / np.sqrt(cls_deg_a)
+        
+    # Count NNZ: original nnz + 2*N (cls edges) + (N+1) (diagonals)
+    nnz_orig = indptr[num_nodes]
+    nnz_new = nnz_orig + 2 * num_nodes + num_new_nodes
+    
+    l_indptr = np.zeros(num_new_nodes + 1, dtype=np.int64)
+    l_indices = np.empty(nnz_new, dtype=np.int64)
+    l_data = np.empty(nnz_new, dtype=np.float32)
+    
+    curr = 0
+    # Original nodes
+    for i in range(num_nodes):
+        l_indptr[i] = curr
+        # Diagonal
+        l_indices[curr] = i
+        l_data[curr] = 1.0 if new_deg_a[i] > 0 else 0.0
+        curr += 1
+        # Original edges scaled
+        for idx in range(indptr[i], indptr[i+1]):
+            j = indices[idx]
+            if i == j: continue
+            l_indices[curr] = j
+            l_data[curr] = - inv_sqrt_deg[i] * inv_sqrt_deg[j]
+            curr += 1
+        # Edge to CLS
+        l_indices[curr] = cls_idx
+        l_data[curr] = - inv_sqrt_deg[i] * inv_sqrt_deg[cls_idx]
+        curr += 1
+        
+    # CLS node
+    l_indptr[cls_idx] = curr
+    # Diagonal
+    l_indices[curr] = cls_idx
+    l_data[curr] = 1.0 if cls_deg_a > 0 else 0.0
+    curr += 1
+    # Edges from CLS
+    for j in range(num_nodes):
+        l_indices[curr] = j
+        l_data[curr] = - inv_sqrt_deg[cls_idx] * inv_sqrt_deg[j]
+        curr += 1
+        
+    l_indptr[num_new_nodes] = curr
+    return l_indptr, l_indices, l_data
+
+
 def get_laplacian_pe(num_nodes, edges_list, k=16):
-    adj = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
-    for u, v in edges_list:
-        adj[int(u), int(v)] = 1.0
-        adj[int(v), int(u)] = 1.0
-    return laplacian_pe_from_adjacency(adj, k=k, training=False)
+    edges_arr = np.ascontiguousarray(np.array(edges_list, dtype=np.int64))
+    indptr, indices = _numba_edges_to_csr(num_nodes, edges_arr)
+    
+    from .utils import laplacian_pe_from_adjacency
+    return laplacian_pe_from_adjacency(num_nodes, indptr, indices, k=k, training=False)
 
 
 def get_cls_augmented_laplacian_pe(num_nodes, edges_list, k=16):
-    cls_idx = int(num_nodes)
-    cls_edges = list(edges_list)
-    cls_edges.extend((i, cls_idx) for i in range(num_nodes))
-    cls_edges.extend((cls_idx, i) for i in range(num_nodes))
-    return get_laplacian_pe(num_nodes + 1, cls_edges, k=k)
+    edges_arr = np.ascontiguousarray(np.array(edges_list, dtype=np.int64))
+    indptr, indices = _numba_edges_to_csr(num_nodes, edges_arr)
+    
+    # Directly build the augmented sparse Laplacian
+    l_indptr, l_indices, l_data = _numba_augment_laplacian_cls(num_nodes, indptr, indices)
+    
+    from .utils import laplacian_pe_from_sparse_matrix
+    return laplacian_pe_from_sparse_matrix(num_nodes + 1, l_indptr, l_indices, l_data, k=k, training=False)
 
 
 def get_rwse(num_nodes, edges_list, k=16):
-    adj = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
-    for u, v in edges_list:
-        adj[int(u), int(v)] = 1.0
-        adj[int(v), int(u)] = 1.0
-    return rwse_from_adjacency(adj, k=k)
+    edges_arr = np.ascontiguousarray(np.array(edges_list, dtype=np.int64))
+    indptr, indices = _numba_edges_to_csr(num_nodes, edges_arr)
+    
+    from .utils import rwse_from_adjacency
+    # Use optimized RWSE directly from CSR
+    return rwse_from_adjacency(num_nodes, indptr, indices, k=k)
 
 
 def get_incidence_matrices(num_nodes, edges_list, max_motifs_per_node=None):

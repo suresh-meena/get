@@ -3,9 +3,9 @@ import json
 import time
 import inspect
 from pathlib import Path
-from collections import deque
 
 import numpy as np
+from numba import njit
 import torch
 from torch.nn.parameter import UninitializedParameter
 import torch.nn as nn
@@ -98,7 +98,7 @@ def split_grouped_dataset(dataset, split_key, seed, train_ratio=0.70, val_ratio=
     else:
         train_i, val_i, test_i = _partition_ids(ids, rng, train_ratio, val_ratio)
         train_ids = set(train_i)
-        val_ids = set(val_i)
+        val_ids = set(val_parts)
         test_ids = set(test_i)
 
     train_data = [g for g in dataset if g[split_key] in train_ids]
@@ -158,34 +158,78 @@ def build_dataloader_kwargs(device, num_workers=None, prefetch_factor=4):
     return kwargs
 
 
-def _build_undirected_adj(num_nodes: int, edge_index: torch.Tensor) -> list[set[int]]:
-    adj = [set() for _ in range(int(num_nodes))]
-    if edge_index.numel() == 0:
-        return adj
-    src = edge_index[0].tolist()
-    dst = edge_index[1].tolist()
-    for u, v in zip(src, dst):
-        ui = int(u)
-        vi = int(v)
-        if ui == vi:
+@njit
+def _numba_build_csr_adj(num_nodes, edge_index):
+    """Build CSR adjacency representation directly in Numba."""
+    indptr = np.zeros(num_nodes + 1, dtype=np.int64)
+    E = edge_index.shape[1]
+    
+    # Count degrees
+    for i in range(E):
+        u, v = edge_index[0, i], edge_index[1, i]
+        if u == v:
             continue
-        adj[ui].add(vi)
-        adj[vi].add(ui)
-    return adj
+        indptr[u + 1] += 1
+        indptr[v + 1] += 1
+        
+    for i in range(num_nodes):
+        indptr[i + 1] += indptr[i]
+        
+    indices = np.empty(indptr[num_nodes], dtype=np.int64)
+    curr_idx = indptr[:-1].copy()
+    for i in range(E):
+        u, v = edge_index[0, i], edge_index[1, i]
+        if u == v:
+            continue
+        indices[curr_idx[u]] = v
+        curr_idx[u] += 1
+        indices[curr_idx[v]] = u
+        curr_idx[v] += 1
+        
+    return indptr, indices
 
 
-def _k_hop_nodes(adj: list[set[int]], center: int, num_hops: int) -> list[int]:
-    seen = {int(center)}
-    q = deque([(int(center), 0)])
-    while q:
-        node, depth = q.popleft()
-        if depth >= num_hops:
+@njit
+def _numba_k_hop_nodes(indptr, indices, center, num_hops):
+    """Numba-accelerated BFS for k-hop neighborhood."""
+    num_nodes = len(indptr) - 1
+    # Use a boolean array for 'seen' instead of a set
+    visited = np.zeros(num_nodes, dtype=np.bool_)
+    
+    # Simple queue
+    q = np.empty(num_nodes, dtype=np.int64)
+    dist = np.empty(num_nodes, dtype=np.int32)
+    
+    head = 0
+    tail = 0
+    
+    q[tail] = center
+    dist[tail] = 0
+    visited[center] = True
+    tail += 1
+    
+    while head < tail:
+        u = q[head]
+        d = dist[head]
+        head += 1
+        
+        if d >= num_hops:
             continue
-        for nbr in adj[node]:
-            if nbr not in seen:
-                seen.add(nbr)
-                q.append((nbr, depth + 1))
-    return sorted(seen)
+            
+        for i in range(indptr[u], indptr[u+1]):
+            v = indices[i]
+            if not visited[v]:
+                visited[v] = True
+                q[tail] = v
+                dist[tail] = d + 1
+                tail += 1
+                
+    # Extract only visited indices
+    res = np.empty(tail, dtype=np.int64)
+    for i in range(tail):
+        res[i] = q[i]
+    res.sort()
+    return res
 
 
 def _build_ego_graph_dataset_dgl(data, centers: list[int], num_hops: int) -> list[dict] | None:
@@ -230,9 +274,6 @@ def _build_ego_graph_dataset_dgl(data, centers: list[int], num_hops: int) -> lis
 def build_ego_graph_dataset(data, num_hops: int = 1, limit: int | None = None, use_dgl_if_available: bool = True) -> list[dict]:
     """
     Convert a node-labeled single graph into graph samples via ego subgraphs.
-
-    Expected fields on `data`: num_nodes, edge_index [2, E], x [N, F], y [N].
-    Output label is binary float tensor [1] copied from center-node anomaly label.
     """
     n = int(data.num_nodes)
     centers = list(range(n))
@@ -244,24 +285,32 @@ def build_ego_graph_dataset(data, num_hops: int = 1, limit: int | None = None, u
         if fast is not None:
             return fast
 
-    edge_index = data.edge_index
+    edge_index_np = data.edge_index.detach().cpu().numpy().astype(np.int64)
+    indptr, indices = _numba_build_csr_adj(n, edge_index_np)
+    
     x_all = data.x
     y_all = data.y
-    adj = _build_undirected_adj(n, edge_index)
 
     samples: list[dict] = []
     for center in tqdm(centers, desc=f"Building ego graphs (h={int(num_hops)})", leave=False):
-        nodes = _k_hop_nodes(adj, center=center, num_hops=int(num_hops))
-        local_index = {node: i for i, node in enumerate(nodes)}
-
+        # Numba-accelerated BFS
+        nodes = _numba_k_hop_nodes(indptr, indices, int(center), int(num_hops))
+        
+        # Build local index mapping
+        local_index = {int(node): i for i, node in enumerate(nodes)}
+        
         local_edges = []
-        for u in nodes:
-            for v in adj[u]:
-                if v in local_index and u <= v:
-                    local_edges.append((local_index[u], local_index[v]))
+        for u_global in nodes:
+            u_local = local_index[int(u_global)]
+            for idx in range(indptr[u_global], indptr[u_global+1]):
+                v_global = indices[idx]
+                if int(v_global) in local_index:
+                    v_local = local_index[int(v_global)]
+                    if u_local <= v_local:
+                        local_edges.append((u_local, v_local))
 
         x_local = x_all[nodes].float()
-        y_local = torch.tensor([float(y_all[center].item())], dtype=torch.float32)
+        y_local = torch.tensor([float(y_all[int(center)].item())], dtype=torch.float32)
         samples.append(
             {
                 "x": x_local,

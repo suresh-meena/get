@@ -21,6 +21,23 @@ def _adj_to_csr_utils(adj):
     return indptr, indices
 
 
+def _adj_to_csr_utils(adj):
+    """Convert dense adjacency tensor to CSR format."""
+    # Move to CPU/numpy for Numba
+    a = adj.detach().cpu().numpy()
+    num_nodes = a.shape[0]
+    # Find indices of non-zero entries
+    rows, cols = np.where(a > 0)
+    
+    indptr = np.zeros(num_nodes + 1, dtype=np.int64)
+    # Count occurrences of each row index to build indptr
+    row_counts = np.bincount(rows, minlength=num_nodes)
+    indptr[1:] = np.cumsum(row_counts)
+    
+    indices = cols.astype(np.int64)
+    return indptr, indices
+
+
 @njit
 def _numba_rwse(indptr, indices, k):
     """Compute RWSE using sparse random walk."""
@@ -58,45 +75,52 @@ def _numba_rwse(indptr, indices, k):
     return rwse
 
 
-def rwse_from_adjacency(adj, k):
-    n = int(adj.size(0))
+def rwse_from_adjacency(num_nodes, indptr, indices, k):
+    """Compute RWSE directly from CSR."""
     if k <= 0:
-        return adj.new_zeros((n, 0), dtype=torch.float32)
-    if n == 0:
-        return adj.new_zeros((n, k), dtype=torch.float32)
+        return torch.zeros((num_nodes, 0), dtype=torch.float32)
     
-    indptr, indices = _adj_to_csr_utils(adj)
     rwse_np = _numba_rwse(indptr, indices, k)
-    
-    return torch.from_numpy(rwse_np).to(device=adj.device, dtype=torch.float32)
+    return torch.from_numpy(rwse_np).to(dtype=torch.float32)
 
-def laplacian_pe_from_adjacency(adj, k, training=False):
-    n = int(adj.size(0))
+
+def laplacian_pe_from_sparse_matrix(num_nodes, indptr, indices, data, k, training=False):
+    """Compute Laplacian PE directly from CSR matrix data."""
     if k <= 0:
-        return adj.new_zeros((n, 0), dtype=torch.float32)
-    if n <= 1:
-        return adj.new_zeros((n, k), dtype=torch.float32)
+        return torch.zeros((num_nodes, 0), dtype=torch.float32)
+    if num_nodes <= 1:
+        return torch.zeros((num_nodes, k), dtype=torch.float32)
 
-    a = adj.to(dtype=torch.float32)
-    deg = a.sum(dim=1)
-    inv_sqrt_deg = torch.zeros_like(deg)
-    valid = deg > 0
-    inv_sqrt_deg[valid] = deg[valid].pow(-0.5)
-    lap = torch.eye(n, device=adj.device, dtype=torch.float32) - (inv_sqrt_deg[:, None] * a * inv_sqrt_deg[None, :])
+    try:
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.linalg import eigsh
+        
+        lap_sparse = csr_matrix((data, indices, indptr), shape=(num_nodes, num_nodes))
+        evals, evecs = eigsh(lap_sparse, k=k+1, which='SM', tol=1e-5)
+        use = evecs[:, 1:k+1]
+    except (ImportError, Exception):
+        # Dense fallback
+        lap = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
+        for i in range(num_nodes):
+            for idx in range(indptr[i], indptr[i+1]):
+                lap[i, indices[idx]] = float(data[idx])
+        evals, evecs = torch.linalg.eigh(lap)
+        use = evecs[:, 1 : 1 + k].cpu().numpy()
 
-    evals, evecs = torch.linalg.eigh(lap)
-    order = torch.argsort(evals)
-    evecs = evecs[:, order]
-    use = evecs[:, 1 : 1 + k]
-    if use.size(1) < k:
-        use = torch.cat(
-            [use, torch.zeros((n, k - use.size(1)), device=adj.device, dtype=use.dtype)],
-            dim=1,
-        )
+    if use.shape[1] < k:
+        use = np.concatenate([use, np.zeros((num_nodes, k - use.shape[1]), dtype=np.float32)], axis=1)
 
-    if training and use.numel() > 0:
-        use = random_flip_pe_signs(use, training=True)
-    return use
+    pe = torch.from_numpy(use).to(dtype=torch.float32)
+    if training:
+        pe = random_flip_pe_signs(pe, training=True)
+    return pe
+
+
+def laplacian_pe_from_adjacency(num_nodes, indptr, indices, k, training=False):
+    """Compute Laplacian PE using sparse solver if possible."""
+    from .data import _numba_build_sparse_laplacian
+    l_indptr, l_indices, l_data = _numba_build_sparse_laplacian(num_nodes, indptr, indices)
+    return laplacian_pe_from_sparse_matrix(num_nodes, l_indptr, l_indices, l_data, k, training)
 
 
 def random_flip_pe_signs(pe, training=False):
