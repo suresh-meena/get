@@ -144,11 +144,15 @@ def compute_motif_energy(G, c_3, u_3, v_3, t_tau, batch, num_graphs, params, pro
         return (zero_E, (dummy, dummy)) if return_grad else zero_E
 
     Q3, K3 = projections['Q3'], projections['K3']
-    T_params = params['T_tau']
-    if t_tau.numel() > 0 and t_tau.max() >= T_params.size(0):
-        t_tau = torch.clamp(t_tau, max=T_params.size(0) - 1)
+    
+    # Static gather optimization: use pre-gathered bias if available
+    T_tau_selected = projections.get('T_tau_selected')
+    if T_tau_selected is None:
+        T_params = params['T_tau']
+        if t_tau.numel() > 0 and t_tau.max() >= T_params.size(0):
+            t_tau = torch.clamp(t_tau, max=T_params.size(0) - 1)
+        T_tau_selected = T_params[t_tau].transpose(0, 1)  # [H, L, R, d_h]
 
-    T_tau_selected = T_params[t_tau].transpose(0, 1)  # [H, L, R, d_h]
     scale = (R * d) ** 0.5
     ell_3 = fused_motif_dot(Q3[..., c_3, :, :], K3[..., u_3, :, :], K3[..., v_3, :, :], T_tau_selected) / scale
     beta_3 = inverse_temperature(params, 'beta_3', beta_max=beta_max)

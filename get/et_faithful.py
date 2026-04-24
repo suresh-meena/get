@@ -225,7 +225,7 @@ class ETFaithfulGraphModel(nn.Module):
         sizes = torch.diff(ptr) + 1
         return dense_modulation, sizes
 
-    def _solve_dynamics(self, x_aug, c_aug, u_aug, cls_indices, node_indices, batch_data):
+    def _solve_dynamics(self, x_aug, c_aug, u_aug, cls_indices, node_indices, batch_data, static_projections=None):
         energy_trace = []
         step = self.eta
         x = x_aug
@@ -253,6 +253,7 @@ class ETFaithfulGraphModel(nn.Module):
                     mask_mode=self.mask_mode,
                     dense_modulation=dense_modulation,
                     dense_sizes=dense_sizes,
+                    static_projections=static_projections,
                 )
                 
                 # Pull back through norm
@@ -298,6 +299,7 @@ class ETFaithfulGraphModel(nn.Module):
         armijo_eta0=None,
         armijo_max_backtracks=25,
         chunk_size=4,
+        static_projections=None,
     ):
         if self.training:
             raise ValueError("Armijo inference_mode is evaluation-only; call model.eval() first.")
@@ -333,6 +335,7 @@ class ETFaithfulGraphModel(nn.Module):
                     self.mask_mode,
                     dense_modulation=dense_modulation,
                     dense_sizes=dense_sizes,
+                    static_projections=static_projections,
                 )
                 grad_x = norm.backward(x, grad_g)
 
@@ -368,6 +371,7 @@ class ETFaithfulGraphModel(nn.Module):
                         self.mask_mode,
                         dense_modulation=dense_modulation,
                         dense_sizes=dense_sizes,
+                        static_projections=static_projections,
                     )
                     
                     rhs = e_t - armijo_c * etas * grad_norm_sq
@@ -400,11 +404,16 @@ class ETFaithfulGraphModel(nn.Module):
         z_nodes = self.node_encoder(x)
         x_aug, c_aug, u_aug, cls_pos, node_pos, graph_chunks = self._build_augmented_graph(batch_data, z_nodes)
         
+        # Motif bias hoisting
+        static_projections = {}
+        # In ETFaithful, motifs are not yet fully active in the sparse path, 
+        # but if they were, we would hoist the T_tau here.
+        
         if inference_mode == 'fixed':
-            x_final, energy_trace = self._solve_dynamics(x_aug, c_aug, u_aug, cls_pos, node_pos, batch_data)
+            x_final, energy_trace = self._solve_dynamics(x_aug, c_aug, u_aug, cls_pos, node_pos, batch_data, static_projections=static_projections)
             solver_stats = {'mode': 'fixed', 'energy_trace': energy_trace}
         elif inference_mode == 'armijo':
-            x_final, energy_trace, solver_stats = self._run_armijo_solver(x_aug, c_aug, u_aug, cls_pos, node_pos, batch_data)
+            x_final, energy_trace, solver_stats = self._run_armijo_solver(x_aug, c_aug, u_aug, cls_pos, node_pos, batch_data, static_projections=static_projections)
         else:
             raise ValueError(f"Unsupported inference_mode: {inference_mode}")
 

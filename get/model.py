@@ -193,21 +193,26 @@ class GETLayer(nn.Module):
         if self.use_pairwise and W_Q2 is not None:
             gQ2, gK2 = head_grads.get('grad_Q2'), head_grads.get('grad_K2')
             if gQ2 is not None:
-                grad_G_att += (gQ2 @ W_Q2).sum(dim=-3)
+                term = (gQ2 @ W_Q2)
+                grad_G_att += term.sum(dim=-3) if self.num_heads > 1 else term.squeeze(-3)
             if gK2 is not None:
-                grad_G_att += (gK2 @ W_K2).sum(dim=-3)
+                term = (gK2 @ W_K2)
+                grad_G_att += term.sum(dim=-3) if self.num_heads > 1 else term.squeeze(-3)
 
         if self.use_motif and W_Q3 is not None:
             gQ3, gK3 = head_grads.get('grad_Q3'), head_grads.get('grad_K3')
             if gQ3 is not None:
-                grad_G_att += (gQ3.flatten(-2, -1) @ W_Q3).sum(dim=-3)
+                term = (gQ3.flatten(-2, -1) @ W_Q3)
+                grad_G_att += term.sum(dim=-3) if self.num_heads > 1 else term.squeeze(-3)
             if gK3 is not None:
-                grad_G_att += (gK3.flatten(-2, -1) @ W_K3).sum(dim=-3)
+                term = (gK3.flatten(-2, -1) @ W_K3)
+                grad_G_att += term.sum(dim=-3) if self.num_heads > 1 else term.squeeze(-3)
 
         if self.use_memory and W_Qm is not None:
             gQm = head_grads.get('grad_Qm')
             if gQm is not None:
-                grad_G_att += (gQm @ W_Qm).sum(dim=-3)
+                term = (gQm @ W_Qm)
+                grad_G_att += term.sum(dim=-3) if self.num_heads > 1 else term.squeeze(-3)
 
         grad_X = grad_X_quad - self.layernorm.backward(X, grad_G_att)
         return E, grad_X
@@ -308,6 +313,12 @@ class GETModel(nn.Module):
             static_projections['a_2'] = self.get_layer.edge_mlp(batch_data.edge_attr)
         if self.get_layer.use_memory and self.get_layer.K > 0:
             static_projections['Km'] = torch.einsum("kd, hzd -> ...hkz", self.get_layer.B_mem, self.get_layer.W_Km)
+        if self.get_layer.use_motif and self.get_layer.T_tau is not None and batch_data.t_tau.numel() > 0:
+            t_tau = batch_data.t_tau
+            T_params = self.get_layer.T_tau
+            if t_tau.max() >= T_params.size(0):
+                t_tau = torch.clamp(t_tau, max=T_params.size(0) - 1)
+            static_projections['T_tau_selected'] = T_params[t_tau].transpose(0, 1)
         return static_projections
 
     def _augment_with_cls_token(self, X, batch_data):

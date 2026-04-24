@@ -25,8 +25,10 @@ class EnergyLayerNorm(nn.Module):
             self.register_parameter("bias", None)
 
     def forward(self, x):
-        xmeaned = x - x.mean(dim=-1, keepdim=True)
-        v = self.gamma * xmeaned / torch.sqrt((xmeaned.pow(2)).mean(dim=-1, keepdim=True) + self.eps)
+        mean = x.mean(dim=-1, keepdim=True)
+        xmeaned = x - mean
+        rstd = torch.rsqrt((xmeaned.pow(2)).mean(dim=-1, keepdim=True) + self.eps)
+        v = self.gamma * xmeaned * rstd
         if self.bias is not None:
             return v + self.bias
         return v
@@ -34,16 +36,17 @@ class EnergyLayerNorm(nn.Module):
     def backward(self, x, grad_v):
         """Analytical pullback: dE/dx = (dE/dv) * (dv/dx)"""
         # x: [..., D], grad_v: [..., D]
-        xmeaned = x - x.mean(dim=-1, keepdim=True)
+        mean = x.mean(dim=-1, keepdim=True)
+        xmeaned = x - mean
         var = (xmeaned.pow(2)).mean(dim=-1, keepdim=True)
-        std_inv = 1.0 / torch.sqrt(var + self.eps)
-        std_inv_sq = std_inv**2
+        rstd = torch.rsqrt(var + self.eps)
+        rstd_sq = rstd**2
         
         term1 = grad_v
         term2 = grad_v.mean(dim=-1, keepdim=True)
-        term3 = xmeaned * (grad_v * xmeaned).mean(dim=-1, keepdim=True) * std_inv_sq
+        term3 = xmeaned * (grad_v * xmeaned).mean(dim=-1, keepdim=True) * rstd_sq
         
-        grad_x = self.gamma * std_inv * (term1 - term2 - term3)
+        grad_x = self.gamma * rstd * (term1 - term2 - term3)
         return grad_x
 
 
@@ -263,12 +266,12 @@ class ETAttentionCore(nn.Module):
             grad_g = torch.einsum("nhz,hdz->nd", grad_q, wq_t) + torch.einsum("nhz,hdz->nd", grad_k, wk_t)
         return e, grad_g
 
-    def energy(self, g, c_aug, u_aug, graph_chunks, mask_mode="sparse", dense_modulation=None, dense_sizes=None):
+    def energy(self, g, c_aug, u_aug, graph_chunks, mask_mode="sparse", dense_modulation=None, dense_sizes=None, static_projections=None):
         if mask_mode == "official_dense":
             return self._dense_energy(g, graph_chunks, dense_modulation=dense_modulation, dense_sizes=dense_sizes)
         return self._sparse_energy(g, c_aug, u_aug)
 
-    def energy_and_grad(self, g, c_aug, u_aug, graph_chunks, mask_mode="sparse", dense_modulation=None, dense_sizes=None):
+    def energy_and_grad(self, g, c_aug, u_aug, graph_chunks, mask_mode="sparse", dense_modulation=None, dense_sizes=None, static_projections=None):
         if mask_mode == "official_dense":
             return self._dense_energy(g, graph_chunks, dense_modulation=dense_modulation, dense_sizes=dense_sizes, return_grad=True)
         return self._sparse_energy(g, c_aug, u_aug, return_grad=True)
@@ -331,11 +334,11 @@ class ETCoreBlock(nn.Module):
         self.attn = ETAttentionCore(d=d, num_heads=num_heads, head_dim=head_dim, beta_init=beta_init)
         self.hn = ETHopfieldCore(d=d, num_memories=num_memories)
 
-    def energy(self, g, c_aug, u_aug, graph_chunks, mask_mode, dense_modulation=None, dense_sizes=None):
-        return self.attn.energy(g, c_aug, u_aug, graph_chunks, mask_mode=mask_mode, dense_modulation=dense_modulation, dense_sizes=dense_sizes) + self.hn.energy(g)
+    def energy(self, g, c_aug, u_aug, graph_chunks, mask_mode, dense_modulation=None, dense_sizes=None, static_projections=None):
+        return self.attn.energy(g, c_aug, u_aug, graph_chunks, mask_mode=mask_mode, dense_modulation=dense_modulation, dense_sizes=dense_sizes, static_projections=static_projections) + self.hn.energy(g)
 
-    def energy_and_grad(self, g, c_aug, u_aug, graph_chunks, mask_mode, dense_modulation=None, dense_sizes=None):
-        e_attn, grad_attn = self.attn.energy_and_grad(g, c_aug, u_aug, graph_chunks, mask_mode=mask_mode, dense_modulation=dense_modulation, dense_sizes=dense_sizes)
+    def energy_and_grad(self, g, c_aug, u_aug, graph_chunks, mask_mode, dense_modulation=None, dense_sizes=None, static_projections=None):
+        e_attn, grad_attn = self.attn.energy_and_grad(g, c_aug, u_aug, graph_chunks, mask_mode=mask_mode, dense_modulation=dense_modulation, dense_sizes=dense_sizes, static_projections=static_projections)
         e_hn, grad_hn = self.hn.energy_and_grad(g)
         return e_attn + e_hn, grad_attn + grad_hn
 
