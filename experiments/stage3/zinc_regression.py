@@ -29,7 +29,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--model", choices=["pairwise", "full", "gin"], default="full")
-    parser.add_argument("--rwse_k", type=int, default=0)
+    parser.add_argument("--rwse_k", type=int, default=20)
     args = parser.parse_args()
 
     set_seed(42)

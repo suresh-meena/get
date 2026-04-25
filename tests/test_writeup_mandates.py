@@ -1,7 +1,11 @@
 import torch
+import pytest
 from get import GETModel, FullGET, PairwiseGET, collate_get_batch
-from get.energy import compute_energy_GET
+from get.energy.core import compute_energy_GET
 
+_requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+
+@_requires_cuda
 def test_inheritance_hopfield_reduction():
     """
     Proposition 1: |V|=1, lambda_2=lambda_3=0 reduces to Modern Hopfield retrieval.
@@ -45,6 +49,7 @@ def test_inheritance_hopfield_reduction():
         assert torch.allclose(E_total, E_manual, atol=1e-7)
     print("  Hopfield reduction verified.")
 
+@_requires_cuda
 def test_inheritance_et_reduction():
     """
     Proposition 2: Complete graph, pairwise-only reduces to restricted ET attention.
@@ -91,6 +96,7 @@ def test_inheritance_et_reduction():
         assert torch.allclose(E_total, E_manual, atol=1e-7)
     print("  ET attention reduction verified.")
 
+@_requires_cuda
 def test_multi_head_energy_averaging():
     """
     Verify that multi-head energy is the average of head energies.
@@ -125,6 +131,7 @@ def test_multi_head_energy_averaging():
         assert torch.allclose(E_total, E_total_backend)
     print("  Multi-head energy averaging verified.")
 
+@_requires_cuda
 def test_double_backward_full_model():
     """
     Rigorous check for double backward support in GETModel.

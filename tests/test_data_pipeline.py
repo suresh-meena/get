@@ -1,8 +1,8 @@
 import numpy as np
-from get.data import _numba_edges_to_csr
+from get.data.batch import _numba_edges_to_csr
 import torch
 
-from get.data import _graph_dataset_cache_fingerprint, _process_one_graph, align_pairwise_edge_attr, collate_get_batch, get_incidence_matrices, validate_get_batch
+from get.data.batch import _graph_dataset_cache_fingerprint, _process_one_graph, align_pairwise_edge_attr, collate_get_batch, get_incidence_matrices, validate_get_batch
 
 
 def test_incidence_deterministic_under_edge_order_shuffle():

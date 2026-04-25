@@ -42,7 +42,7 @@ def test_split_grouped_dataset_nonbinary_path_is_defined():
 
 
 def test_trainer_fast_fails_on_invalid_batch(monkeypatch):
-    from get.data import collate_get_batch
+    from get.data.batch import collate_get_batch
 
     class DummyModel(nn.Module):
         def __init__(self):

@@ -1,6 +1,6 @@
 import torch
 from types import SimpleNamespace
-from get.model import GETLayer
+from get.models.get_model import GETLayer
 
 def test_get_layer_grad():
     print("Verifying GETLayer analytical gradients...")
@@ -43,7 +43,7 @@ def test_get_layer_grad():
 
 def test_et_faithful_grad():
     print("Verifying ETFaithfulCore analytical gradients...")
-    from get.et_core import ETCoreBlock
+    from get.models.et_core import ETCoreBlock
     d = 16
     num_heads = 2
     head_dim = 8

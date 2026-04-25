@@ -1,6 +1,6 @@
 import torch
-from get.model import GETModel
-from get.data import GETBatch
+from get.models.get_model import GETModel
+from get.data.batch import GETBatch
 import pytest
 
 def get_dummy_batch(num_nodes=10, num_graphs=2, in_dim=4):

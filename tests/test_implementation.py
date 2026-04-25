@@ -156,7 +156,7 @@ def test_armijo_solver_leaves_state_unchanged_when_no_step_is_accepted(monkeypat
     layer = model.get_layers[0]
     original_compute_energy = layer.compute_energy
 
-    def forced_reject(candidate_X, batch_data, static_projections=None):
+    def forced_reject(candidate_X, batch_data, static_projections=None, degree_scaler=None):
         num_graphs = len(batch_data.ptr) - 1
         if candidate_X.dim() == 3:
             return torch.full((candidate_X.size(0), num_graphs), 1e6, dtype=candidate_X.dtype, device=candidate_X.device)
@@ -168,6 +168,7 @@ def test_armijo_solver_leaves_state_unchanged_when_no_step_is_accepted(monkeypat
             X,
             batch,
             static,
+            degree_scaler=None,
             armijo_c=0.1,
             armijo_gamma=0.5,
             armijo_eta0=10.0,

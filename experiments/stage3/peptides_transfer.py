@@ -41,16 +41,16 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tr_raw, val_raw, ts_raw = load_peptides(task=args.task, root=args.data_root)
 
-    tr = CachedGraphDataset(tr_raw, name=f"peptides_{args.task}_train", max_motifs=16, pe_k=16).cached_data
-    val = CachedGraphDataset(val_raw, name=f"peptides_{args.task}_val", max_motifs=16, pe_k=16).cached_data
-    ts = CachedGraphDataset(ts_raw, name=f"peptides_{args.task}_test", max_motifs=16, pe_k=16).cached_data
+    tr = CachedGraphDataset(tr_raw, name=f"peptides_{args.task}_train", max_motifs=16, pe_k=16, rwse_k=20).cached_data
+    val = CachedGraphDataset(val_raw, name=f"peptides_{args.task}_val", max_motifs=16, pe_k=16, rwse_k=20).cached_data
+    ts = CachedGraphDataset(ts_raw, name=f"peptides_{args.task}_test", max_motifs=16, pe_k=16, rwse_k=20).cached_data
     in_dim = tr[0]["x"].size(1)
     out_dim = int(tr[0]["y"].numel())
 
     models = {
-        "PairwiseGET": PairwiseGET(in_dim, int(args.hidden_dim * 1.73), out_dim, pe_k=16),
-        "FullGET": FullGET(in_dim, args.hidden_dim, out_dim, pe_k=16, lambda_3=1.0),
-        "ETFaithful": ETFaithful(in_dim, args.hidden_dim, out_dim, pe_k=16, num_steps=6),
+        "PairwiseGET": PairwiseGET(in_dim, int(args.hidden_dim * 1.73), out_dim, pe_k=16, rwse_k=20),
+        "FullGET": FullGET(in_dim, args.hidden_dim, out_dim, pe_k=16, rwse_k=20, lambda_3=1.0),
+        "ETFaithful": ETFaithful(in_dim, args.hidden_dim, out_dim, pe_k=16, rwse_k=20, num_steps=6),
         "GIN": GINBaseline(in_dim, args.hidden_dim, out_dim)
     }
 

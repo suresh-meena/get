@@ -1,7 +1,7 @@
 import torch
 
 from get import ETAttentionCore, ETGraphMaskModulator, ETFaithful, FullGET
-from get.data import collate_get_batch
+from get.data.batch import collate_get_batch
 
 
 def _tiny_graph_with_edge_attr(dtype=torch.float32):

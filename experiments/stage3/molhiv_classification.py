@@ -58,15 +58,15 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tr_raw, val_raw, ts_raw = load_molhiv(root=args.data_root)
 
-    tr = CachedGraphDataset(tr_raw, name="molhiv_train", max_motifs=16, pe_k=16).cached_data
-    val = CachedGraphDataset(val_raw, name="molhiv_val", max_motifs=16, pe_k=16).cached_data
-    ts = CachedGraphDataset(ts_raw, name="molhiv_test", max_motifs=16, pe_k=16).cached_data
+    tr = CachedGraphDataset(tr_raw, name="molhiv_train", max_motifs=16, pe_k=16, rwse_k=20).cached_data
+    val = CachedGraphDataset(val_raw, name="molhiv_val", max_motifs=16, pe_k=16, rwse_k=20).cached_data
+    ts = CachedGraphDataset(ts_raw, name="molhiv_test", max_motifs=16, pe_k=16, rwse_k=20).cached_data
     in_dim = tr[0]["x"].size(1)
 
     models = {
-        "PairwiseGET": PairwiseGET(in_dim, int(args.hidden_dim * 1.73), 1, pe_k=16),
-        "FullGET": FullGET(in_dim, args.hidden_dim, 1, pe_k=16, lambda_3=1.0),
-        "ETFaithful": ETFaithful(in_dim, args.hidden_dim, 1, pe_k=16, num_steps=6),
+        "PairwiseGET": PairwiseGET(in_dim, int(args.hidden_dim * 1.73), 1, pe_k=16, rwse_k=20),
+        "FullGET": FullGET(in_dim, args.hidden_dim, 1, pe_k=16, rwse_k=20, lambda_3=1.0),
+        "ETFaithful": ETFaithful(in_dim, args.hidden_dim, 1, pe_k=16, rwse_k=20, num_steps=6),
         "GIN": GINBaseline(in_dim, args.hidden_dim, 1)
     }
 

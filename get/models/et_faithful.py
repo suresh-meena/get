@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
-
-from .et_core import ETCoreBlock, ETGraphMaskModulator, EnergyLayerNorm
+from get.models.et_core import ETCoreBlock
+from get.nn import EnergyLayerNorm, ETGraphMaskModulator
 
 
 class ETFaithfulGraphModel(nn.Module):
@@ -60,9 +60,6 @@ class ETFaithfulGraphModel(nn.Module):
         if self.mask_mode not in {"sparse", "official_dense"}:
             raise ValueError(f"Unsupported mask_mode: {self.mask_mode}")
 
-        # Match the reference ET graph code: a linear projection in and a
-        # linear classifier out, with the recurrent energy descent carrying the
-        # capacity of the model.
         self.node_encoder = nn.Linear(in_dim, d)
         self.pe_proj = nn.Linear(self.pe_k, d) if self.pe_k > 0 else None
         self.rwse_proj = nn.Linear(self.rwse_k, d) if self.rwse_k > 0 else None
@@ -107,7 +104,6 @@ class ETFaithfulGraphModel(nn.Module):
         device = z_nodes.device
         dtype = z_nodes.dtype
 
-        # 1. Integrate CLS tokens
         X_aug = torch.empty((num_nodes + num_graphs, self.d), dtype=dtype, device=device)
         X_aug[:num_nodes] = z_nodes
         X_aug[num_nodes:] = self.cls_token.expand(num_graphs, -1)
@@ -116,8 +112,6 @@ class ETFaithfulGraphModel(nn.Module):
         node_batch = batch_data.batch
         node_cls_indices = cls_indices[node_batch]
         
-        # 2. Vectorized augmented edges
-        # c2/u2 + 2*N (cls-node bidirectional) + N or 2*N (self-loops)
         num_orig_edges = c2.numel()
         num_cls_edges = 2 * num_nodes
         num_self_loops = num_nodes + num_graphs if self.allow_self else num_graphs
@@ -127,12 +121,10 @@ class ETFaithfulGraphModel(nn.Module):
         u_aug = torch.empty(total_aug_edges, dtype=torch.long, device=device)
         
         curr = 0
-        # Original edges
         c_aug[curr : curr + num_orig_edges] = c2
         u_aug[curr : curr + num_orig_edges] = u2
         curr += num_orig_edges
         
-        # CLS <-> Node edges
         node_indices = torch.arange(num_nodes, device=device)
         c_aug[curr : curr + num_nodes] = node_indices
         u_aug[curr : curr + num_nodes] = node_cls_indices
@@ -141,7 +133,6 @@ class ETFaithfulGraphModel(nn.Module):
         u_aug[curr : curr + num_nodes] = node_indices
         curr += num_nodes
         
-        # Self-loops
         if self.allow_self:
             c_aug[curr : curr + num_nodes] = node_indices
             u_aug[curr : curr + num_nodes] = node_indices
@@ -151,16 +142,13 @@ class ETFaithfulGraphModel(nn.Module):
         u_aug[curr : curr + num_graphs] = cls_indices
         curr += num_graphs
         
-        # 3. Handle PE
         if hasattr(batch_data, "pe") and batch_data.pe is not None:
             pe = batch_data.pe
-            # Pre-allocated augmented PE
             pe_aug = torch.zeros((num_nodes + num_graphs, pe.size(-1)), dtype=dtype, device=device)
             pe_aug[:num_nodes] = pe.to(dtype=dtype)
             if self.pe_proj is not None:
                 X_aug.add_(self.pe_proj(pe_aug))
 
-        # RWSE
         if self.rwse_proj is not None and hasattr(batch_data, "rwse") and batch_data.rwse is not None:
             rwse = batch_data.rwse
             rwse_aug = torch.zeros((num_nodes + num_graphs, rwse.size(-1)), dtype=dtype, device=device)
@@ -173,24 +161,17 @@ class ETFaithfulGraphModel(nn.Module):
         if self.mask_mode != "official_dense" or self.mask_modulator is None:
             return None
         
-        # x is [N_aug, D]. We need to reshape it into [B, max_n_aug, D]
         ptr = batch_data.ptr
         num_graphs = ptr.numel() - 1
         num_original_nodes = ptr[-1].item()
         
-        # Max nodes in augmented graph: max(n_orig) + 1 (for CLS)
         max_n_orig = torch.diff(ptr).max().item()
         max_n_aug = int(max_n_orig + 1)
         
-        # Prepare dense x_batch
         x_dense = x.new_zeros((num_graphs, max_n_aug, self.d))
-        
-        # Map original nodes
         node_batch = batch_data.batch
         node_local = torch.arange(num_original_nodes, device=x.device) - ptr[node_batch]
-        # Augmented nodes have CLS at local 0, and original nodes at local 1..n
         x_dense[node_batch, node_local + 1] = x[node_indices]
-        # Map CLS tokens to local 0
         x_dense[torch.arange(num_graphs, device=x.device), 0] = x[cls_indices]
         
         edge_attr = getattr(batch_data, "edge_attr", None)
@@ -200,15 +181,10 @@ class ETFaithfulGraphModel(nn.Module):
         if edge_attr is not None:
             feat_dim = edge_attr.size(-1)
             e_dense = x.new_zeros((num_graphs, max_n_aug, max_n_aug, feat_dim))
-            # Original edges
             edge_batch = node_batch[c2]
             src_local = c2 - ptr[edge_batch] + 1
             dst_local = u2 - ptr[edge_batch] + 1
             e_dense[edge_batch, src_local, dst_local] = edge_attr.to(dtype=x.dtype)
-            
-            # CLS <-> Node edges in e_dense (local 0 <-> 1..n)
-            # We use zeros or a specific value for CLS edges? Default ET code uses 1.0 or specific features.
-            # Here we follow the logic that CLS is fully connected.
             e_dense[:, 0, :, :] = 1.0
             e_dense[:, :, 0, :] = 1.0
         else:
@@ -229,7 +205,6 @@ class ETFaithfulGraphModel(nn.Module):
         step = self.eta
         x = x_aug
         
-        # Initial dense cache if needed
         dense_cache = self._prepare_dense_cache(x, cls_indices, node_indices, batch_data)
         if dense_cache is None:
             dense_modulation = None
@@ -237,25 +212,22 @@ class ETFaithfulGraphModel(nn.Module):
         else:
             dense_modulation, dense_sizes = dense_cache
 
-        # Solver loop
         for block_idx in range(self.num_blocks):
             norm = self.norm_blocks[block_idx]
             core = self.core_blocks[block_idx]
-            for step_idx in range(self.num_steps):
+            for _ in range(self.num_steps):
                 g = norm(x)
-                # Analytical gradient call
                 e, grad_g = core.energy_and_grad(
                     g,
                     c_aug,
                     u_aug,
-                    None, # graph_chunks is no longer used
+                    None,
                     mask_mode=self.mask_mode,
                     dense_modulation=dense_modulation,
                     dense_sizes=dense_sizes,
                     static_projections=static_projections,
                 )
                 
-                # Pull back through norm
                 grad_x = norm.backward(x, grad_g)
 
                 noise = None
@@ -265,7 +237,6 @@ class ETFaithfulGraphModel(nn.Module):
                     gnorm = grad_x.norm(dim=-1, keepdim=True).clamp_min(1e-6)
                     grad_x = grad_x * (self.grad_clip_norm / gnorm).clamp(max=1.0)
 
-                # In-place update for efficiency
                 x.sub_(step * grad_x)
                 if noise is not None:
                     x.add_(torch.sqrt(step.clamp_min(1e-8)) * noise)
@@ -310,7 +281,6 @@ class ETFaithfulGraphModel(nn.Module):
         solver_stats = self._init_solver_stats('armijo')
         x = x_aug
 
-        # Pre-compute dense modulation
         dense_cache = self._prepare_dense_cache(x, cls_indices, node_indices, batch_data)
         if dense_cache is None:
             dense_modulation = None
@@ -349,7 +319,6 @@ class ETFaithfulGraphModel(nn.Module):
                     solver_stats['accepted'].append(True)
                     continue
 
-                # Chunked vectorized Armijo check
                 accepted_eta = 0.0
                 accepted_backtracks = armijo_max_backtracks
                 accepted_energy = float(e_t.detach().item())
@@ -401,12 +370,9 @@ class ETFaithfulGraphModel(nn.Module):
         x = x.to(dtype=self.cls_token.dtype)
 
         z_nodes = self.node_encoder(x)
-        x_aug, c_aug, u_aug, cls_pos, node_pos, graph_chunks = self._build_augmented_graph(batch_data, z_nodes)
+        x_aug, c_aug, u_aug, cls_pos, node_pos, _ = self._build_augmented_graph(batch_data, z_nodes)
         
-        # Motif bias hoisting
         static_projections = {}
-        # In ETFaithful, motifs are not yet fully active in the sparse path, 
-        # but if they were, we would hoist the T_tau here.
         
         if inference_mode == 'fixed':
             x_final, energy_trace = self._solve_dynamics(x_aug, c_aug, u_aug, cls_pos, node_pos, batch_data, static_projections=static_projections)

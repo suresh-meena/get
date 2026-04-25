@@ -4,7 +4,7 @@ import networkx as nx
 import numpy as np
 from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
 
-from get import FullGET, PairwiseGET, GINBaseline
+from get import FullGET, PairwiseGET, GINBaseline, GCNBaseline, GATBaseline
 from experiments.common import set_seed, GETTrainer, save_results
 
 def generate_csl_dataset(graphs_per_class=15, seed=42):
@@ -40,7 +40,9 @@ def main():
     model_factories = [
         ("PairwiseGET", lambda: PairwiseGET(1, int(64 * 1.73), 10)),
         ("FullGET", lambda: FullGET(1, 64, 10, R=2, lambda_3=0.5)),
-        ("GIN", lambda: GINBaseline(1, 64, 10))
+        ("GIN", lambda: GINBaseline(1, 64, 10)),
+        ("GCN", lambda: GCNBaseline(1, 64, 10)),
+        ("GAT", lambda: GATBaseline(1, 64, 10))
     ]
 
     for name, factory in model_factories:

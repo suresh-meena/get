@@ -1,24 +1,9 @@
 import torch
 import torch.nn as nn
 from types import SimpleNamespace
-from .energy import compute_energy_GET, compute_energy_and_grad_GET, _scatter_add_nd
-from .et_core import ETGraphMaskModulator, EnergyLayerNorm
-
-
-class StableMLP(nn.Module):
-    def __init__(self, in_dim, out_dim, hidden_dim=None, activation=nn.GELU, dropout=0.1, final_norm=True):
-        super().__init__()
-        hidden_dim = hidden_dim or out_dim
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            activation(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, out_dim)
-        )
-        self.norm = nn.LayerNorm(out_dim) if final_norm else nn.Identity()
-
-    def forward(self, x):
-        return self.norm(self.net(x))
+from get.energy import compute_energy_GET, compute_energy_and_grad_GET
+from get.energy.ops import scatter_add_nd as _scatter_add_nd, compute_degree_scaler, get_degree_from_incidence
+from get.nn import ETGraphMaskModulator, EnergyLayerNorm, StableMLP
 
 
 def _inv_softplus(x):
@@ -26,11 +11,12 @@ def _inv_softplus(x):
 
 
 class GETLayer(nn.Module):
-    def __init__(self, d=256, R=4, K=32, num_heads=1, head_dim=None, num_motif_types=2,
+    def __init__(self, d=256, R=4, K=32, num_heads=4, head_dim=None, num_motif_types=4,
                  lambda_2=1.0, lambda_3=0.5, lambda_m=1.0, beta_2=1.0, beta_3=1.0, beta_m=1.0,
                  grad_clip_norm=1.0, beta_max=5.0, state_clip_norm=10.0, update_damping=1.0, learn_update_damping=False,
                  pairwise_symmetric=False, noise_std=0.0, use_pairwise=True, use_motif=True, use_memory=True,
-                 norm_style="standard", pairwise_et_mask=False, pairwise_et_kernel_size=3):
+                 norm_style="standard", pairwise_et_mask=False, pairwise_et_kernel_size=3,
+                 use_pna_scaling=False, avg_degree=1.0):
         super().__init__()
         self.d = d
         self.num_heads = int(num_heads)
@@ -49,6 +35,8 @@ class GETLayer(nn.Module):
         self.use_memory = bool(use_memory)
         self.norm_style = str(norm_style)
         self.pairwise_et_mask = bool(pairwise_et_mask)
+        self.use_pna_scaling = bool(use_pna_scaling)
+        self.avg_degree = float(avg_degree)
 
         update_damping = min(max(float(update_damping), 1e-4), 1.0 - 1e-4)
         if learn_update_damping:
@@ -163,19 +151,19 @@ class GETLayer(nn.Module):
             'W_Q3': self.W_Q3, 'W_K3': self.W_K3, 'W_Qm': self.W_Qm, 'B_mem': self.B_mem,
         }
 
-    def compute_energy(self, X, batch_data, static_projections=None):
+    def compute_energy(self, X, batch_data, static_projections=None, degree_scaler=None):
         G = self.layernorm(X)
         projections = self._build_projections(G, static_projections, batch_data=batch_data)
         params = self.get_params_dict()
         params['num_heads'] = self.num_heads
         num_graphs = len(batch_data.ptr) - 1
-        return compute_energy_GET(X, G, batch_data.c_2, batch_data.u_2, batch_data.c_3, batch_data.u_3, batch_data.v_3, batch_data.t_tau, batch_data.batch, num_graphs, params, projections)
+        return compute_energy_GET(X, G, batch_data.c_2, batch_data.u_2, batch_data.c_3, batch_data.u_3, batch_data.v_3, batch_data.t_tau, batch_data.batch, num_graphs, params, projections, degree_scaler=degree_scaler)
 
-    def energy_and_grad(self, X, batch_data, static_projections=None, create_graph=False):
+    def energy_and_grad(self, X, batch_data, static_projections=None, create_graph=False, degree_scaler=None):
         if not hasattr(self.layernorm, "backward"):
             if not X.requires_grad:
                 X = X.requires_grad_(True)
-            E = self.compute_energy(X, batch_data, static_projections)
+            E = self.compute_energy(X, batch_data, static_projections, degree_scaler=degree_scaler)
             return E, torch.autograd.grad(E.sum(), X, create_graph=create_graph)[0]
 
         G = self.layernorm(X)
@@ -183,7 +171,7 @@ class GETLayer(nn.Module):
         params = self.get_params_dict()
         params['num_heads'] = self.num_heads
         num_graphs = len(batch_data.ptr) - 1
-        E, grad_X_quad, head_grads = compute_energy_and_grad_GET(X, G, batch_data.c_2, batch_data.u_2, batch_data.c_3, batch_data.u_3, batch_data.v_3, batch_data.t_tau, batch_data.batch, num_graphs, params, projections)
+        E, grad_X_quad, head_grads = compute_energy_and_grad_GET(X, G, batch_data.c_2, batch_data.u_2, batch_data.c_3, batch_data.u_3, batch_data.v_3, batch_data.t_tau, batch_data.batch, num_graphs, params, projections, degree_scaler=degree_scaler)
 
         grad_G_att = torch.zeros_like(G)
         W_Q2 = getattr(self, 'W_Q2', None)
@@ -219,9 +207,9 @@ class GETLayer(nn.Module):
         grad_X = grad_X_quad - self.layernorm.backward(X, grad_G_att)
         return E, grad_X
 
-    def forward(self, X, batch_data, step_size, static_projections=None, is_training=True, apply_clipping=True, inference_mode='fixed'):
+    def forward(self, X, batch_data, step_size, static_projections=None, is_training=True, apply_clipping=True, inference_mode='fixed', degree_scaler=None):
         if inference_mode == 'fixed':
-            E, grad_X = self.energy_and_grad(X, batch_data, static_projections, create_graph=is_training)
+            E, grad_X = self.energy_and_grad(X, batch_data, static_projections, create_graph=is_training, degree_scaler=degree_scaler)
             if apply_clipping:
                 gnorm = torch.norm(grad_X, dim=-1, keepdim=True)
                 grad_X = grad_X * (self.grad_clip_norm / gnorm.clamp(min=self.grad_clip_norm))
@@ -234,7 +222,7 @@ class GETLayer(nn.Module):
 
 
 class GETModel(nn.Module):
-    def __init__(self, in_dim, d=256, num_classes=1, num_steps=8, num_blocks=1, share_block_weights=False, tol=1e-4, compile=False, eta=0.05, eta_max=0.25, dropout=0.1, num_heads=1, head_dim=None, encoder_hidden_mult=2, readout_hidden_mult=2, pe_k=0, rwse_k=0, num_motif_types=2, use_cls_token=False, cls_self_loop=True, **layer_kwargs):
+    def __init__(self, in_dim, d=256, num_classes=1, num_steps=8, num_blocks=1, share_block_weights=False, tol=1e-4, compile=False, eta=0.05, eta_max=0.25, dropout=0.1, num_heads=4, head_dim=None, encoder_hidden_mult=2, readout_hidden_mult=2, pe_k=0, rwse_k=0, num_motif_types=4, use_cls_token=False, cls_self_loop=True, use_pna_scaling=False, avg_degree=1.0, **layer_kwargs):
         super().__init__()
         self.d = d
         self.num_steps = num_steps
@@ -246,6 +234,8 @@ class GETModel(nn.Module):
         self.rwse_k = rwse_k
         self.use_cls_token = bool(use_cls_token)
         self.cls_self_loop = bool(cls_self_loop)
+        self.use_pna_scaling = bool(use_pna_scaling)
+        self.avg_degree = float(avg_degree)
 
         if self.pe_k > 0:
             self.pe_proj = nn.Linear(pe_k, d)
@@ -254,10 +244,10 @@ class GETModel(nn.Module):
 
         self.node_encoder = StableMLP(in_dim, d, hidden_dim=max(d, encoder_hidden_mult * d), dropout=dropout, final_norm=True)
         if self.share_block_weights:
-            shared_layer = GETLayer(d, num_motif_types=num_motif_types, num_heads=num_heads, head_dim=head_dim, **layer_kwargs)
+            shared_layer = GETLayer(d, num_motif_types=num_motif_types, num_heads=num_heads, head_dim=head_dim, use_pna_scaling=use_pna_scaling, avg_degree=avg_degree, **layer_kwargs)
             self.get_layers = nn.ModuleList([shared_layer for _ in range(self.num_blocks)])
         else:
-            self.get_layers = nn.ModuleList([GETLayer(d, num_motif_types=num_motif_types, num_heads=num_heads, head_dim=head_dim, **layer_kwargs) for _ in range(self.num_blocks)])
+            self.get_layers = nn.ModuleList([GETLayer(d, num_motif_types=num_motif_types, num_heads=num_heads, head_dim=head_dim, use_pna_scaling=use_pna_scaling, avg_degree=avg_degree, **layer_kwargs) for _ in range(self.num_blocks)])
 
         eta = min(max(float(eta), 1e-4), eta_max - 1e-4)
         self.eta_logit = nn.Parameter(torch.logit(torch.tensor(eta / eta_max)))
@@ -374,16 +364,23 @@ class GETModel(nn.Module):
 
         X, solver_batch, cls_positions = self._augment_with_cls_token(X, batch_data)
         static_projections_list = self._build_static_projections(solver_batch)
+
+        degree_scaler = None
+        if self.use_pna_scaling:
+            num_nodes = solver_batch.num_nodes
+            degrees = get_degree_from_incidence(solver_batch.c_2, num_nodes)
+            degree_scaler = compute_degree_scaler(degrees, self.avg_degree, mode="pna")
+
         if inference_mode == 'fixed':
-            X, energy_trace, stats = self._run_fixed_solver(X, solver_batch, static_projections_list, training_mode=self.training)
+            X, energy_trace, stats = self._run_fixed_solver(X, solver_batch, static_projections_list, training_mode=self.training, degree_scaler=degree_scaler)
         elif inference_mode == 'armijo':
-            X, energy_trace, stats = self._run_armijo_solver(X, solver_batch, static_projections_list, **kwargs)
+            X, energy_trace, stats = self._run_armijo_solver(X, solver_batch, static_projections_list, degree_scaler=degree_scaler, **kwargs)
         else:
             raise ValueError(f"Unknown mode: {inference_mode}")
         out = self._readout(X, solver_batch, task_level, cls_positions)
         return (out, energy_trace, stats) if return_solver_stats else (out, energy_trace)
 
-    def _run_fixed_solver(self, X, solver_batch, static_projections_list, training_mode=True):
+    def _run_fixed_solver(self, X, solver_batch, static_projections_list, training_mode=True, degree_scaler=None):
         energy_trace = []
         eta = self.eta
         X_current = X
@@ -395,7 +392,7 @@ class GETModel(nn.Module):
                 X_prev = X_current.detach().clone() if (self.tol > 0 and step_idx % check_freq == 0) else None
                 
                 # Use the layer's forward which now returns next state and energy
-                X_next, E = layer(X_current, solver_batch, eta, static_projections, is_training=training_mode)
+                X_next, E = layer(X_current, solver_batch, eta, static_projections, is_training=training_mode, degree_scaler=degree_scaler)
                 energy_trace.append(E.detach())
                 X_current = X_next
                 
@@ -407,7 +404,7 @@ class GETModel(nn.Module):
                             break
         return X_current, energy_trace, {}
 
-    def _run_armijo_solver(self, X, batch_data, static_projections_list, armijo_c=0.1, armijo_gamma=0.5, armijo_eta0=0.2, armijo_max_backtracks=25, chunk_size=4):
+    def _run_armijo_solver(self, X, batch_data, static_projections_list, degree_scaler=None, armijo_c=0.1, armijo_gamma=0.5, armijo_eta0=0.2, armijo_max_backtracks=25, chunk_size=4):
         num_graphs = len(batch_data.ptr) - 1
         energy_trace = []
         stats = {'backtracks': [], 'steps': 0, 'step_sizes': [], 'accepted': []}
@@ -420,7 +417,7 @@ class GETModel(nn.Module):
         for block_idx, layer in enumerate(self.get_layers):
             static_projections = static_projections_list[block_idx]
             for step_idx in range(self.num_steps):
-                E_t, grad_X = layer.energy_and_grad(X_current, batch_data, static_projections=static_projections, create_graph=False)
+                E_t, grad_X = layer.energy_and_grad(X_current, batch_data, static_projections=static_projections, create_graph=False, degree_scaler=degree_scaler)
                 if self.tol > 0:
                     gnorm = torch.norm(grad_X) / (torch.norm(X_current) + 1e-6)
                     if gnorm < self.tol:
@@ -440,7 +437,7 @@ class GETModel(nn.Module):
                     
                     # Evaluate current chunk
                     X_tries = X_current.unsqueeze(0) - etas.view(-1, 1, 1) * grad_X.unsqueeze(0)
-                    E_tries = layer.compute_energy(X_tries, batch_data, static_projections=static_projections)
+                    E_tries = layer.compute_energy(X_tries, batch_data, static_projections=static_projections, degree_scaler=degree_scaler)
                     E_target = E_t.unsqueeze(0) - armijo_c * etas.view(-1, 1) * gn_sq_graph.unsqueeze(0)
                     
                     valid = (E_tries <= E_target)
@@ -469,13 +466,3 @@ class GETModel(nn.Module):
                 stats['accepted'].append(found_global.float().mean().item())
                 stats['steps'] += 1
         return X_current, energy_trace, stats
-
-
-class PairwiseGET(GETModel):
-    def __init__(self, in_dim, d=256, **kwargs):
-        super().__init__(in_dim, d, use_pairwise=True, use_motif=False, use_memory=False, **kwargs)
-
-
-class FullGET(GETModel):
-    def __init__(self, in_dim, d=256, **kwargs):
-        super().__init__(in_dim, d, **kwargs)
