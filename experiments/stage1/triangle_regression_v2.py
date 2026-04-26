@@ -6,7 +6,7 @@ from tqdm.auto import tqdm
 import numpy as np
 
 from get import FullGET, PairwiseGET, GINBaseline
-from experiments.common import build_dataloader_kwargs, set_seed, GETTrainer, save_results, split_grouped_dataset
+from experiments.common import set_seed, GETTrainer, save_results, split_grouped_dataset
 
 def generate_true_triangle_regression_dataset(num_graphs=2000, n_nodes=24, degree_range=(2, 6), seed=0):
     dataset = []
@@ -25,7 +25,7 @@ def generate_true_triangle_regression_dataset(num_graphs=2000, n_nodes=24, degre
         nswap = rng.randint(4, degree * n_nodes)
         try:
             nx.double_edge_swap(G, nswap=nswap, max_tries=nswap * 10, seed=rng.randint(0, 10**9))
-        except:
+        except nx.NetworkXAlgorithmError:
             pass
             
         tri_count = sum(nx.triangles(G).values()) // 3

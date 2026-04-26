@@ -20,8 +20,10 @@ Please run the stage-specific scripts directly from the `code/` directory.
 - `stage4/`: ET-style transfer tasks
   - `runner.py`: Unified runner for TU graph classification and YelpChi/Amazon anomaly detection.
   - `plot.py`: Generates publication-ready plots for Stage 4 outputs.
+- top-level `plot.py`: Common seaborn-based plotter for saved experiment JSON files.
 - `shared/`: Shared utilities
   - `common.py`: Shared functions, data splitting, and unified `GETTrainer`.
+  - `plotting.py`: Shared plotting helpers for loss, validation, and energy curves.
 
 ## Usage Example
 

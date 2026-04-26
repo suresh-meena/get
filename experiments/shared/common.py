@@ -608,6 +608,42 @@ class GETTrainer:
             metrics['metric'] = accuracy_score(all_y, all_preds)
         return metrics
 
+    def _capture_energy_trace(self, loader, inference_mode='armijo'):
+        try:
+            batch = next(iter(loader))
+        except StopIteration:
+            return []
+
+        self.model.eval()
+        batch = batch.to(self.device)
+        forward_kwargs = {'task_level': 'graph'}
+        signature = inspect.signature(self.model.forward)
+        if 'inference_mode' in signature.parameters:
+            forward_kwargs['inference_mode'] = inference_mode
+        if 'return_solver_stats' in signature.parameters:
+            forward_kwargs['return_solver_stats'] = False
+
+        try:
+            with torch.no_grad():
+                outputs = self.model(batch, **forward_kwargs)
+        except Exception:
+            return []
+
+        if not isinstance(outputs, tuple) or len(outputs) < 2:
+            return []
+
+        energy_trace = outputs[1]
+        if energy_trace is None:
+            return []
+
+        trace = []
+        for step_energy in energy_trace:
+            if isinstance(step_energy, torch.Tensor):
+                trace.append(float(step_energy.detach().float().mean().cpu().item()))
+            else:
+                trace.append(float(np.asarray(step_energy, dtype=np.float64).mean()))
+        return trace
+
     def run(self, train_ds, val_ds, test_ds, epochs, batch_size, collate_fn=collate_get_batch, use_armijo_at_test=True, use_weighted_loss=False):
         if use_weighted_loss:
             self._prepare_weighted_criterion(train_ds)
@@ -666,9 +702,13 @@ class GETTrainer:
         
         if best_state:
             self.model.load_state_dict(best_state, strict=False)
+
+        energy_trace = self._capture_energy_trace(test_loader, inference_mode='armijo' if use_armijo_at_test else 'fixed')
         
         # Use Armijo for the final test evaluation as per paper
         test_mode = 'armijo' if use_armijo_at_test else 'fixed'
         test_res = self.evaluate(test_loader, inference_mode=test_mode)
         test_res['history'] = history
+        if energy_trace:
+            test_res['energy_trace'] = energy_trace
         return test_res

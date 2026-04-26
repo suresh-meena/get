@@ -2,11 +2,8 @@ import torch
 import networkx as nx
 import numpy as np
 import argparse
-import matplotlib.pyplot as plt
-from torch_geometric.data import Data, Batch
-from get.models.get_model import GETModel
 from experiments.shared.common import GETTrainer, set_seed, save_results
-from experiments.stage1.wedge_discrimination import PairwiseGET, FullGET, GINBaseline
+from get import PairwiseGET, FullGET, GINBaseline
 
 def generate_srg_dataset(num_samples=500):
     """
@@ -25,7 +22,8 @@ def generate_srg_dataset(num_samples=500):
         for dx, dy in gens0:
             nx, ny = (x + dx) % 4, (y + dy) % 4
             u, v = node_to_idx[(x, y)], node_to_idx[(nx, ny)]
-            if u < v: edges0_base.append((u, v))
+            if u < v:
+                edges0_base.append((u, v))
 
     # Rook's Generators (All nodes in same row or column)
     edges1_base = []
@@ -34,11 +32,13 @@ def generate_srg_dataset(num_samples=500):
             # Row
             nx, ny = (x + i) % 4, y
             u, v = node_to_idx[(x, y)], node_to_idx[(nx, ny)]
-            if u < v: edges1_base.append((u, v))
+            if u < v:
+                edges1_base.append((u, v))
             # Column
             nx, ny = x, (y + i) % 4
             u, v = node_to_idx[(x, y)], node_to_idx[(nx, ny)]
-            if u < v: edges1_base.append((u, v))
+            if u < v:
+                edges1_base.append((u, v))
     
     # Remove duplicates from Rook's (since i=1 and i=3 might hit same edge)
     edges1_base = list(set(tuple(sorted(e)) for e in edges1_base))
@@ -84,13 +84,14 @@ def main():
     parser.add_argument("--task", type=str, default="srg", choices=["srg", "cycle"])
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--pe_k", type=int, default=8)
-    parser.add_argument("--no_pe", action="store_true", help="Test without positional encodings (Strict 1-WL check)")
+    parser.add_argument("--pe_k", type=int, default=0)
+    parser.add_argument("--inject_feature_noise", type=float, default=0.0, help="Std of Gaussian noise added to node features.")
     args = parser.parse_args()
 
-    if args.no_pe:
-        args.pe_k = 0
-        print("!!! WARNING: Running in NO-PE mode. This is a strict 1-WL expressivity test. !!!")
+    if args.pe_k > 0:
+        print(f"Using positional encodings with pe_k={args.pe_k}.")
+    else:
+        print("Running without positional encodings (default Stage-1 setting).")
 
     set_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -107,14 +108,15 @@ def main():
     val_ds = full_ds[400:450]
     test_ds = full_ds[450:]
     
-    # Symmetry-breaking noise for strict 1-WL tests
-    for d in train_ds + val_ds + test_ds:
-        d["x"] = torch.ones_like(d["x"]) + torch.randn_like(d["x"]) * 0.01
+    if args.inject_feature_noise > 0.0:
+        print(f"Injecting node feature noise std={args.inject_feature_noise}.")
+        for d in train_ds + val_ds + test_ds:
+            d["x"] = torch.ones_like(d["x"]) + torch.randn_like(d["x"]) * float(args.inject_feature_noise)
 
     # Models (Using the same stable hyperparams from Wedge Discrimination)
     # We use in_dim=1 (constant ones)
     in_dim = 1
-    pe_k = 0 if args.no_pe else args.pe_k
+    pe_k = args.pe_k
     models = [
         ("PairwiseGET", PairwiseGET(in_dim, 128, 1, num_steps=16, pe_k=pe_k, lambda_2=10.0, update_damping=0.05, grad_clip_norm=0.1), 5e-4),
         ("FullGET", FullGET(in_dim, 128, 1, num_steps=16, pe_k=pe_k, lambda_3=10.0, beta_3=5.0, update_damping=0.05, grad_clip_norm=0.1), 5e-4),

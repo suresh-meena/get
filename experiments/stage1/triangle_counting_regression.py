@@ -1,14 +1,32 @@
 import argparse
 import random
-import torch
+
 import networkx as nx
-from tqdm.auto import tqdm
 import numpy as np
+import torch
+from tqdm.auto import tqdm
 
-from get import FullGET, PairwiseGET, GINBaseline
-from experiments.common import build_dataloader_kwargs, set_seed, GETTrainer, save_results, split_grouped_dataset
+from experiments.common import GETTrainer, build_dataloader_kwargs, save_results, set_seed, split_grouped_dataset
+from experiments.stage1.common import (
+    build_stage1_graph_item,
+    match_pairwise_width,
+    prepare_stage1_graph,
+    summarize_stage1_support,
+)
+from get import FullGET, GINBaseline, PairwiseGET
 
-def generate_degree_controlled_triangle_dataset(num_graphs=2000, n_nodes=24, degree=4, seed=0):
+def generate_degree_controlled_triangle_dataset(
+    num_graphs=2000,
+    n_nodes=24,
+    degree=4,
+    seed=0,
+    rwse_k=0,
+    include_degree=False,
+    include_motif_counts=False,
+    support_mode="exact",
+    max_motifs=None,
+    feature_mode="core",
+):
     rows = []
     pbar = tqdm(total=num_graphs, desc="Generating Graphs")
     rng = random.Random(seed)
@@ -34,14 +52,25 @@ def generate_degree_controlled_triangle_dataset(num_graphs=2000, n_nodes=24, deg
     dataset = []
     for i, r in enumerate(rows):
         y = 1.0 if i in pos_set else 0.0
-        dataset.append({
-            "x": torch.ones(n_nodes, 1), 
-            "edges": list(r["graph"].edges()), 
-            "y": torch.tensor([y], dtype=torch.float32),
-            "degree": float(degree),
-            "graph_id": i,
-            "tri_count": r["tri_count"],
-        })
+        base_item = build_stage1_graph_item(
+            r["graph"],
+            y,
+            i,
+            rwse_k=0,
+            include_degree=include_degree,
+            include_motif_counts=include_motif_counts,
+        )
+        item = prepare_stage1_graph(
+            base_item,
+            feature_mode=feature_mode,
+            support_mode=support_mode,
+            max_motifs=max_motifs,
+            rwse_k=rwse_k,
+            seed=seed + i,
+        )
+        item["degree"] = float(degree)
+        item["tri_count"] = float(r["tri_count"])
+        dataset.append(item)
 
     pos_rate = float(np.mean([g["y"].item() for g in dataset]))
     print(
@@ -123,26 +152,95 @@ def main():
     parser.add_argument("--degree", type=int, default=4)
     parser.add_argument("--margin_loss_weight", type=float, default=0.05)
     parser.add_argument("--logit_margin", type=float, default=1.0)
+    parser.add_argument("--rwse_k", type=int, default=0)
+    parser.add_argument("--include_degree", action="store_true")
+    parser.add_argument("--include_motif_counts", action="store_true")
+    parser.add_argument(
+        "--support_mode",
+        type=str,
+        default="exact",
+        choices=["exact", "topB_closed_first", "topB_open_first", "random", "oracle", "full"],
+    )
+    parser.add_argument("--max_motifs", type=int, default=-1, help="Per-node support budget; negative means unlimited.")
+    parser.add_argument(
+        "--feature_mode",
+        type=str,
+        default="core",
+        choices=["core", "rwse", "static_motif"],
+        help="Stage-1 feature ablation mode.",
+    )
     args = parser.parse_args()
 
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    max_motifs = None if int(args.max_motifs) < 0 else int(args.max_motifs)
     dataset = generate_degree_controlled_triangle_dataset(
         num_graphs=args.num_graphs,
         n_nodes=args.n_nodes,
         degree=args.degree,
         seed=args.seed,
+        rwse_k=args.rwse_k,
+        include_degree=args.include_degree,
+        include_motif_counts=args.include_motif_counts,
+        support_mode=args.support_mode,
+        max_motifs=max_motifs,
+        feature_mode=args.feature_mode,
     )
     train_ds, val_ds, test_ds = split_grouped_dataset(dataset, "graph_id", seed=args.seed)
+    support_summary = summarize_stage1_support(dataset)
+    print(
+        "Support summary: "
+        f"candidate={int(support_summary['candidate_motif_count'])}, "
+        f"retained={int(support_summary['retained_motif_count'])}, "
+        f"retained_fraction={support_summary['retained_fraction']:.3f}"
+    )
+
+    in_dim = int(train_ds[0]["x"].size(-1)) if train_ds else int(dataset[0]["x"].size(-1))
+    match = match_pairwise_width(
+        in_dim,
+        1,
+        96,
+        full_kwargs={
+            "num_steps": 8,
+            "R": 2,
+            "lambda_3": 0.8,
+            "lambda_m": 1.0,
+            "beta_2": 1.0,
+            "beta_3": 1.2,
+            "eta": 0.008,
+            "eta_max": 0.04,
+            "grad_clip_norm": 0.3,
+            "state_clip_norm": 5.0,
+            "beta_max": 3.0,
+            "update_damping": 0.5,
+            "dropout": 0.0,
+            "compile": False,
+        },
+        pairwise_kwargs={
+            "num_steps": 8,
+            "eta": 0.01,
+            "eta_max": 0.05,
+            "beta_2": 1.0,
+            "grad_clip_norm": 0.5,
+            "state_clip_norm": 5.0,
+            "beta_max": 3.0,
+        },
+    )
+    pairwise_d = match["pairwise_width"]
+    print(
+        f"Matched PairwiseGET width={pairwise_d} against FullGET d=96 "
+        f"(params {match['pairwise_params']} vs {match['full_params']}, rel err {match['relative_error']:.3%})"
+    )
 
     results = {}
     models = [
-        ("PairwiseGET", PairwiseGET(1, int(96 * 1.73), 1, num_steps=8, eta=0.01, eta_max=0.05, beta_2=1.0, grad_clip_norm=0.5, state_clip_norm=5.0, beta_max=3.0), 1e-4, 0.5),
-        ("FullGET", FullGET(1, 96, 1, num_steps=8, R=2, lambda_3=0.8, lambda_m=1.0, beta_2=1.0, beta_3=1.2, eta=0.008, eta_max=0.04, grad_clip_norm=0.3, state_clip_norm=5.0, beta_max=3.0, update_damping=0.5, dropout=0.0, compile=False), 3e-5, 0.3),
-        ("GIN", GINBaseline(1, 96, 1, num_layers=4), 2e-4, 1.0),
+        ("PairwiseGET", lambda: PairwiseGET(in_dim, pairwise_d, 1, num_steps=8, eta=0.01, eta_max=0.05, beta_2=1.0, grad_clip_norm=0.5, state_clip_norm=5.0, beta_max=3.0), 1e-4, 0.5),
+        ("FullGET", lambda: FullGET(in_dim, 96, 1, num_steps=8, R=2, lambda_3=0.8, lambda_m=1.0, beta_2=1.0, beta_3=1.2, eta=0.008, eta_max=0.04, grad_clip_norm=0.3, state_clip_norm=5.0, beta_max=3.0, update_damping=0.5, dropout=0.0, compile=False), 3e-5, 0.3),
+        ("GIN", lambda: GINBaseline(in_dim, 96, 1, num_layers=4), 2e-4, 1.0),
     ]
 
-    for name, model, lr, max_grad_norm in models:
+    for name, model_fn, lr, max_grad_norm in models:
+        model = model_fn()
         print(f"\n--- Training {name} ---")
         trainer = GETTrainer(
             model,
@@ -151,7 +249,7 @@ def main():
             lr=lr,
             max_grad_norm=max_grad_norm,
         )
-        _ = trainer.run(train_ds, val_ds, test_ds, args.epochs, args.batch_size)
+        train_res = trainer.run(train_ds, val_ds, test_ds, args.epochs, args.batch_size)
         
         y_pred, y_true = _predict(model, test_ds, batch_size=args.batch_size, device=device)
         degs = np.array([g["degree"] for g in test_ds], dtype=np.float64)
@@ -166,10 +264,14 @@ def main():
             'spearman': spearman_val,
             'rmse_deg_residual': deg_res['rmse_deg_residual'],
             'spearman_deg_residual': deg_res['spearman_deg_residual'],
+            'history': train_res.get('history', {}),
         }
+        if train_res.get('energy_trace'):
+            res['energy_trace'] = train_res['energy_trace']
         results[name] = res
         print(f"{name} Test MAE: {res['mae']:.4f}, RMSE: {res['rmse']:.4f}, Spearman: {res['spearman']:.4f}, Deg-Resid Spearman: {res['spearman_deg_residual']:.4f}")
 
+    results["_support_summary"] = support_summary
     save_results("exp2_triangle_results", results)
 
 if __name__ == "__main__":

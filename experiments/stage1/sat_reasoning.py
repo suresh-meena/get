@@ -11,7 +11,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from get import FullGET, PairwiseGET, collate_get_batch  # noqa: E402
-from experiments.common import set_seed, build_dataloader_kwargs, get_num_params  # noqa: E402
+from experiments.common import set_seed, build_dataloader_kwargs, get_num_params, save_results  # noqa: E402
 
 def generate_random_3cnf(num_vars=20, num_clauses=80, seed=42):
     rng = random.Random(seed)
@@ -226,6 +226,7 @@ def train(model, train_loader, val_loader, test_loader, epochs, device, model_na
     best_val_loss = float('inf')
     best_test_metrics = (float('inf'), 0.0, 0.0) 
     param_cnt = get_num_params(model)
+    history = {"train_loss": [], "val_loss": []}
     pbar = tqdm(range(epochs), desc=f"Train {model_name} [{param_cnt}]", bar_format='{l_bar}{bar:20}{r_bar}', leave=False)
     
     for epoch in pbar:
@@ -250,6 +251,8 @@ def train(model, train_loader, val_loader, test_loader, epochs, device, model_na
                 loss = compute_loss(logits, batch, xor=xor)
                 val_loss += loss.item()
         val_loss /= max(1, len(val_loader))
+        history["train_loss"].append(train_loss / max(1, len(train_loader)))
+        history["val_loss"].append(val_loss)
         epoch_time = time.time() - t0
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -270,7 +273,24 @@ def train(model, train_loader, val_loader, test_loader, epochs, device, model_na
             best_test_metrics = (test_loss, np.mean(ratios), np.mean(solved_list))
         metrics_str = f"L: {train_loss/max(1, len(train_loader)):.4f} | V: {val_loss:.4f} | B: {best_test_metrics[0]:.4f} | {epoch_time:.1f}s/ep"
         pbar.set_postfix_str(metrics_str)
-    return best_test_metrics
+
+    energy_trace = []
+    try:
+        model.eval()
+        sample_batch = next(iter(test_loader)).to(device)
+        with torch.no_grad():
+            _, energy_trace_raw = model(sample_batch, task_level="node", inference_mode="armijo")
+        energy_trace = [float(step.detach().float().mean().cpu().item()) for step in energy_trace_raw]
+    except Exception:
+        energy_trace = []
+
+    return {
+        "test_loss": float(best_test_metrics[0]),
+        "clause_ratio": float(best_test_metrics[1]),
+        "solved_ratio": float(best_test_metrics[2]),
+        "history": history,
+        "energy_trace": energy_trace,
+    }
 
 def main():
     parser = argparse.ArgumentParser()
@@ -293,9 +313,13 @@ def main():
         "PairwiseGET": PairwiseGET(4, int(args.hidden_dim * 1.73), 1, num_steps=8),
         "FullGET": FullGET(4, args.hidden_dim, 1, num_steps=8, R=2, lambda_3=1.0, lambda_m=1.0, num_motif_types=24),
     }
+    results = {}
     for name, model in models.items():
-        test_loss, clause_ratio, solved_ratio = train(model, train_loader, val_loader, test_loader, args.epochs, device, model_name=name, xor=args.xor)
-        print(f"{name} Test Loss: {test_loss:.4f} | Satisfied Clause Ratio: {clause_ratio:.4f} | Solved Accuracy: {solved_ratio:.4f}")
+        res = train(model, train_loader, val_loader, test_loader, args.epochs, device, model_name=name, xor=args.xor)
+        results[name] = res
+        print(f"{name} Test Loss: {res['test_loss']:.4f} | Satisfied Clause Ratio: {res['clause_ratio']:.4f} | Solved Accuracy: {res['solved_ratio']:.4f}")
+
+    save_results("exp1_sat_reasoning", results)
 
 if __name__ == "__main__":
     main()

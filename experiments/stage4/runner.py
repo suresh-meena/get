@@ -10,6 +10,8 @@ import statistics
 from types import SimpleNamespace
 import sys
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -182,7 +184,7 @@ def make_synth_anomaly_dataset(num_graphs: int, in_dim: int, seed: int) -> list[
 class FitResult:
     metric: float
     history: dict[str, list[float]]
-    extra: dict[str, float]
+    extra: dict[str, float | list[float]]
 
 
 def _normalized_name(name: str) -> str:
@@ -644,7 +646,11 @@ def _train_graph_binary_with_val(
         metrics_str = f"L: {train_loss:.3f} | V: {val_auc:.3f} | B: {best['test_auc']:.3f} | {epoch_time:.1f}s/ep"
         epoch_bar.set_postfix_str(metrics_str)
 
-    return FitResult(metric=best["test_auc"], history=history, extra={"best_test_f1": best["test_f1"]})
+    energy_trace = _capture_energy_trace(model, test_loader, device, task_level="graph")
+    extra: dict[str, float | list[float]] = {"best_test_f1": best["test_f1"]}
+    if energy_trace:
+        extra["energy_trace"] = energy_trace
+    return FitResult(metric=best["test_auc"], history=history, extra=extra)
 
 
 def _mean_std(xs: list[float]) -> tuple[float, float]:
@@ -668,6 +674,44 @@ def _recommend_anomaly_batch_size(dataset: list[dict], requested: int) -> int:
     dynamic_cap = max(1, node_budget // max_nodes)
     safe_batch = min(int(requested), dynamic_cap, hard_cap)
     return max(1, int(safe_batch))
+
+
+def _capture_energy_trace(model: torch.nn.Module, loader: DataLoader, device: str, task_level: str = "graph") -> list[float]:
+    try:
+        batch = next(iter(loader))
+    except StopIteration:
+        return []
+
+    model.eval()
+    forward_kwargs = {"task_level": task_level}
+    import inspect
+
+    signature = inspect.signature(model.forward)
+    if "inference_mode" in signature.parameters:
+        forward_kwargs["inference_mode"] = "armijo"
+    if "return_solver_stats" in signature.parameters:
+        forward_kwargs["return_solver_stats"] = False
+
+    try:
+        with torch.no_grad():
+            outputs = model(batch.to(device), **forward_kwargs)
+    except Exception:
+        return []
+
+    if not isinstance(outputs, tuple) or len(outputs) < 2:
+        return []
+
+    energy_trace = outputs[1]
+    if energy_trace is None:
+        return []
+
+    trace: list[float] = []
+    for step_energy in energy_trace:
+        if isinstance(step_energy, torch.Tensor):
+            trace.append(float(step_energy.detach().float().mean().cpu().item()))
+        else:
+            trace.append(float(np.asarray(step_energy, dtype=np.float64).mean()))
+    return trace
 
 
 def run_graph_classification(args: argparse.Namespace) -> dict:
@@ -818,6 +862,11 @@ def run_graph_classification(args: argparse.Namespace) -> dict:
                         "fullget": full_res.history,
                         "et_faithful": et_res.history,
                     },
+                    "energy_traces": {
+                        "pairwise": pair_res.extra.get("energy_trace"),
+                        "fullget": full_res.extra.get("energy_trace"),
+                        "et_faithful": et_res.extra.get("energy_trace"),
+                    },
                 }
                 if gin is not None:
                     gin_res = _train_graph_classification(
@@ -825,6 +874,7 @@ def run_graph_classification(args: argparse.Namespace) -> dict:
                     )
                     fold_run["gin_acc"] = gin_res.metric
                     fold_run["histories"]["gin"] = gin_res.history
+                    fold_run["energy_traces"]["gin"] = gin_res.extra.get("energy_trace")
                 fold_runs.append(fold_run)
 
             if not fold_runs:
