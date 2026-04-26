@@ -437,15 +437,22 @@ class GETTrainer:
         self.lr = kwargs.get('lr', 1e-3)
         self.weight_decay = kwargs.get('weight_decay', 1e-5)
         self.max_grad_norm = kwargs.get('max_grad_norm', 1.0)
+        self.max_grad_val = kwargs.get('max_grad_val', 0.01) # Hard value clip
+        self.opt_type = kwargs.get('opt_type', 'adam')
         self.margin_loss_weight = float(kwargs.get('margin_loss_weight', 0.0))
         self.logit_margin = float(kwargs.get('logit_margin', 1.0))
+        
         self.use_amp = (device == 'cuda' or 'cuda' in str(device))
         self.autocast_device_type = torch.device(self.device).type
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
         self.supports_armijo = 'inference_mode' in inspect.signature(self.model.forward).parameters
         self.validate_batches = bool(kwargs.get('validate_batches', True))
         
-        self.optimizer = build_adamw_optimizer(self.model, lr=self.lr, weight_decay=self.weight_decay)
+        if self.opt_type == 'sgd':
+            self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=0.9, weight_decay=self.weight_decay)
+        else:
+            self.optimizer = build_adamw_optimizer(self.model, lr=self.lr, weight_decay=self.weight_decay)
+            
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode='min' if task_type == 'regression' else 'max', 
             factor=0.5, patience=10
@@ -532,11 +539,13 @@ class GETTrainer:
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                torch.nn.utils.clip_grad_value_(self.model.parameters(), self.max_grad_val)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                torch.nn.utils.clip_grad_value_(self.model.parameters(), self.max_grad_val)
                 self.optimizer.step()
             total_loss += loss.item()
         return total_loss / max(len(loader), 1)
@@ -618,12 +627,28 @@ class GETTrainer:
         param_cnt = get_num_params(self.model)
         pbar = tqdm(range(epochs), desc=f"Train {self.model_name} [{param_cnt}]", bar_format='{l_bar}{bar:20}{r_bar}')
         
+        history = {'train_loss': [], 'val_metric': []}
         for epoch in pbar:
             t0 = time.time()
             train_loss = self.train_epoch(train_loader)
+            # Diagnostic: Print motif gradient norms if they exist
+            if epoch % 5 == 0 or epoch == epochs - 1:
+                motif_grad_norm = 0.0
+                count = 0
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        # Try to identify motif parameters by their shape or if they are in the GETLayer
+                        if p.shape == torch.Size([]) or (p.dim() > 1 and p.shape[-1] == self.model.d if hasattr(self.model, 'd') else False):
+                            motif_grad_norm += p.grad.norm().item()
+                            count += 1
+                if count > 0:
+                    print(f"Epoch {epoch} | Avg Param Grad Norm: {motif_grad_norm/count:.6f}")
             # Use fixed during validation for speed
             val_res = self.evaluate(val_loader, inference_mode='fixed')
             epoch_time = time.time() - t0
+            
+            history['train_loss'].append(train_loss)
+            history['val_metric'].append(val_res['metric'])
             
             self.scheduler.step(val_res['loss'] if self.task_type == 'regression' else val_res['metric'])
             
@@ -644,4 +669,6 @@ class GETTrainer:
         
         # Use Armijo for the final test evaluation as per paper
         test_mode = 'armijo' if use_armijo_at_test else 'fixed'
-        return self.evaluate(test_loader, inference_mode=test_mode)
+        test_res = self.evaluate(test_loader, inference_mode=test_mode)
+        test_res['history'] = history
+        return test_res

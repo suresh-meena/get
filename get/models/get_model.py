@@ -393,6 +393,11 @@ class GETModel(nn.Module):
                 
                 # Use the layer's forward which now returns next state and energy
                 X_next, E = layer(X_current, solver_batch, eta, static_projections, is_training=training_mode, degree_scaler=degree_scaler)
+                
+                # RE-NORMALIZE state to prevent Energy Slingshot (NaNs)
+                # This keeps node features on the stable energy manifold
+                X_next = layer.layernorm(X_next)
+                
                 energy_trace.append(E.detach())
                 X_current = X_next
                 

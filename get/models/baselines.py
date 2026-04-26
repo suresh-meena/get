@@ -7,7 +7,7 @@ import torch.nn as nn
 
 
 class GINBaseline(nn.Module):
-    def __init__(self, in_dim, d, num_classes, num_layers=3):
+    def __init__(self, in_dim, d, num_classes, num_layers=3, dropout=0.1):
         super().__init__()
         try:
             from torch_geometric.nn import GINConv, global_add_pool
@@ -16,17 +16,32 @@ class GINBaseline(nn.Module):
         self.encoder = nn.Linear(in_dim, d)
         self.global_add_pool = global_add_pool
         self.convs = nn.ModuleList()
+        self.bns = nn.ModuleList()
+        self.dropout = dropout
         for _ in range(num_layers):
-            mlp = nn.Sequential(nn.Linear(d, d), nn.ReLU(), nn.Linear(d, d))
+            mlp = nn.Sequential(
+                nn.Linear(d, 2 * d),
+                nn.BatchNorm1d(2 * d),
+                nn.ReLU(),
+                nn.Linear(2 * d, d)
+            )
             self.convs.append(GINConv(mlp))
-        self.readout = nn.Sequential(nn.Linear(d, d), nn.ReLU(), nn.Linear(d, num_classes))
+            self.bns.append(nn.BatchNorm1d(d))
+        self.readout = nn.Sequential(
+            nn.Linear(d, d),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d, num_classes)
+        )
 
     def forward(self, batch_data, task_level='graph'):
         x = self.encoder(batch_data.x)
         edge_index = torch.stack([batch_data.c_2, batch_data.u_2], dim=0)
-        for conv in self.convs:
+        for conv, bn in zip(self.convs, self.bns):
             x = conv(x, edge_index)
+            x = bn(x)
             x = torch.relu(x)
+            x = torch.dropout(x, p=self.dropout, train=self.training)
         if task_level == 'graph':
             x = self.global_add_pool(x, batch_data.batch)
         return self.readout(x), None

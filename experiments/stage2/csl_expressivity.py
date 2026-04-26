@@ -4,7 +4,7 @@ import networkx as nx
 import numpy as np
 from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
 
-from get import FullGET, PairwiseGET, GINBaseline, GCNBaseline, GATBaseline
+from get import FullGET, PairwiseGET, GINBaseline, GCNBaseline, GATBaseline, CachedGraphDataset
 from experiments.common import set_seed, GETTrainer, save_results
 
 def generate_csl_dataset(graphs_per_class=15, seed=42):
@@ -28,18 +28,25 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--rwse_k", type=int, default=16)
     args = parser.parse_args()
 
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dataset, labels = generate_csl_dataset()
+    raw_dataset, labels = generate_csl_dataset()
+    
+    if args.rwse_k > 0:
+        print(f"Computing RWSE (k={args.rwse_k})...")
+        dataset = CachedGraphDataset(raw_dataset, name="CSL", rwse_k=args.rwse_k)
+    else:
+        dataset = raw_dataset
     
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=args.seed)
     results = {}
 
     model_factories = [
-        ("PairwiseGET", lambda: PairwiseGET(1, int(64 * 1.73), 10)),
-        ("FullGET", lambda: FullGET(1, 64, 10, R=2, lambda_3=0.5)),
+        ("PairwiseGET", lambda: PairwiseGET(1, int(64 * 1.73), 10, rwse_k=args.rwse_k)),
+        ("FullGET", lambda: FullGET(1, 64, 10, R=2, lambda_3=0.5, rwse_k=args.rwse_k)),
         ("GIN", lambda: GINBaseline(1, 64, 10)),
         ("GCN", lambda: GCNBaseline(1, 64, 10)),
         ("GAT", lambda: GATBaseline(1, 64, 10))
@@ -49,7 +56,6 @@ def main():
         print(f"\n--- CV for {name} ---")
         fold_accs = []
         for fold, (train_idx, test_idx) in enumerate(skf.split(np.zeros(len(labels)), labels)):
-            # Stage-2 protocol: 3:1:1 train/val/test.
             y_train_full = labels[train_idx]
             splitter = StratifiedShuffleSplit(n_splits=1, test_size=0.25, random_state=args.seed + fold)
             train_sub_idx, val_sub_idx = next(splitter.split(np.zeros(len(train_idx)), y_train_full))
