@@ -1,14 +1,77 @@
 {
   "PairwiseGET": {
-    "loss": 0.7117958068847656,
-    "metric": 0.5
+    "mae": 0.5,
+    "rmse": 0.6776008174780184,
+    "spearman": 0.0,
+    "rmse_deg_residual": 0.5,
+    "spearman_deg_residual": 0.0,
+    "history": {
+      "train_loss": [
+        0.48319578170776367
+      ],
+      "val_metric": [
+        0.5
+      ]
+    },
+    "energy_trace": [
+      1345.40478515625,
+      848.6581420898438,
+      530.7325439453125,
+      327.2467956542969,
+      196.9959716796875,
+      113.60391235351562,
+      60.183982849121094,
+      25.918651580810547
+    ]
   },
   "FullGET": {
-    "loss": 0.6986458659172058,
-    "metric": 0.7366666666666666
+    "mae": 0.9544034202893575,
+    "rmse": 1.077444210963128,
+    "spearman": 0.09759000729485331,
+    "rmse_deg_residual": 0.5000001390779137,
+    "spearman_deg_residual": 0.09759000729485331,
+    "history": {
+      "train_loss": [
+        0.9541015625
+      ],
+      "val_metric": [
+        0.9541015625
+      ]
+    },
+    "energy_trace": [
+      1025.521240234375,
+      610.84716796875,
+      345.44134521484375,
+      175.55914306640625,
+      66.79977416992188,
+      -2.8607165813446045,
+      -47.52819061279297,
+      -76.24722290039062
+    ]
   },
   "GIN": {
-    "loss": 0.6933117628097534,
-    "metric": 0.5
+    "mae": 7.250874996185303,
+    "rmse": 7.268093849855354,
+    "spearman": 0.0,
+    "rmse_deg_residual": 0.5,
+    "spearman_deg_residual": 0.0,
+    "history": {
+      "train_loss": [
+        1.743401288986206
+      ],
+      "val_metric": [
+        7.25390625
+      ]
+    }
+  },
+  "_support_summary": {
+    "num_graphs": 40.0,
+    "candidate_motif_count": 1943.0,
+    "retained_motif_count": 1865.0,
+    "candidate_closed": 195.0,
+    "candidate_open": 1748.0,
+    "retained_closed": 195.0,
+    "retained_open": 1670.0,
+    "retained_fraction": 0.9598558929490478
   }
 }
