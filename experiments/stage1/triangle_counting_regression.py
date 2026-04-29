@@ -43,15 +43,10 @@ def generate_degree_controlled_triangle_dataset(
         pbar.update(1)
 
     counts = np.array([r["tri_count"] for r in rows], dtype=np.float64)
-    median_count = float(np.median(counts))
-    target_pos = num_graphs // 2
-    ranked = list(range(num_graphs))
-    ranked.sort(key=lambda i: (counts[i], rng.random()))
-    pos_set = set(ranked[-target_pos:])
 
     dataset = []
     for i, r in enumerate(rows):
-        y = 1.0 if i in pos_set else 0.0
+        y = float(r["tri_count"])
         base_item = build_stage1_graph_item(
             r["graph"],
             y,
@@ -72,11 +67,9 @@ def generate_degree_controlled_triangle_dataset(
         item["tri_count"] = float(r["tri_count"])
         dataset.append(item)
 
-    pos_rate = float(np.mean([g["y"].item() for g in dataset]))
     print(
-        f"Triangle threshold (median): {median_count:.1f}, "
         f"count range: [{counts.min():.0f}, {counts.max():.0f}], "
-        f"positive rate: {pos_rate:.3f}"
+        f"mean: {counts.mean():.2f}, std: {counts.std():.2f}"
     )
     return dataset
 

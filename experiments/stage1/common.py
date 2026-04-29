@@ -53,8 +53,10 @@ def _graph_to_csr(graph_item: dict) -> tuple[int, np.ndarray, np.ndarray]:
 
 
 def _canonical_motif_mask(c_3: torch.Tensor, u_3: torch.Tensor, v_3: torch.Tensor) -> torch.Tensor:
-    # Keep one canonical orientation per motif support tuple to avoid multi-center duplicates.
-    return (c_3 < u_3) & (c_3 < v_3)
+    # Stage-1 tests should match the model definition: every node can anchor
+    # its own neighbor-pair motifs. Do not drop triangle copies anchored at
+    # other vertices, because that changes the intended order-3 support.
+    return torch.ones_like(c_3, dtype=torch.bool)
 
 
 def _select_support_indices(

@@ -24,11 +24,12 @@ def generate_random_3cnf(num_vars=20, num_clauses=80, seed=42):
         clauses.append(list(zip(vars, signs)))
     return num_vars, clauses
 
-def build_sat_factor_graph(num_vars, clauses, xor=False):
+def build_sat_factor_graph(num_vars, clauses, xor=False, parity_seed=None):
     num_clauses = len(clauses)
     num_nodes = num_vars + num_clauses
     
     edges = []
+    edge_attr = []
     c_3, u_3, v_3, t_tau = [], [], [], []
     
     # Motif type map
@@ -39,17 +40,11 @@ def build_sat_factor_graph(num_vars, clauses, xor=False):
         pair_idx = {(0,1): 0, (0,2): 1, (1,2): 2}[(r, s)]
         return sign_idx * 3 + pair_idx
 
-    var_deg_pos = [0] * num_vars
-    var_deg_neg = [0] * num_vars
-    
     for a, clause in enumerate(clauses):
         c_idx = num_vars + a
         for r, (v_idx, sign) in enumerate(clause):
             edges.append((v_idx, c_idx)) # undirected handled by GET logic
-            if sign > 0:
-                var_deg_pos[v_idx] += 1
-            else:
-                var_deg_neg[v_idx] += 1
+            edge_attr.append([float(sign)])
         
         # 3 wedges per clause
         s1, s2, s3 = [s for v, s in clause]
@@ -65,19 +60,17 @@ def build_sat_factor_graph(num_vars, clauses, xor=False):
     # Vars: type 0
     for i in range(num_vars):
         x[i, 0] = 0.0 # type
-        x[i, 1] = var_deg_pos[i]
-        x[i, 2] = var_deg_neg[i]
+        x[i, 1] = 0.0
+        x[i, 2] = 0.0
         x[i, 3] = 0.0
     
     # Clauses: type 1
     for a, clause in enumerate(clauses):
         c_idx = num_vars + a
-        pos_cnt = sum(1 for v, s in clause if s > 0)
-        neg_cnt = sum(1 for v, s in clause if s < 0)
         x[c_idx, 0] = 1.0 # type
-        x[c_idx, 1] = 3.0 # fixed degree
-        x[c_idx, 2] = pos_cnt
-        x[c_idx, 3] = neg_cnt
+        x[c_idx, 1] = 0.0
+        x[c_idx, 2] = 0.0
+        x[c_idx, 3] = 0.0
 
     # Store clause definitions in the graph dict for loss computation
     clause_tensor = torch.zeros(num_clauses, 3, 2, dtype=torch.long)
@@ -86,11 +79,17 @@ def build_sat_factor_graph(num_vars, clauses, xor=False):
             clause_tensor[a, r, 0] = v
             clause_tensor[a, r, 1] = 1 if s > 0 else 0
 
-    parity_bits = torch.randint(0, 2, (num_clauses,), dtype=torch.float32) if xor else torch.zeros(num_clauses)
+    if xor:
+        gen = torch.Generator()
+        gen.manual_seed(int(0 if parity_seed is None else parity_seed))
+        parity_bits = torch.randint(0, 2, (num_clauses,), dtype=torch.float32, generator=gen)
+    else:
+        parity_bits = torch.zeros(num_clauses)
             
     return {
         "x": x,
         "edges": edges,
+        "edge_attr": torch.tensor(edge_attr, dtype=torch.float32),
         "c_3": torch.tensor(c_3, dtype=torch.long),
         "u_3": torch.tensor(u_3, dtype=torch.long),
         "v_3": torch.tensor(v_3, dtype=torch.long),
@@ -104,8 +103,11 @@ def generate_dataset(num_graphs, num_vars=20, num_clauses=80, xor=False, seed=42
     rng = random.Random(seed)
     dataset = []
     for i in range(num_graphs):
-        nv, clauses = generate_random_3cnf(num_vars, num_clauses, seed=rng.randint(0, 1000000))
-        g = build_sat_factor_graph(nv, clauses, xor=xor)
+        formula_seed = rng.randint(0, 1000000)
+        parity_seed = rng.randint(0, 1000000)
+        nv, clauses = generate_random_3cnf(num_vars, num_clauses, seed=formula_seed)
+        g = build_sat_factor_graph(nv, clauses, xor=xor, parity_seed=parity_seed)
+        g["graph_id"] = i
         dataset.append(g)
     return dataset
 
@@ -298,10 +300,11 @@ def main():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--xor", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
-    set_seed(42)
+    set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dataset = generate_dataset(args.num_graphs, num_vars=20, num_clauses=80, xor=args.xor)
+    dataset = generate_dataset(args.num_graphs, num_vars=20, num_clauses=80, xor=args.xor, seed=args.seed)
     split1, split2 = int(0.6 * args.num_graphs), int(0.8 * args.num_graphs)
     train_ds, val_ds, test_ds = dataset[:split1], dataset[split1:split2], dataset[split2:]
     from torch.utils.data import DataLoader

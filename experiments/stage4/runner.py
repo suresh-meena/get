@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import torch  # noqa: E402
+from torch.nn.parameter import UninitializedParameter  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
 from tqdm.auto import tqdm  # noqa: E402
 
@@ -43,9 +44,10 @@ except Exception:
     GINBaseline = None
 
 try:
-    from sklearn.model_selection import StratifiedKFold
+    from sklearn.model_selection import StratifiedKFold, train_test_split
 except Exception:
     StratifiedKFold = None
+    train_test_split = None
 
 
 TU8_DATASETS = [
@@ -355,6 +357,20 @@ def _prepare_get_cached_dataset(
     return wrapped.cached_data
 
 
+def _add_cached_structural_features(dataset: list[dict]) -> list[dict]:
+    augmented = []
+    for item in dataset:
+        copied = dict(item)
+        feats = [copied["x"]]
+        if copied.get("pe") is not None:
+            feats.append(copied["pe"].to(dtype=copied["x"].dtype))
+        if copied.get("rwse") is not None:
+            feats.append(copied["rwse"].to(dtype=copied["x"].dtype))
+        copied["x"] = torch.cat(feats, dim=-1)
+        augmented.append(copied)
+    return augmented
+
+
 def _build_optimizer(model: torch.nn.Module, lr: float, wd: float) -> torch.optim.Optimizer:
     return torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(wd))
 
@@ -362,6 +378,7 @@ def _build_optimizer(model: torch.nn.Module, lr: float, wd: float) -> torch.opti
 def _train_graph_classification(
     model: torch.nn.Module,
     train_ds: list[dict],
+    val_ds: list[dict],
     test_ds: list[dict],
     epochs: int,
     batch_size: int,
@@ -385,6 +402,13 @@ def _train_graph_classification(
         collate_fn=collate_get_batch,
         **loader_kwargs,
     )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_get_batch,
+        **loader_kwargs,
+    )
     test_loader = DataLoader(
         test_ds,
         batch_size=batch_size,
@@ -393,8 +417,10 @@ def _train_graph_classification(
         **loader_kwargs,
     )
 
-    history = {"train_loss": [], "test_acc": [], "bad_batches": []}
+    history = {"train_loss": [], "val_acc": [], "test_acc": []}
     param_cnt = get_num_params(model)
+    best_val = -1.0
+    best_state = None
     
     # Informative log
     print("-" * 50)
@@ -413,56 +439,60 @@ def _train_graph_classification(
         t0 = time.time()
         model.train()
         train_losses = []
-        bad = 0
         for batch in train_loader:
-            try:
-                batch = batch.to(device)
-                opt.zero_grad()
-                logits, _ = model(batch, task_level="graph")
-                loss = criterion(logits, batch.y.view(-1).long())
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
-                train_losses.append(float(loss.detach().item()))
-            except Exception:
-                bad += 1
+            batch = batch.to(device)
+            opt.zero_grad()
+            logits, _ = model(batch, task_level="graph")
+            loss = criterion(logits, batch.y.view(-1).long())
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            train_losses.append(float(loss.detach().item()))
         
         train_loss = float(statistics.fmean(train_losses) if train_losses else 0.0)
         history["train_loss"].append(train_loss)
-        history["bad_batches"].append(float(bad))
 
         model.eval()
-        y_true, y_pred = [], []
-        
-        import inspect
-        forward_kwargs = {'task_level': "graph"}
-        if 'inference_mode' in inspect.signature(model.forward).parameters:
-            forward_kwargs['inference_mode'] = 'armijo'
-            
-        with torch.no_grad():
-            for batch in test_loader:
-                batch = batch.to(device)
-                
-                logits, _ = model(batch, **forward_kwargs)
-                preds = logits.argmax(dim=-1)
-                y_pred.extend(preds.cpu().tolist())
-                y_true.extend(batch.y.view(-1).long().cpu().tolist())
-                
-        if y_true:
+        def _eval_acc(loader: DataLoader) -> float:
+            y_true, y_pred = [], []
+            import inspect
+            forward_kwargs = {'task_level': "graph"}
+            if 'inference_mode' in inspect.signature(model.forward).parameters:
+                forward_kwargs['inference_mode'] = 'armijo'
+            with torch.no_grad():
+                for batch in loader:
+                    batch = batch.to(device)
+                    logits, _ = model(batch, **forward_kwargs)
+                    preds = logits.argmax(dim=-1)
+                    y_pred.extend(preds.cpu().tolist())
+                    y_true.extend(batch.y.view(-1).long().cpu().tolist())
+            if not y_true:
+                return 0.0
             if accuracy_score is not None:
-                acc = float(accuracy_score(y_true, y_pred))
-            else:
-                acc = float(sum(int(a == b) for a, b in zip(y_true, y_pred)) / len(y_true))
-        else:
-            acc = 0.0
-            
-        history["test_acc"].append(acc)
+                return float(accuracy_score(y_true, y_pred))
+            return float(sum(int(a == b) for a, b in zip(y_true, y_pred)) / len(y_true))
+
+        val_acc = _eval_acc(val_loader)
+        test_acc = _eval_acc(test_loader)
+        if val_acc > best_val:
+            best_val = val_acc
+            best_state = {
+                k: v.detach().cpu().clone()
+                for k, v in model.state_dict().items()
+                if not isinstance(v, UninitializedParameter)
+            }
+                
+        history["val_acc"].append(val_acc)
+        history["test_acc"].append(test_acc)
         epoch_time = time.time() - t0
         
-        metrics_str = f"L: {train_loss:.3f} | A: {acc:.3f} | B: {max(history['test_acc']):.3f} | {epoch_time:.1f}s/ep"
+        metrics_str = f"L: {train_loss:.3f} | V: {val_acc:.3f} | T: {test_acc:.3f} | Bv: {best_val:.3f} | {epoch_time:.1f}s/ep"
         epoch_bar.set_postfix_str(metrics_str)
 
-    return FitResult(metric=history["test_acc"][-1] if history["test_acc"] else 0.0, history=history, extra={})
+    if best_state is not None:
+        model.load_state_dict(best_state, strict=False)
+    best_test = _eval_acc(test_loader)
+    return FitResult(metric=best_test, history=history, extra={"best_val_acc": best_val})
 
 
 def _select_threshold(y_true: list[float], y_score: list[float]) -> float:
@@ -544,7 +574,6 @@ def _train_graph_binary_with_val(
         "val_f1": [],
         "test_auc": [],
         "test_f1": [],
-        "bad_batches": [],
     }
     best = {"val_auc": -1.0, "test_auc": 0.5, "test_f1": 0.0}
 
@@ -567,19 +596,15 @@ def _train_graph_binary_with_val(
         t0 = time.time()
         model.train()
         losses = []
-        bad = 0
         for batch in train_loader:
-            try:
-                batch = batch.to(device)
-                opt.zero_grad()
-                logits, _ = model(batch, task_level="graph")
-                loss = criterion(logits.view(-1), batch.y.view(-1).float())
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
-                losses.append(float(loss.detach().item()))
-            except Exception:
-                bad += 1
+            batch = batch.to(device)
+            opt.zero_grad()
+            logits, _ = model(batch, task_level="graph")
+            loss = criterion(logits.view(-1), batch.y.view(-1).float())
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            losses.append(float(loss.detach().item()))
 
         def _collect(loader: DataLoader) -> tuple[list[float], list[float]]:
             ys, ps = [], []
@@ -637,7 +662,6 @@ def _train_graph_binary_with_val(
         history["val_f1"].append(val_f1)
         history["test_auc"].append(test_auc)
         history["test_f1"].append(test_f1)
-        history["bad_batches"].append(float(bad))
 
         if val_auc > best["val_auc"]:
             best = {"val_auc": val_auc, "test_auc": test_auc, "test_f1": test_f1}
@@ -715,7 +739,8 @@ def _capture_energy_trace(model: torch.nn.Module, loader: DataLoader, device: st
 
 
 def run_graph_classification(args: argparse.Namespace) -> dict:
-    get_pe_k = int(args.get_pe_k) if int(args.get_pe_k) > 0 else 16
+    get_pe_k = max(0, int(args.get_pe_k))
+    cache_pe_k = max(get_pe_k, max(0, int(args.et_pe_k)))
     if _normalized_name(args.dataset) in {"tu8", "alltu"}:
         target_datasets = list(TU8_DATASETS)
     else:
@@ -748,7 +773,7 @@ def run_graph_classification(args: argparse.Namespace) -> dict:
                 name=f"stage4_cls_{dataset_name}",
                 cache_dir=args.cache_dir,
                 max_motifs=args.max_motifs if args.max_motifs > 0 else None,
-                pe_k=get_pe_k,
+                pe_k=cache_pe_k,
                 rwse_k=args.rwse_k,
                 enable_cache=args.cache_processed,
             )
@@ -794,8 +819,31 @@ def run_graph_classification(args: argparse.Namespace) -> dict:
                 prefetch_factor=args.prefetch_factor,
             )
             for fold_id, (train_idx, test_idx) in enumerate(split_indices):
-                train_ds = [proc_ds[i] for i in train_idx]
+                train_idx = list(train_idx)
+                test_idx = list(test_idx)
+                train_labels = [labels[i] for i in train_idx]
+                if (
+                    len(train_idx) >= 5
+                    and train_test_split is not None
+                    and len(set(train_labels)) > 1
+                    and min(train_labels.count(label) for label in set(train_labels)) >= 2
+                ):
+                    train_sub_idx, val_sub_idx = train_test_split(
+                        train_idx,
+                        test_size=0.20,
+                        random_state=int(seed) + int(fold_id),
+                        stratify=train_labels,
+                    )
+                else:
+                    val_count = max(1, int(round(0.20 * len(train_idx))))
+                    val_sub_idx = train_idx[-val_count:]
+                    train_sub_idx = train_idx[:-val_count] or train_idx
+                train_ds = [proc_ds[i] for i in train_sub_idx]
+                val_ds = [proc_ds[i] for i in val_sub_idx]
                 test_ds = [proc_ds[i] for i in test_idx]
+                train_ds_gin = _add_cached_structural_features(train_ds)
+                val_ds_gin = _add_cached_structural_features(val_ds)
+                test_ds_gin = _add_cached_structural_features(test_ds)
 
                 common_kwargs = {
                     "in_dim": in_dim,
@@ -838,18 +886,18 @@ def run_graph_classification(args: argparse.Namespace) -> dict:
                 gin = None
                 if GINBaseline is not None:
                     try:
-                        gin = GINBaseline(in_dim, args.hidden_dim, num_classes)
+                        gin = GINBaseline(train_ds_gin[0]["x"].size(1), args.hidden_dim, num_classes)
                     except Exception:
                         gin = None
 
                 pair_res = _train_graph_classification(
-                    pairwise, train_ds, test_ds, args.epochs, args.batch_size, args.device, loader_kwargs=loader_kwargs, model_name="PairwiseGET"
+                    pairwise, train_ds, val_ds, test_ds, args.epochs, args.batch_size, args.device, loader_kwargs=loader_kwargs, model_name="PairwiseGET"
                 )
                 full_res = _train_graph_classification(
-                    fullget, train_ds, test_ds, args.epochs, args.batch_size, args.device, loader_kwargs=loader_kwargs, model_name="FullGET"
+                    fullget, train_ds, val_ds, test_ds, args.epochs, args.batch_size, args.device, loader_kwargs=loader_kwargs, model_name="FullGET"
                 )
                 et_res = _train_graph_classification(
-                    et_faithful, train_ds, test_ds, args.epochs, args.batch_size, args.device, loader_kwargs=loader_kwargs, model_name="ETFaithful"
+                    et_faithful, train_ds, val_ds, test_ds, args.epochs, args.batch_size, args.device, loader_kwargs=loader_kwargs, model_name="ETFaithful"
                 )
 
                 fold_run = {
@@ -870,11 +918,11 @@ def run_graph_classification(args: argparse.Namespace) -> dict:
                 }
                 if gin is not None:
                     gin_res = _train_graph_classification(
-                        gin, train_ds, test_ds, args.epochs, args.batch_size, args.device, loader_kwargs=loader_kwargs, model_name="GIN"
+                        gin, train_ds_gin, val_ds_gin, test_ds_gin, args.epochs, args.batch_size, args.device, loader_kwargs=loader_kwargs, model_name="GIN"
                     )
-                    fold_run["gin_acc"] = gin_res.metric
-                    fold_run["histories"]["gin"] = gin_res.history
-                    fold_run["energy_traces"]["gin"] = gin_res.extra.get("energy_trace")
+                    fold_run["gin_struct_acc"] = gin_res.metric
+                    fold_run["histories"]["gin_struct"] = gin_res.history
+                    fold_run["energy_traces"]["gin_struct"] = gin_res.extra.get("energy_trace")
                 fold_runs.append(fold_run)
 
             if not fold_runs:
@@ -921,6 +969,8 @@ def run_graph_classification(args: argparse.Namespace) -> dict:
 
 
 def run_graph_anomaly(args: argparse.Namespace) -> dict:
+    get_pe_k = max(0, int(args.get_pe_k))
+    cache_pe_k = max(get_pe_k, max(0, int(args.et_pe_k)))
     prebuilt_ds: list[dict] | None = None
     if _normalized_name(args.dataset) != "synth":
         base_graph = _load_anomaly_graph(args.dataset, data_root=args.data_root)
@@ -952,7 +1002,7 @@ def run_graph_anomaly(args: argparse.Namespace) -> dict:
             name=f"stage4_anom_{args.dataset}_h{args.ego_hops}",
             cache_dir=args.cache_dir,
             max_motifs=args.max_motifs if args.max_motifs > 0 else None,
-            pe_k=args.get_pe_k,
+            pe_k=cache_pe_k,
             rwse_k=args.rwse_k,
             enable_cache=use_cache,
         )
@@ -987,6 +1037,17 @@ def run_graph_anomaly(args: argparse.Namespace) -> dict:
             train_ds, val_ds, test_ds = split["train"], split["val"], split["test"]
             in_dim = int(train_ds[0]["x"].size(1))
 
+            pairwise = PairwiseGET(
+                in_dim=in_dim,
+                d=int(args.hidden_dim * 1.73),
+                num_classes=1,
+                num_steps=args.num_steps,
+                norm_style=args.get_norm_style,
+                pairwise_et_mask=args.get_pairwise_et_mask,
+                pe_k=get_pe_k,
+                rwse_k=args.rwse_k,
+                use_cls_token=False,
+            )
             fullget = FullGET(
                 in_dim=in_dim,
                 d=args.hidden_dim,
@@ -995,7 +1056,7 @@ def run_graph_anomaly(args: argparse.Namespace) -> dict:
                 lambda_3=args.lambda_3,
                 norm_style=args.get_norm_style,
                 pairwise_et_mask=args.get_pairwise_et_mask,
-                pe_k=args.get_pe_k,
+                pe_k=get_pe_k,
                 rwse_k=args.rwse_k,
                 use_cls_token=False,
             )
@@ -1017,6 +1078,19 @@ def run_graph_anomaly(args: argparse.Namespace) -> dict:
                 args.device,
                 num_workers=loader_num_workers,
                 prefetch_factor=args.prefetch_factor,
+            )
+            pair_res = _train_graph_binary_with_val(
+                pairwise,
+                train_ds,
+                val_ds,
+                test_ds,
+                args.epochs,
+                effective_batch_size,
+                args.device,
+                loader_kwargs=loader_kwargs,
+                use_weighted_bce=args.weighted_bce,
+                eval_batch_size=1,
+                model_name="PairwiseGET"
             )
             full_res = _train_graph_binary_with_val(
                 fullget,
@@ -1047,11 +1121,14 @@ def run_graph_anomaly(args: argparse.Namespace) -> dict:
             runs.append(
                 {
                     "seed": int(seed),
+                    "pairwise_auc": float(pair_res.metric),
+                    "pairwise_f1": float(pair_res.extra["best_test_f1"]),
                     "fullget_auc": float(full_res.metric),
                     "fullget_f1": float(full_res.extra["best_test_f1"]),
                     "et_faithful_auc": float(et_res.metric),
                     "et_faithful_f1": float(et_res.extra["best_test_f1"]),
                     "histories": {
+                        "pairwise": pair_res.history,
                         "fullget": full_res.history,
                         "et_faithful": et_res.history,
                     },
@@ -1061,11 +1138,17 @@ def run_graph_anomaly(args: argparse.Namespace) -> dict:
 
     summary = {}
     for rate_key, runs in by_rate.items():
+        pair_auc_mean, pair_auc_std = _mean_std([r["pairwise_auc"] for r in runs])
+        pair_f1_mean, pair_f1_std = _mean_std([r["pairwise_f1"] for r in runs])
         fg_auc_mean, fg_auc_std = _mean_std([r["fullget_auc"] for r in runs])
         fg_f1_mean, fg_f1_std = _mean_std([r["fullget_f1"] for r in runs])
         et_auc_mean, et_auc_std = _mean_std([r["et_faithful_auc"] for r in runs])
         et_f1_mean, et_f1_std = _mean_std([r["et_faithful_f1"] for r in runs])
         summary[rate_key] = {
+            "pairwise_mean": pair_auc_mean,
+            "pairwise_std": pair_auc_std,
+            "pairwise_f1_mean": pair_f1_mean,
+            "pairwise_f1_std": pair_f1_std,
             "fullget_mean": fg_auc_mean,
             "fullget_std": fg_auc_std,
             "fullget_f1_mean": fg_f1_mean,
@@ -1114,7 +1197,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--et_num_heads", type=int, default=1)
     parser.add_argument("--et_head_dim", type=int, default=0)
     parser.add_argument("--et_pe_k", type=int, default=8)
-    parser.add_argument("--et_mask_mode", choices=["sparse", "official_dense"], default="official_dense")
+    parser.add_argument("--et_mask_mode", choices=["sparse", "official_dense"], default="sparse")
     parser.add_argument("--et_node_cap", type=int, default=0)
     return parser.parse_args()
 

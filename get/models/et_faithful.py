@@ -237,12 +237,12 @@ class ETFaithfulGraphModel(nn.Module):
                     gnorm = grad_x.norm(dim=-1, keepdim=True).clamp_min(1e-6)
                     grad_x = grad_x * (self.grad_clip_norm / gnorm).clamp(max=1.0)
 
-                x.sub_(step * grad_x)
+                x = x - step * grad_x
                 if noise is not None:
-                    x.add_(torch.sqrt(step.clamp_min(1e-8)) * noise)
+                    x = x + torch.sqrt(step.clamp_min(1e-8)) * noise
                 if self.state_clip_norm is not None:
                     snorm = x.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-                    x.mul_((self.state_clip_norm / snorm).clamp(max=1.0))
+                    x = x * (self.state_clip_norm / snorm).clamp(max=1.0)
 
                 energy_trace.append(float(e.detach().item()))
         return x, energy_trace

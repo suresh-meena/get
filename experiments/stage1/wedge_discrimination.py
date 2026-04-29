@@ -161,7 +161,7 @@ def main():
         128,
         full_kwargs={
             "num_steps": 16,
-            "lambda_3": 50.0,
+            "lambda_3": 1.0,
             "beta_3": 5.0,
             "update_damping": 0.05,
             "grad_clip_norm": 0.1,
@@ -181,7 +181,7 @@ def main():
     results = {}
     models = [
         ("PairwiseGET", lambda: PairwiseGET(in_dim, pairwise_d, 1, num_steps=16, update_damping=0.05, grad_clip_norm=0.1), 1e-4, 0.5),
-        ("FullGET", lambda: FullGET(in_dim, 128, 1, num_steps=16, lambda_3=50.0, beta_3=5.0, update_damping=0.05, grad_clip_norm=0.1), 1e-4, 0.3),
+        ("FullGET", lambda: FullGET(in_dim, 128, 1, num_steps=16, lambda_3=1.0, beta_3=5.0, update_damping=0.05, grad_clip_norm=0.1), 1e-4, 0.3),
         ("GIN", lambda: GINBaseline(in_dim, 128, 1, num_layers=4), 1e-4, 1.0),
     ]
 
