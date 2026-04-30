@@ -10,13 +10,43 @@ def _inv_softplus(x):
     return torch.log(torch.exp(torch.tensor(x)) - 1.0)
 
 
+class _EdgeFeatureProjector(nn.Module):
+    """Project variable-width edge features without LazyLinear."""
+
+    def __init__(self, hidden_dim: int, out_dim: int, edge_feat_dim: int = 1):
+        super().__init__()
+        self.edge_feat_dim = max(1, int(edge_feat_dim))
+        self.net = nn.Sequential(
+            nn.Linear(self.edge_feat_dim, int(hidden_dim)),
+            nn.GELU(),
+            nn.Linear(int(hidden_dim), int(out_dim)),
+        )
+
+    def _prepare(self, edge_attr: torch.Tensor) -> torch.Tensor:
+        if edge_attr.dim() == 1:
+            edge_attr = edge_attr.unsqueeze(-1)
+        if edge_attr.size(-1) == self.edge_feat_dim:
+            return edge_attr
+        if self.edge_feat_dim == 1:
+            return edge_attr.mean(dim=-1, keepdim=True)
+        if edge_attr.size(-1) > self.edge_feat_dim:
+            return edge_attr[..., : self.edge_feat_dim]
+        pad = self.edge_feat_dim - edge_attr.size(-1)
+        zeros = torch.zeros(*edge_attr.shape[:-1], pad, dtype=edge_attr.dtype, device=edge_attr.device)
+        return torch.cat([edge_attr, zeros], dim=-1)
+
+    def forward(self, edge_attr: torch.Tensor) -> torch.Tensor:
+        prepared = self._prepare(edge_attr).to(dtype=self.net[0].weight.dtype)
+        return self.net(prepared)
+
+
 class GETLayer(nn.Module):
     def __init__(self, d=256, R=4, K=32, num_heads=4, head_dim=None, num_motif_types=4,
                  lambda_2=1.0, lambda_3=0.5, lambda_m=1.0, beta_2=1.0, beta_3=1.0, beta_m=1.0,
                  grad_clip_norm=1.0, beta_max=5.0, state_clip_norm=10.0, update_damping=1.0, learn_update_damping=False,
                  pairwise_symmetric=False, noise_std=0.0, use_pairwise=True, use_motif=True, use_memory=True,
                  norm_style="standard", pairwise_et_mask=False, pairwise_et_kernel_size=3,
-                 use_pna_scaling=False, avg_degree=1.0):
+                 use_pna_scaling=False, avg_degree=1.0, edge_feat_dim=1):
         super().__init__()
         self.d = d
         self.num_heads = int(num_heads)
@@ -75,11 +105,7 @@ class GETLayer(nn.Module):
             self.W_Km = None
             self.B_mem = None
 
-        self.edge_mlp = nn.Sequential(
-            nn.LazyLinear(d),
-            nn.GELU(),
-            nn.Linear(d, self.num_heads)
-        )
+        self.edge_mlp = _EdgeFeatureProjector(hidden_dim=d, out_dim=self.num_heads, edge_feat_dim=edge_feat_dim)
         self.pairwise_mask_modulator = None
         if self.pairwise_et_mask:
             self.pairwise_mask_modulator = ETGraphMaskModulator(

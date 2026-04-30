@@ -162,7 +162,7 @@ def _collect_series(node, label_parts: tuple[str, ...] = ()) -> list[PlotSeries]
 def _aggregate_curves(curves_by_label: dict[str, list[list[float]]]) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     aggregated: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     for label, curves in curves_by_label.items():
-        usable = [np.asarray(curve, dtype=np.float64) for curve in curves if len(curve) > 0]
+        usable = [np.asarray(curve, dtype=np.float64) for curve in curves if hasattr(curve, "__len__") and len(curve) > 0]
         if not usable:
             continue
         min_len = min(len(curve) for curve in usable)
@@ -197,8 +197,7 @@ def plot_payload(payload: dict, output_path: Path, title: str | None = None) -> 
     if not series:
         raise ValueError("No histories or energy traces found in payload.")
 
-    histories = [item.history for item in series if item.history]
-    history_groups: dict[str, list[list[float]]] = {}
+    history_groups: dict[str, list[dict]] = {}
     energy_groups: dict[str, list[list[float]]] = {}
     for item in series:
         if item.history:
@@ -206,57 +205,93 @@ def plot_payload(payload: dict, output_path: Path, title: str | None = None) -> 
         if item.energy_trace:
             energy_groups.setdefault(item.label, []).append(item.energy_trace)
 
-    train_groups: dict[str, list[list[float]]] = {}
-    for label, grouped_histories in history_groups.items():
-        curves = [history["train_loss"] for history in grouped_histories if "train_loss" in history]
+    # Detect primary metric
+    all_histories = [h for group in history_groups.values() for h in group]
+    eval_key = _metric_key(all_histories)
+    
+    # 2x2 Grid setup
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10), dpi=300)
+    palette = sns.color_palette("deep", n_colors=max(len(history_groups), len(energy_groups), 3))
+    model_colors = {label: palette[i % len(palette)] for i, label in enumerate(sorted(history_groups.keys()))}
+
+    # --- Plot 1: Train Loss (0,0) ---
+    ax = axes[0, 0]
+    for label, group in sorted(history_groups.items()):
+        curves = [h["train_loss"] for h in group if "train_loss" in h]
         if curves:
-            train_groups[label] = curves
+            agg_dict = _aggregate_curves({label: curves})
+            if label in agg_dict:
+                mean, std = agg_dict[label]
+                x = np.arange(1, len(mean) + 1)
+                ax.plot(x, mean, label=label, color=model_colors[label], linewidth=2)
+                if len(mean) > 1:
+                    ax.fill_between(x, mean - std, mean + std, color=model_colors[label], alpha=0.1)
+    ax.set_title("Training Loss", fontweight="bold")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.legend(frameon=False, loc="upper right")
 
-    eval_key = _metric_key(histories)
-    eval_groups: dict[str, list[list[float]]] = {}
-    if eval_key is not None:
-        for label, grouped_histories in history_groups.items():
-            curves = [history[eval_key] for history in grouped_histories if eval_key in history]
+    # --- Plot 2: Validation Metric (0,1) ---
+    ax = axes[0, 1]
+    if eval_key:
+        for label, group in sorted(history_groups.items()):
+            curves = [h[eval_key] for h in group if eval_key in h]
             if curves:
-                eval_groups[label] = curves
+                agg_dict = _aggregate_curves({label: curves})
+                if label in agg_dict:
+                    mean, std = agg_dict[label]
+                    x = np.arange(1, len(mean) + 1)
+                    ax.plot(x, mean, label=label, color=model_colors[label], linewidth=2)
+                    if len(mean) > 1:
+                        ax.fill_between(x, mean - std, mean + std, color=model_colors[label], alpha=0.1)
+        ax.set_title(_metric_title(eval_key, "Validation Performance"), fontweight="bold")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(_metric_title(eval_key, "Metric"))
 
-    panels: list[tuple[str, str, dict[str, list[list[float]]]]] = []
-    if train_groups:
-        panels.append(("train_loss", _metric_title("train_loss", "Training Loss"), train_groups))
-    if eval_groups:
-        panels.append((eval_key or "metric", _metric_title(eval_key, "Validation Metric"), eval_groups))
+    # --- Plot 3: Final Test Performance Bar (1,0) ---
+    ax = axes[1, 0]
+    bar_labels, bar_values = [], []
+    for label, group in sorted(history_groups.items()):
+        # Try to find final test result in payload for this label
+        # If not explicit, take last val_metric
+        val = None
+        if eval_key and group:
+            last_curves = [h[eval_key] for h in group if isinstance(h, dict) and eval_key in h]
+            if last_curves:
+                val = np.mean([c[-1] for c in last_curves if hasattr(c, "__len__")])
+        
+        if val is not None:
+            bar_labels.append(label)
+            bar_values.append(val)
+    
+    if bar_values:
+        sns.barplot(x=bar_labels, y=bar_values, ax=ax, palette=palette, hue=bar_labels, legend=False)
+        for i, v in enumerate(bar_values):
+            ax.text(i, v + 0.005, f"{v:.3f}", ha='center', fontweight='bold', fontsize=9)
+    ax.set_title("Test Set Performance", fontweight="bold")
+    ax.set_xticks(range(len(bar_labels)))
+    ax.set_xticklabels(bar_labels, rotation=35, ha='right', fontsize=9)
+
+    # --- Plot 4: Energy Descent (1,1) ---
+    ax = axes[1, 1]
     if energy_groups:
-        panels.append(("energy_trace", _metric_title("energy_trace", "Energy Descent"), energy_groups))
-
-    if not panels:
-        raise ValueError("No plottable curves found in payload.")
-
-    ncols = len(panels)
-    fig, axes = plt.subplots(1, ncols, figsize=(6.0 * ncols, 5.0), dpi=300)
-    if ncols == 1:
-        axes = [axes]
-
-    palette = sns.color_palette("deep", n_colors=max(3, len({label for _, _, groups in panels for label in groups})))
-
-    for ax, (metric_name, panel_title, groups) in zip(axes, panels):
-        aggregated = _aggregate_curves(groups)
-        for idx, (label, (mean_curve, std_curve)) in enumerate(sorted(aggregated.items())):
-            x = np.arange(1, len(mean_curve) + 1)
-            color = palette[idx % len(palette)]
-            ax.plot(x, mean_curve, linewidth=2.2, label=label, color=color)
-            if len(mean_curve) > 1:
-                ax.fill_between(x, mean_curve - std_curve, mean_curve + std_curve, color=color, alpha=0.15, linewidth=0)
-        ax.set_title(panel_title, fontweight="bold", pad=12)
-        ax.set_xlabel("Step" if metric_name == "energy_trace" else "Epoch", fontweight="bold")
-        ax.set_ylabel(_metric_title(metric_name, panel_title), fontweight="bold")
-        ax.grid(alpha=0.25, linestyle="--")
-        sns.despine(ax=ax)
-        ax.legend(frameon=False)
+        agg_energy = _aggregate_curves(energy_groups)
+        for label, (mean, std) in sorted(agg_energy.items()):
+            x = np.arange(len(mean))
+            ax.plot(x, mean, label=label, color=model_colors.get(label, 'black'), linewidth=2)
+            if len(mean) > 1:
+                ax.fill_between(x, mean - std, mean + std, color=model_colors.get(label, 'black'), alpha=0.1)
+        ax.set_title("Energy Descent (Inference)", fontweight="bold")
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Energy")
+    else:
+        ax.text(0.5, 0.5, "No Energy Traces", ha='center', va='center', alpha=0.5)
 
     if title:
-        fig.suptitle(title, fontweight="bold", y=1.02)
+        fig.suptitle(title, fontweight="bold", fontsize=18, y=0.98)
 
-    fig.tight_layout()
+    sns.despine(fig)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)

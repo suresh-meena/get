@@ -12,20 +12,21 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from experiments.shared.common import load_tu_dataset  # noqa: E402
+from experiments.shared.common import load_tu_dataset, save_results  # noqa: E402
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Unified Stage-2 runner for ET-style transfer tasks.")
     parser.add_argument("--task", choices=["graph_classification", "graph_anomaly"], required=True)
+    parser.add_argument("--model_config", default="configs/models/stage4.yaml")
     parser.add_argument("--dataset", default="synth")
     parser.add_argument("--data_root", default="data/stage4")
     parser.add_argument("--num_graphs", type=int, default=120)
     parser.add_argument("--limit_graphs", type=int, default=0)
     parser.add_argument("--in_dim", type=int, default=8)
-    parser.add_argument("--hidden_dim", type=int, default=128)
+    parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_steps", type=int, default=1)
     parser.add_argument("--cv_folds", type=int, default=1)
     parser.add_argument("--lambda_3", type=float, default=0.5)
@@ -84,10 +85,8 @@ def main() -> int:
         payload = run_graph_anomaly(args)
         out_path = Path("outputs/stage2_graph_anomaly.json")
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-    print(f"Saved {out_path}")
+    out_name = "stage2_graph_classification" if args.task == "graph_classification" else "stage2_graph_anomaly"
+    save_results(out_name, payload, metadata=vars(args))
     return 0
 
 

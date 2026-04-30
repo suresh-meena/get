@@ -1,5 +1,7 @@
 import argparse
 import torch
+import json
+from pathlib import Path
 
 from get import FullGET, PairwiseGET, GINBaseline, ETFaithful
 from get.data import CachedGraphDataset
@@ -27,14 +29,14 @@ def load_zinc_subset(root="data/ZINC"):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=500)
-    parser.add_argument("--hidden_dim", type=int, default=128)
-    parser.add_argument("--model", choices=["pairwise", "full", "gin", "et_faithful"], default="et_faithful")
+    parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--rwse_k", type=int, default=20)
     parser.add_argument("--num_samples", type=int, default=-1)
-    parser.add_argument("--batch_size", type=int, default=1024)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    set_seed(42)
+    set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     raw_tr, raw_val, raw_ts = load_zinc_subset()
     
@@ -49,28 +51,31 @@ def main():
     tr_cached, val_cached, ts_cached = tr_ds.cached_data, val_ds.cached_data, ts_ds.cached_data
 
     in_dim = tr_cached[0]['x'].size(1)
-    if args.model == "et_faithful":
-        model = ETFaithful(in_dim, args.hidden_dim, 1, num_steps=1, num_blocks=4, num_heads=12, head_dim=64, pe_k=15, rwse_k=args.rwse_k, eta=0.1, K=args.hidden_dim*4, mask_mode="sparse", et_official_mode=False)
-        train_data, val_data, test_data = tr_cached, val_cached, ts_cached
-    elif args.model == "full":
-        model = FullGET(in_dim, args.hidden_dim, 1, num_steps=16, pe_k=16, rwse_k=args.rwse_k, lambda_3=1.0, update_damping=0.1)
-        train_data, val_data, test_data = tr_cached, val_cached, ts_cached
-    elif args.model == "pairwise":
-        model = PairwiseGET(in_dim, int(args.hidden_dim * 1.73), 1, pe_k=16, rwse_k=args.rwse_k)
-        train_data, val_data, test_data = tr_cached, val_cached, ts_cached
-    else:
-        train_data = add_cached_structural_features(tr_cached)
-        val_data = add_cached_structural_features(val_cached)
-        test_data = add_cached_structural_features(ts_cached)
-        model = GINBaseline(train_data[0]['x'].size(1), args.hidden_dim, 1)
-        args.model = "gin_struct"
+    
+    models_to_run = {
+        "ETFaithful": lambda: ETFaithful(in_dim, args.hidden_dim, 1, num_blocks=8, num_heads=12, head_dim=64, pe_k=15, rwse_k=args.rwse_k, eta=0.1, K=args.hidden_dim*4, mask_mode="sparse", et_official_mode=False),
+        "FullGET": lambda: FullGET(in_dim, args.hidden_dim, 1, num_blocks=8, num_steps=1, num_heads=12, pe_k=16, rwse_k=args.rwse_k, lambda_3=1.0, beta_3=1.2, update_damping=0.1),
+        "PairwiseGET": lambda: PairwiseGET(in_dim, int(args.hidden_dim * 1.73), 1, pe_k=16, rwse_k=args.rwse_k, lambda_2=3.0, beta_2=1.5),
+        "GIN": lambda: GINBaseline(add_cached_structural_features(tr_cached)[0]['x'].size(1), args.hidden_dim, 1)
+    }
 
-    print(f"\n--- Training {args.model} on ZINC ---")
-    trainer = GETTrainer(model, task_type='regression', device=device, lr=5e-4)
-    res = trainer.run(train_data, val_data, test_data, args.epochs, args.batch_size)
-    print(f"ZINC Test MAE: {res['metric']:.4f}")
+    results = {}
+    for name, model_fn in models_to_run.items():
+        print(f"\n--- Training {name} on ZINC ---")
+        if name == "GIN":
+            train_data = add_cached_structural_features(tr_cached)
+            val_data = add_cached_structural_features(val_cached)
+            test_data = add_cached_structural_features(ts_cached)
+        else:
+            train_data, val_data, test_data = tr_cached, val_cached, ts_cached
+            
+        model = model_fn()
+        trainer = GETTrainer(model_fn(), task_type='regression', device=device, model_name=name, lr=1e-4, weight_decay=1e-4)
+        res = trainer.run(train_data, val_data, test_data, args.epochs, args.batch_size)
+        results[name] = res
+        print(f"ZINC {name} Test MAE: {res['metric']:.4f}")
 
-    save_results(f"zinc_{args.model}", res)
+    save_results("zinc_results", results)
 
 if __name__ == "__main__":
     main()

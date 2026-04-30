@@ -1,7 +1,6 @@
 """ET graph-appendix edge-conditioned mask modulator."""
 import torch
 import torch.nn as nn
-from torch.nn.parameter import UninitializedParameter
 
 
 class ETGraphMaskModulator(nn.Module):
@@ -19,18 +18,15 @@ class ETGraphMaskModulator(nn.Module):
             kernel_size=int(kernel_size), stride=1,
             padding=int(kernel_size) // 2, bias=True
         )
-        if self.edge_feat_dim is None:
-            self.edge_proj = nn.LazyLinear(self.num_heads, bias=False)
-        else:
-            self.edge_proj = nn.Linear(self.edge_feat_dim, self.num_heads, bias=False)
+        in_dim = 1 if self.edge_feat_dim is None else self.edge_feat_dim
+        self.edge_proj = nn.Linear(in_dim, self.num_heads, bias=False)
         self.reset_parameters()
 
     def reset_parameters(self):
         nn.init.kaiming_uniform_(self.mask_conv.weight, a=5 ** 0.5)
         if self.mask_conv.bias is not None:
             nn.init.zeros_(self.mask_conv.bias)
-        if hasattr(self.edge_proj, "weight") and not isinstance(self.edge_proj.weight, UninitializedParameter):
-            nn.init.xavier_uniform_(self.edge_proj.weight)
+        nn.init.xavier_uniform_(self.edge_proj.weight)
 
     def _prepare_edge_features(self, edge_features, x_dtype):
         if edge_features.dim() == 2:

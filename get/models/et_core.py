@@ -296,7 +296,7 @@ class ETFaithfulGraphModel(nn.Module):
         d,
         num_classes,
         num_steps=8,
-        num_heads=1,
+        num_heads=4,
         head_dim=None,
         pe_k=16,
         rwse_k=0,

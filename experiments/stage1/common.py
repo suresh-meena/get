@@ -1,6 +1,7 @@
 """Shared helpers for Stage 1 experiments."""
 from __future__ import annotations
 
+import random
 import networkx as nx
 import numpy as np
 import torch
@@ -10,6 +11,7 @@ from get import FullGET, PairwiseGET
 from get.data import add_structural_node_features
 from get.data.motif_extraction import _numba_edges_to_csr, get_incidence_matrices
 from get.data.positional import get_rwse
+from experiments.shared.common import GETTrainer
 
 
 def count_trainable_params(model) -> int:

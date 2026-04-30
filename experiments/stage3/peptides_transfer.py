@@ -31,8 +31,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", choices=["func", "struct"], required=True)
     parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--hidden_dim", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--data_root", default="data/LRGB")
     args = parser.parse_args()
@@ -51,9 +51,9 @@ def main():
     ts_gin = add_cached_structural_features(ts)
 
     models = {
-        "PairwiseGET": (PairwiseGET(in_dim, int(args.hidden_dim * 1.73), out_dim, pe_k=16, rwse_k=20), tr, val, ts),
-        "FullGET": (FullGET(in_dim, args.hidden_dim, out_dim, pe_k=16, rwse_k=20, lambda_3=1.0), tr, val, ts),
-        "ETFaithful": (ETFaithful(in_dim, args.hidden_dim, out_dim, pe_k=16, rwse_k=20, num_steps=6), tr, val, ts),
+        "PairwiseGET": (PairwiseGET(in_dim, int(args.hidden_dim * 1.73), out_dim, pe_k=16, rwse_k=20, lambda_2=3.0, beta_2=1.5), tr, val, ts),
+        "FullGET": (FullGET(in_dim, args.hidden_dim, out_dim, num_blocks=8, num_steps=1, num_heads=12, pe_k=16, rwse_k=20, lambda_3=1.0, beta_3=1.2), tr, val, ts),
+        "ETFaithful": (ETFaithful(in_dim, args.hidden_dim, out_dim, num_blocks=8, num_heads=12, pe_k=16, rwse_k=20), tr, val, ts),
         "GIN+Struct": (GINBaseline(tr_gin[0]["x"].size(1), args.hidden_dim, out_dim), tr_gin, val_gin, ts_gin),
     }
 
@@ -61,12 +61,12 @@ def main():
     task_type = 'multilabel' if args.task == 'func' else 'regression'
     for name, (model, train_data, val_data, test_data) in models.items():
         print(f"--- Training {name} on Peptides-{args.task} ---")
-        trainer = GETTrainer(model, task_type=task_type, device=device, model_name=name, lr=1e-3, weight_decay=1e-5)
+        trainer = GETTrainer(model, task_type=task_type, device=device, model_name=name, lr=1e-4, weight_decay=1e-4)
         res = trainer.run(train_data, val_data, test_data, args.epochs, args.batch_size)
         print(f"{name} Test Metric ({'AP' if args.task == 'func' else 'MAE'}): {res['metric']:.4f}")
         results[name] = res
 
-    save_results(f"exp9_peptides_{args.task}_results", results)
+    save_results(f"exp9_peptides_{args.task}_results", results, metadata=vars(args))
 
 if __name__ == "__main__":
     main()

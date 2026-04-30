@@ -1,0 +1,86 @@
+{
+  "task": "graph_anomaly",
+  "dataset": "synth",
+  "summary": {
+    "0.4": {
+      "pairwise_mean": 0.7777777777777778,
+      "pairwise_std": 0.0,
+      "pairwise_f1_mean": 0.75,
+      "pairwise_f1_std": 0.0,
+      "fullget_mean": 0.888888888888889,
+      "fullget_std": 0.0,
+      "fullget_f1_mean": 0.6785714285714286,
+      "fullget_f1_std": 0.0,
+      "et_faithful_mean": 0.6111111111111112,
+      "et_faithful_std": 0.0,
+      "et_faithful_f1_mean": 0.4,
+      "et_faithful_f1_std": 0.0
+    }
+  },
+  "runs": {
+    "0.4": [
+      {
+        "seed": 123,
+        "pairwise_auc": 0.7777777777777778,
+        "pairwise_f1": 0.75,
+        "fullget_auc": 0.888888888888889,
+        "fullget_f1": 0.6785714285714286,
+        "et_faithful_auc": 0.6111111111111112,
+        "et_faithful_f1": 0.4,
+        "histories": {
+          "pairwise": {
+            "train_loss": [
+              1.1103355884552002
+            ],
+            "val_auc": [
+              1.0
+            ],
+            "val_f1": [
+              1.0
+            ],
+            "test_auc": [
+              0.7777777777777778
+            ],
+            "test_f1": [
+              0.75
+            ]
+          },
+          "fullget": {
+            "train_loss": [
+              1.0296958684921265
+            ],
+            "val_auc": [
+              1.0
+            ],
+            "val_f1": [
+              0.4444444444444444
+            ],
+            "test_auc": [
+              0.888888888888889
+            ],
+            "test_f1": [
+              0.6785714285714286
+            ]
+          },
+          "et_faithful": {
+            "train_loss": [
+              0.9708352088928223
+            ],
+            "val_auc": [
+              1.0
+            ],
+            "val_f1": [
+              0.4444444444444444
+            ],
+            "test_auc": [
+              0.6111111111111112
+            ],
+            "test_f1": [
+              0.4
+            ]
+          }
+        }
+      }
+    ]
+  }
+}

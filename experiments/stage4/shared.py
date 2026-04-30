@@ -14,7 +14,8 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from experiments.shared.common import build_ego_graph_dataset, get_num_params
-from get import ETFaithful, FullGET, PairwiseGET, collate_get_batch, CachedGraphDataset
+from experiments.shared.model_config import instantiate_models_from_config
+from get import collate_get_batch, CachedGraphDataset
 from get.data import _graph_dataset_cache_fingerprint
 
 try:
@@ -347,8 +348,8 @@ def _train_graph_classification(
     epochs: int,
     batch_size: int,
     device: str,
-    lr: float = 1e-3,
-    weight_decay: float = 1e-5,
+    lr: float = 5e-4,
+    weight_decay: float = 1e-4,
     loader_kwargs: dict | None = None,
     model_name: str | None = None,
 ) -> FitResult:
@@ -357,6 +358,7 @@ def _train_graph_classification(
     model = model.to(device)
     model_name = model_name or model.__class__.__name__
     opt = _build_optimizer(model, lr=lr, wd=weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max", factor=0.5, patience=5)
     criterion = torch.nn.CrossEntropyLoss()
     loader_kwargs = loader_kwargs or {}
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_get_batch, **loader_kwargs)
@@ -428,6 +430,7 @@ def _train_graph_classification(
 
         history["val_acc"].append(val_acc)
         history["test_acc"].append(test_acc)
+        scheduler.step(val_acc)
         epoch_time = time.time() - t0
         epoch_bar.set_postfix_str(f"L: {train_loss:.3f} | V: {val_acc:.3f} | T: {test_acc:.3f} | Bv: {best_val:.3f} | {epoch_time:.1f}s/ep")
 
@@ -462,8 +465,8 @@ def _train_graph_binary_with_val(
     epochs: int,
     batch_size: int,
     device: str,
-    lr: float = 1e-3,
-    weight_decay: float = 1e-5,
+    lr: float = 5e-4,
+    weight_decay: float = 1e-4,
     loader_kwargs: dict | None = None,
     use_weighted_bce: bool = True,
     eval_batch_size: int | None = None,
@@ -476,6 +479,7 @@ def _train_graph_binary_with_val(
     model = model.to(device)
     model_name = model_name or model.__class__.__name__
     opt = _build_optimizer(model, lr=lr, wd=weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max", factor=0.5, patience=5)
     if use_weighted_bce and len(train_ds) > 0:
         y = torch.tensor([g["y"].view(-1)[0] for g in train_ds], dtype=torch.float32)
         pos = float((y > 0.5).sum().item())
@@ -616,6 +620,7 @@ def _train_graph_binary_with_val(
         history["val_f1"].append(val_f1)
         history["test_auc"].append(test_auc)
         history["test_f1"].append(test_f1)
+        scheduler.step(val_auc)
 
         if val_auc > best["val_auc"]:
             best = {"val_auc": val_auc, "test_auc": test_auc, "test_f1": test_f1}
@@ -734,46 +739,30 @@ def _build_graph_classification_models(
     args: SimpleNamespace,
     get_pe_k: int,
 ) -> tuple[torch.nn.Module, torch.nn.Module, torch.nn.Module]:
-    common_kwargs = {
+    context = {
         "in_dim": in_dim,
-        "d": args.hidden_dim,
         "num_classes": num_classes,
-        "num_steps": args.num_steps,
+        "hidden_dim": int(args.hidden_dim),
+        "pairwise_hidden_dim": int(args.hidden_dim * 1.73),
+        "num_steps": int(args.num_steps),
+        "lambda_3": float(args.lambda_3),
+        "get_norm_style": str(args.get_norm_style),
+        "get_pairwise_et_mask": bool(args.get_pairwise_et_mask),
+        "get_pe_k": int(get_pe_k),
+        "rwse_k": int(args.rwse_k),
+        "et_num_blocks": int(args.et_num_blocks),
+        "et_num_heads": int(args.et_num_heads),
+        "et_head_dim_or_none": int(args.et_head_dim) if int(args.et_head_dim) > 0 else None,
+        "et_pe_k": int(args.et_pe_k),
+        "et_mask_mode": str(args.et_mask_mode),
+        "et_official_mode": bool(args.et_mask_mode == "official_dense"),
+        "et_node_cap": args.et_node_cap,
     }
-    pairwise_kwargs = dict(common_kwargs)
-    pairwise_kwargs["d"] = int(args.hidden_dim * 1.73)
-    pairwise = PairwiseGET(
-        **pairwise_kwargs,
-        norm_style=args.get_norm_style,
-        pairwise_et_mask=args.get_pairwise_et_mask,
-        pe_k=get_pe_k,
-        rwse_k=args.rwse_k,
-        use_cls_token=False,
+    built = instantiate_models_from_config(
+        args.model_config,
+        context=context,
     )
-    fullget = FullGET(
-        **common_kwargs,
-        lambda_3=args.lambda_3,
-        norm_style=args.get_norm_style,
-        pairwise_et_mask=args.get_pairwise_et_mask,
-        pe_k=get_pe_k,
-        rwse_k=args.rwse_k,
-        use_cls_token=False,
-    )
-    et_faithful = ETFaithful(
-        in_dim=in_dim,
-        d=args.hidden_dim,
-        num_classes=num_classes,
-        num_steps=args.num_steps,
-        num_blocks=args.et_num_blocks,
-        num_heads=args.et_num_heads,
-        head_dim=args.et_head_dim if args.et_head_dim > 0 else None,
-        pe_k=args.et_pe_k,
-        rwse_k=args.rwse_k,
-        mask_mode=args.et_mask_mode,
-        et_official_mode=(args.et_mask_mode == "official_dense"),
-        node_cap=args.et_node_cap,
-    )
-    return pairwise, fullget, et_faithful
+    return built["PairwiseGET"], built["FullGET"], built["ETFaithful"]
 
 
 def _build_graph_anomaly_models(
@@ -781,44 +770,30 @@ def _build_graph_anomaly_models(
     args: SimpleNamespace,
     get_pe_k: int,
 ) -> tuple[torch.nn.Module, torch.nn.Module, torch.nn.Module]:
-    pairwise = PairwiseGET(
-        in_dim=in_dim,
-        d=int(args.hidden_dim * 1.73),
-        num_classes=1,
-        num_steps=args.num_steps,
-        norm_style=args.get_norm_style,
-        pairwise_et_mask=args.get_pairwise_et_mask,
-        pe_k=get_pe_k,
-        rwse_k=args.rwse_k,
-        use_cls_token=False,
+    context = {
+        "in_dim": in_dim,
+        "num_classes": 1,
+        "hidden_dim": int(args.hidden_dim),
+        "pairwise_hidden_dim": int(args.hidden_dim * 1.73),
+        "num_steps": int(args.num_steps),
+        "lambda_3": float(args.lambda_3),
+        "get_norm_style": str(args.get_norm_style),
+        "get_pairwise_et_mask": bool(args.get_pairwise_et_mask),
+        "get_pe_k": int(get_pe_k),
+        "rwse_k": int(args.rwse_k),
+        "et_num_blocks": int(args.et_num_blocks),
+        "et_num_heads": int(args.et_num_heads),
+        "et_head_dim_or_none": int(args.et_head_dim) if int(args.et_head_dim) > 0 else None,
+        "et_pe_k": int(args.et_pe_k),
+        "et_mask_mode": str(args.et_mask_mode),
+        "et_official_mode": bool(args.et_mask_mode == "official_dense"),
+        "et_node_cap": args.et_node_cap,
+    }
+    built = instantiate_models_from_config(
+        args.model_config,
+        context=context,
     )
-    fullget = FullGET(
-        in_dim=in_dim,
-        d=args.hidden_dim,
-        num_classes=1,
-        num_steps=args.num_steps,
-        lambda_3=args.lambda_3,
-        norm_style=args.get_norm_style,
-        pairwise_et_mask=args.get_pairwise_et_mask,
-        pe_k=get_pe_k,
-        rwse_k=args.rwse_k,
-        use_cls_token=False,
-    )
-    et_faithful = ETFaithful(
-        in_dim=in_dim,
-        d=args.hidden_dim,
-        num_classes=1,
-        num_steps=args.num_steps,
-        num_blocks=args.et_num_blocks,
-        num_heads=args.et_num_heads,
-        head_dim=args.et_head_dim if args.et_head_dim > 0 else None,
-        pe_k=args.et_pe_k,
-        rwse_k=args.rwse_k,
-        mask_mode=args.et_mask_mode,
-        et_official_mode=(args.et_mask_mode == "official_dense"),
-        node_cap=args.et_node_cap,
-    )
-    return pairwise, fullget, et_faithful
+    return built["PairwiseGET"], built["FullGET"], built["ETFaithful"]
 
 
 def _make_anomaly_batch_samplers(

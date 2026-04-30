@@ -216,4 +216,6 @@ __marimo__/
 *.pyc
 *.pyo
 
-data/
+/data/
+!get/data/
+!get/data/**

@@ -1,5 +1,4 @@
 import random
-import json
 import time
 import inspect
 import multiprocessing as mp
@@ -15,6 +14,7 @@ from sklearn.metrics import accuracy_score, roc_auc_score, mean_absolute_error
 from tqdm.auto import tqdm
 
 from get import build_adamw_optimizer, collate_get_batch, validate_get_batch
+from experiments.shared.io import save_results
 
 def get_num_params(model):
     """Return formatted string of trainable parameter count."""
@@ -106,18 +106,6 @@ def split_grouped_dataset(dataset, split_key, seed, train_ratio=0.70, val_ratio=
     val_data = [g for g in dataset if g[split_key] in val_ids]
     test_data = [g for g in dataset if g[split_key] in test_ids]
     return train_data, val_data, test_data
-
-def save_results(name, payload, metadata=None):
-    Path("outputs").mkdir(parents=True, exist_ok=True)
-    path = Path("outputs") / f"{name}.json"
-    
-    data = payload
-    if metadata is not None:
-        data = {"results": payload, "metadata": metadata}
-        
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    print(f"Results saved to {path}")
 
 def load_tu_dataset(dataset_name, limit=None):
     from torch_geometric.datasets import TUDataset
@@ -753,7 +741,7 @@ class GETTrainer:
         param_cnt = get_num_params(self.model)
         pbar = tqdm(range(epochs), desc=f"Train {self.model_name} [{param_cnt}]", bar_format='{l_bar}{bar:20}{r_bar}')
         
-        history = {'train_loss': [], 'val_metric': []}
+        history = {'train_loss': [], 'val_loss': [], 'val_metric': []}
         for epoch in pbar:
             t0 = time.time()
             train_loss = self.train_epoch(train_loader)
@@ -774,6 +762,7 @@ class GETTrainer:
             epoch_time = time.time() - t0
             
             history['train_loss'].append(train_loss)
+            history['val_loss'].append(val_res['loss'])
             history['val_metric'].append(val_res['metric'])
             
             self.scheduler.step(val_res['loss'] if self.task_type == 'regression' else val_res['metric'])

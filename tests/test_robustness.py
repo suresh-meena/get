@@ -1,7 +1,11 @@
 import torch
+import pytest
 from get import GETModel
 from get.data import collate_get_batch
 
+_requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+
+@_requires_cuda
 def test_motif_symmetry():
     """Verify that s(i; j, k) == s(i; k, j) for motifs."""
     d = 16
@@ -34,6 +38,7 @@ def test_motif_symmetry():
     assert torch.allclose(E1, E2)
     print("Motif symmetry verified.")
 
+@_requires_cuda
 def test_empty_graph_robustness():
     """Verify that empty graphs (no edges, no motifs) don't crash and return quadratic energy only."""
     d = 16
@@ -52,6 +57,7 @@ def test_empty_graph_robustness():
     assert len(trace) > 0
     print("Empty graph robustness verified.")
 
+@_requires_cuda
 def test_permutation_equivariance():
     """Verify that permuting nodes results in permuted gradients."""
     d = 16

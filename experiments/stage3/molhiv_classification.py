@@ -48,8 +48,8 @@ def load_molhiv(root="data/OGB"):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--hidden_dim", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--data_root", default="data/OGB")
     args = parser.parse_args()
@@ -67,19 +67,19 @@ def main():
     ts_gin = add_cached_structural_features(ts)
 
     models = {
-        "PairwiseGET": (PairwiseGET(in_dim, int(args.hidden_dim * 1.73), 1, pe_k=16, rwse_k=20), tr, val, ts),
-        "FullGET": (FullGET(in_dim, args.hidden_dim, 1, pe_k=16, rwse_k=20, lambda_3=1.0), tr, val, ts),
-        "ETFaithful": (ETFaithful(in_dim, args.hidden_dim, 1, pe_k=16, rwse_k=20, num_steps=6), tr, val, ts),
+        "PairwiseGET": (PairwiseGET(in_dim, int(args.hidden_dim * 1.73), 1, pe_k=16, rwse_k=20, lambda_2=3.0, beta_2=1.5), tr, val, ts),
+        "FullGET": (FullGET(in_dim, args.hidden_dim, 1, num_blocks=8, num_steps=1, num_heads=12, pe_k=16, rwse_k=20, lambda_3=1.0, beta_3=1.2), tr, val, ts),
+        "ETFaithful": (ETFaithful(in_dim, args.hidden_dim, 1, num_blocks=8, num_heads=12, pe_k=16, rwse_k=20), tr, val, ts),
         "GIN+Struct": (GINBaseline(tr_gin[0]["x"].size(1), args.hidden_dim, 1), tr_gin, val_gin, ts_gin),
     }
 
     results = {}
     for name, (model, train_data, val_data, test_data) in models.items():
-        trainer = GETTrainer(model, task_type='binary', device=device, model_name=name, lr=1e-3, weight_decay=1e-5)
+        trainer = GETTrainer(model, task_type='binary', device=device, model_name=name, lr=1e-4, weight_decay=1e-4)
         results[name] = trainer.run(train_data, val_data, test_data, args.epochs, args.batch_size, use_weighted_loss=True)
         print(f"{name} Test ROC-AUC: {results[name]['metric']:.4f}")
 
-    save_results("exp8_molhiv_results", results)
+    save_results("exp8_molhiv_results", results, metadata=vars(args))
 
 if __name__ == "__main__":
     main()

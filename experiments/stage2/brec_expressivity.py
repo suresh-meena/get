@@ -54,7 +54,7 @@ def _load_brec_pairs(path):
     if p.suffix == ".pt":
         payload = torch.load(p, weights_only=False)
     elif p.suffix == ".npy":
-        payload = np.load(p, allow_pickle=True)
+        payload = np.load(p, allow_pickle=True, encoding='latin1')
         if isinstance(payload, np.ndarray):
             if payload.shape == ():
                 payload = payload.item()
@@ -243,7 +243,7 @@ def _resolve_brec_file(brec_file, data_root="data"):
     raw_npy = _find_raw_brec_npy(extract_dir)
     if raw_npy is not None:
         checked.append(str(raw_npy))
-        raw_payload = np.load(raw_npy, allow_pickle=True)
+        raw_payload = np.load(raw_npy, allow_pickle=True, encoding='latin1')
         pairs = _convert_raw_brec_payload(raw_payload)
         generated = Path(data_root) / "BREC" / "generated_brec_pairs.jsonl"
         _save_brec_pairs_jsonl(pairs, generated)
