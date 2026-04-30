@@ -9,12 +9,14 @@ def _adj_to_csr_utils(adj):
     a = adj.detach().cpu().numpy()
     num_nodes = a.shape[0]
     rows, cols = np.where(a > 0)
+    rows = rows.astype(np.int32, copy=False)
+    cols = cols.astype(np.int32, copy=False)
 
-    indptr = np.zeros(num_nodes + 1, dtype=np.int64)
-    row_counts = np.bincount(rows, minlength=num_nodes)
-    indptr[1:] = np.cumsum(row_counts)
+    indptr = np.zeros(num_nodes + 1, dtype=np.int32)
+    row_counts = np.asarray(np.bincount(rows, minlength=num_nodes), dtype=np.int32)
+    indptr[1:] = np.cumsum(row_counts, dtype=np.int32)
 
-    indices = cols.astype(np.int64)
+    indices = cols
     return indptr, indices
 
 
@@ -50,14 +52,9 @@ def _numba_rwse_sparse(indptr, indices, k, p_vec, p_next):
 
 def rwse_from_adjacency(num_nodes, indptr, indices, k):
     """Compute RWSE directly from CSR."""
-    if k <= 0:
-        return torch.zeros((num_nodes, 0), dtype=torch.float32)
+    from get.data.positional import get_rwse
 
-    p_vec = np.zeros(num_nodes, dtype=np.float32)
-    p_next = np.zeros(num_nodes, dtype=np.float32)
-
-    rwse_np = _numba_rwse_sparse(indptr, indices, k, p_vec, p_next)
-    return torch.from_numpy(rwse_np).to(dtype=torch.float32)
+    return get_rwse(num_nodes, indptr, indices, k)
 
 
 def laplacian_pe_from_sparse_matrix(num_nodes, indptr, indices, data, k, training=False):
@@ -74,9 +71,12 @@ def laplacian_pe_from_sparse_matrix(num_nodes, indptr, indices, data, k, trainin
         from scipy.sparse import csr_matrix
         from scipy.sparse.linalg import eigsh
 
-        lap_sparse = csr_matrix((data, indices, indptr), shape=(num_nodes, num_nodes))
-        evals, evecs = eigsh(lap_sparse, k=k + 1, which='SM', tol=1e-5)
-        use = evecs[:, 1:k + 1]
+        if k + 1 < num_nodes:
+            lap_sparse = csr_matrix((data, indices, indptr), shape=(num_nodes, num_nodes))
+            evals, evecs = eigsh(lap_sparse, k=k + 1, which='SM', tol=1e-5)
+            use = evecs[:, 1:k + 1]
+        else:
+            raise ValueError("use dense fallback")
     except (ImportError, Exception):
         lap = _numba_csr_to_dense(num_nodes, indptr, indices, np.asarray(data, dtype=np.float32))
         evals, evecs = np.linalg.eigh(lap)

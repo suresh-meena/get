@@ -1,23 +1,9 @@
 import argparse
 import torch
 
-from get import FullGET, PairwiseGET, GINBaseline
+from get import FullGET, PairwiseGET, GINBaseline, ETFaithful
 from get.data import CachedGraphDataset
-from experiments.common import set_seed, GETTrainer, save_results
-
-
-def add_cached_structural_features(dataset):
-    augmented = []
-    for item in dataset:
-        copied = dict(item)
-        feats = [copied["x"]]
-        if copied.get("pe") is not None:
-            feats.append(copied["pe"].to(dtype=copied["x"].dtype))
-        if copied.get("rwse") is not None:
-            feats.append(copied["rwse"].to(dtype=copied["x"].dtype))
-        copied["x"] = torch.cat(feats, dim=-1)
-        augmented.append(copied)
-    return augmented
+from experiments.shared.common import add_cached_structural_features, set_seed, GETTrainer, save_results
 
 def load_zinc_subset(root="data/ZINC"):
     from torch_geometric.datasets import ZINC
@@ -40,12 +26,12 @@ def load_zinc_subset(root="data/ZINC"):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=25)
-    parser.add_argument("--hidden_dim", type=int, default=256)
-    parser.add_argument("--model", choices=["pairwise", "full", "gin"], default="full")
+    parser.add_argument("--epochs", type=int, default=500)
+    parser.add_argument("--hidden_dim", type=int, default=128)
+    parser.add_argument("--model", choices=["pairwise", "full", "gin", "et_faithful"], default="et_faithful")
     parser.add_argument("--rwse_k", type=int, default=20)
     parser.add_argument("--num_samples", type=int, default=-1)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=1024)
     args = parser.parse_args()
 
     set_seed(42)
@@ -63,7 +49,10 @@ def main():
     tr_cached, val_cached, ts_cached = tr_ds.cached_data, val_ds.cached_data, ts_ds.cached_data
 
     in_dim = tr_cached[0]['x'].size(1)
-    if args.model == "full":
+    if args.model == "et_faithful":
+        model = ETFaithful(in_dim, args.hidden_dim, 1, num_steps=1, num_blocks=4, num_heads=12, head_dim=64, pe_k=15, rwse_k=args.rwse_k, eta=0.1, K=args.hidden_dim*4, mask_mode="sparse", et_official_mode=False)
+        train_data, val_data, test_data = tr_cached, val_cached, ts_cached
+    elif args.model == "full":
         model = FullGET(in_dim, args.hidden_dim, 1, num_steps=16, pe_k=16, rwse_k=args.rwse_k, lambda_3=1.0, update_damping=0.1)
         train_data, val_data, test_data = tr_cached, val_cached, ts_cached
     elif args.model == "pairwise":

@@ -5,15 +5,16 @@ from pathlib import Path
 import networkx as nx
 import torch
 
-from experiments.common import GETTrainer, save_results, set_seed, split_grouped_dataset
+from experiments.shared.common import save_results, set_seed, split_grouped_dataset
 from experiments.shared.plotting import plot_payload
 from experiments.stage1.common import (
     build_stage1_graph_item,
     match_pairwise_width,
     prepare_stage1_graph,
+    run_model_suite,
     summarize_stage1_support,
 )
-from get import FullGET, GINBaseline, PairwiseGET
+from get import ETFaithful, FullGET, GINBaseline, PairwiseGET
 
 
 def generate_matched_dataset(
@@ -110,7 +111,7 @@ def generate_matched_dataset(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_pairs", type=int, default=2000)
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--rwse_k", type=int, default=0)
@@ -178,30 +179,43 @@ def main():
         f"(params {match['pairwise_params']} vs {match['full_params']}, rel err {match['relative_error']:.3%})"
     )
 
-    results = {}
-    models = [
-        ("PairwiseGET", lambda: PairwiseGET(in_dim, pairwise_d, 1, num_steps=16, update_damping=0.05, grad_clip_norm=0.1), 1e-4, 0.5),
-        ("FullGET", lambda: FullGET(in_dim, 128, 1, num_steps=16, lambda_3=1.0, beta_3=5.0, update_damping=0.05, grad_clip_norm=0.1), 1e-4, 0.3),
-        ("GIN", lambda: GINBaseline(in_dim, 128, 1, num_layers=4), 1e-4, 1.0),
-    ]
-
-    for name, model_fn, lr, max_grad_norm in models:
-        model = model_fn()
-        if "cuda" in device:
-            torch.cuda.empty_cache()
-        print(f"\n--- Training {name} ---")
-        trainer = GETTrainer(
-            model,
-            task_type="binary",
-            device=device,
-            lr=lr,
-            max_grad_norm=max_grad_norm,
-            max_grad_val=0.05,
-            weight_decay=1e-4,
-        )
-        res = trainer.run(train_ds, val_ds, test_ds, args.epochs, args.batch_size)
-        results[name] = res
-        print(f"{name} Final Test AUC: {res['metric']:.4f}")
+    if "cuda" in device:
+        torch.cuda.empty_cache()
+    results = run_model_suite(
+        train_ds,
+        val_ds,
+        test_ds,
+        [
+            {
+                "name": "PairwiseGET",
+                "model": lambda: PairwiseGET(in_dim, pairwise_d, 1, num_steps=16, update_damping=0.05, grad_clip_norm=0.1),
+                "trainer_kwargs": {"lr": 1e-4, "max_grad_norm": 0.5, "max_grad_val": 0.05, "weight_decay": 1e-4},
+                "report_label": "Final Test AUC",
+            },
+            {
+                "name": "FullGET",
+                "model": lambda: FullGET(in_dim, 128, 1, num_steps=16, lambda_3=1.0, beta_3=5.0, update_damping=0.05, grad_clip_norm=0.1),
+                "trainer_kwargs": {"lr": 1e-4, "max_grad_norm": 0.3, "max_grad_val": 0.05, "weight_decay": 1e-4},
+                "report_label": "Final Test AUC",
+            },
+            {
+                "name": "ETFaithful",
+                "model": lambda: ETFaithful(in_dim, 128, 1, num_steps=16, rwse_k=args.rwse_k, mask_mode="sparse", et_official_mode=False),
+                "trainer_kwargs": {"lr": 1e-4, "max_grad_norm": 0.3, "max_grad_val": 0.05, "weight_decay": 1e-4},
+                "report_label": "Final Test AUC",
+            },
+            {
+                "name": "GIN",
+                "model": lambda: GINBaseline(in_dim, 128, 1, num_layers=4),
+                "trainer_kwargs": {"lr": 1e-4, "max_grad_norm": 1.0, "max_grad_val": 0.05, "weight_decay": 1e-4},
+                "report_label": "Final Test AUC",
+            },
+        ],
+        device=device,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        task_type="binary",
+    )
 
     plot_path = plot_payload(results, Path("outputs/exp1_wedge_plots.png"), title="Wedge Discrimination")
     print(f"\nPlots saved to {plot_path}")

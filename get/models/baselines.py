@@ -1,7 +1,7 @@
 """Baseline models and factory functions."""
 from get.utils.registry import register_model
 from get.models.get_model import GETModel
-from get.models.et_faithful import ETFaithfulGraphModel
+from get.models.et_core import ETFaithfulGraphModel
 import torch
 import torch.nn as nn
 

@@ -2,9 +2,8 @@ from types import SimpleNamespace
 
 import torch
 
-from experiments.common import build_anomaly_protocol_split, build_dataloader_kwargs, build_ego_graph_dataset
-from experiments.common import GETTrainer
-from get import GETBatch
+from experiments.shared.common import build_anomaly_protocol_split, build_dataloader_kwargs, build_ego_graph_dataset
+from experiments.shared.common import GETTrainer
 from torch import nn
 
 
@@ -27,7 +26,7 @@ def test_build_ego_graph_dataset_shapes_and_labels():
 
 
 def test_split_grouped_dataset_nonbinary_path_is_defined():
-    from experiments.common import split_grouped_dataset
+    from experiments.shared.common import split_grouped_dataset
 
     dataset = [
         {"x": torch.randn(2, 1), "edges": [(0, 1)], "y": torch.tensor([0]), "group": 0},

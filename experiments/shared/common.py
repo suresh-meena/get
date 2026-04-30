@@ -2,6 +2,7 @@ import random
 import json
 import time
 import inspect
+import multiprocessing as mp
 from pathlib import Path
 
 import numpy as np
@@ -131,20 +132,42 @@ def load_tu_dataset(dataset_name, limit=None):
         ds = ds[:int(limit)]
     out = []
     for idx, data in enumerate(ds):
-        x = data.x.float() if data.x is not None else torch.ones(data.num_nodes, 1)
-        edges = list(zip(data.edge_index[0].tolist(), data.edge_index[1].tolist()))
+        if data.x is None:
+            x = torch.ones(data.num_nodes, 1)
+        elif data.x.dtype == torch.float32:
+            x = data.x
+        else:
+            x = data.x.float()
+        edge_index = data.edge_index.to(dtype=torch.long).contiguous()
+        edges = edge_index.t().contiguous()
         y = data.y.view(-1)[0].long()
-        out.append({"x": x, "edges": edges, "y": y, "graph_id": idx})
+        out.append({"x": x, "edges": edges, "edge_index": edge_index, "y": y, "graph_id": idx})
     return out
+
+
+def add_cached_structural_features(dataset: list[dict]) -> list[dict]:
+    augmented = []
+    for item in dataset:
+        copied = dict(item)
+        feats = [copied["x"]]
+        if copied.get("pe") is not None:
+            feats.append(copied["pe"].to(dtype=copied["x"].dtype))
+        if copied.get("rwse") is not None:
+            feats.append(copied["rwse"].to(dtype=copied["x"].dtype))
+        copied["x"] = torch.cat(feats, dim=-1)
+        augmented.append(copied)
+    return augmented
 
 
 def build_dataloader_kwargs(device, num_workers=None, prefetch_factor=4):
     """Return DataLoader kwargs tuned for aggressive asynchronous prefetching."""
     is_cuda = str(device).startswith("cuda")
     if num_workers is None:
-        # Scale workers with CPU count, capped for stability
+        # Scale workers with CPU count, capped for stability.
+        # On CUDA jobs we want multiple workers to keep the GPU fed.
         import os
-        num_workers = min(os.cpu_count() or 4, 8) if is_cuda else 0
+        cpu_cnt = os.cpu_count() or 4
+        num_workers = min(cpu_cnt, 8) if is_cuda else 0
     num_workers = max(0, int(num_workers))
 
     kwargs = {
@@ -161,7 +184,7 @@ def build_dataloader_kwargs(device, num_workers=None, prefetch_factor=4):
 @njit
 def _numba_build_csr_adj(num_nodes, edge_index):
     """Build CSR adjacency representation directly in Numba."""
-    indptr = np.zeros(num_nodes + 1, dtype=np.int64)
+    indptr = np.zeros(num_nodes + 1, dtype=np.int32)
     E = edge_index.shape[1]
     
     # Count degrees
@@ -175,7 +198,7 @@ def _numba_build_csr_adj(num_nodes, edge_index):
     for i in range(num_nodes):
         indptr[i + 1] += indptr[i]
         
-    indices = np.empty(indptr[num_nodes], dtype=np.int64)
+    indices = np.empty(indptr[num_nodes], dtype=np.int32)
     curr_idx = indptr[:-1].copy()
     for i in range(E):
         u, v = edge_index[0, i], edge_index[1, i]
@@ -197,7 +220,7 @@ def _numba_k_hop_nodes(indptr, indices, center, num_hops):
     visited = np.zeros(num_nodes, dtype=np.bool_)
     
     # Simple queue
-    q = np.empty(num_nodes, dtype=np.int64)
+    q = np.empty(num_nodes, dtype=np.int32)
     dist = np.empty(num_nodes, dtype=np.int32)
     
     head = 0
@@ -225,7 +248,7 @@ def _numba_k_hop_nodes(indptr, indices, center, num_hops):
                 tail += 1
                 
     # Extract only visited indices
-    res = np.empty(tail, dtype=np.int64)
+    res = np.empty(tail, dtype=np.int32)
     for i in range(tail):
         res[i] = q[i]
     res.sort()
@@ -251,24 +274,71 @@ def _build_ego_graph_dataset_dgl(data, centers: list[int], num_hops: int) -> lis
         sg, _inv = dgl.khop_in_subgraph(g, int(center), k=int(num_hops), relabel_nodes=True)
         global_nodes = sg.ndata[dgl.NID].to(dtype=torch.long)
         sg_src, sg_dst = sg.edges()
-        local_edges = []
-        for u, v in zip(sg_src.tolist(), sg_dst.tolist()):
-            ui = int(u)
-            vi = int(v)
-            if ui <= vi:
-                local_edges.append((ui, vi))
+        mask = sg_src <= sg_dst
+        edge_index = torch.stack((sg_src[mask].to(dtype=torch.long), sg_dst[mask].to(dtype=torch.long)), dim=0)
 
         x_local = x_all[global_nodes].float()
-        y_local = torch.tensor([float(y_all[int(center)].item())], dtype=torch.float32)
+        y_local = y_all[int(center)].view(-1)[:1].to(dtype=torch.float32)
         samples.append(
             {
                 "x": x_local,
-                "edges": local_edges,
+                "edges": edge_index,
+                "edge_index": edge_index,
                 "y": y_local,
                 "graph_id": int(center),
             }
         )
     return samples
+
+
+_EGO_BUILD_EDGE_INDEX = None
+_EGO_BUILD_INDPTR = None
+_EGO_BUILD_INDICES = None
+_EGO_BUILD_X_ALL = None
+_EGO_BUILD_Y_ALL = None
+_EGO_BUILD_NUM_HOPS = None
+_EGO_BUILD_MAX_NODES = None
+
+
+def _ego_graph_worker_init(edge_index_np, x_all, y_all, num_hops: int, max_nodes: int | None):
+    global _EGO_BUILD_EDGE_INDEX, _EGO_BUILD_INDPTR, _EGO_BUILD_INDICES, _EGO_BUILD_X_ALL, _EGO_BUILD_Y_ALL, _EGO_BUILD_NUM_HOPS, _EGO_BUILD_MAX_NODES
+    _EGO_BUILD_EDGE_INDEX = edge_index_np
+    _EGO_BUILD_INDPTR, _EGO_BUILD_INDICES = _numba_build_csr_adj(x_all.size(0), edge_index_np)
+    _EGO_BUILD_X_ALL = x_all
+    _EGO_BUILD_Y_ALL = y_all
+    _EGO_BUILD_NUM_HOPS = int(num_hops)
+    _EGO_BUILD_MAX_NODES = None if max_nodes is None else max(1, int(max_nodes))
+
+
+def _cap_ego_nodes(nodes: np.ndarray, center: int, max_nodes: int | None) -> np.ndarray:
+    if max_nodes is None or int(max_nodes) <= 0 or nodes.size <= int(max_nodes):
+        return nodes
+    max_nodes = int(max_nodes)
+    center_mask = nodes == center
+    if np.any(center_mask):
+        others = nodes[~center_mask]
+        if max_nodes <= 1:
+            return np.asarray([center], dtype=np.int64)
+        capped = np.concatenate([np.asarray([center], dtype=np.int64), others[: max_nodes - 1]])
+        capped.sort()
+        return capped
+    return nodes[:max_nodes]
+
+
+def _ego_graph_worker(center: int) -> dict:
+    nodes = _numba_k_hop_nodes(_EGO_BUILD_INDPTR, _EGO_BUILD_INDICES, int(center), _EGO_BUILD_NUM_HOPS)
+    nodes = _cap_ego_nodes(nodes, int(center), _EGO_BUILD_MAX_NODES)
+    l_src, l_dst = _numba_extract_subgraph_edges(_EGO_BUILD_INDPTR, _EGO_BUILD_INDICES, nodes)
+    edge_index = torch.from_numpy(np.stack((l_src, l_dst), axis=0)).to(dtype=torch.long)
+    x_local = _EGO_BUILD_X_ALL[nodes].float()
+    y_local = _EGO_BUILD_Y_ALL[int(center)].view(-1)[:1].to(dtype=torch.float32)
+    return {
+        "x": x_local,
+        "edges": edge_index,
+        "edge_index": edge_index,
+        "y": y_local,
+        "graph_id": int(center),
+    }
 
 
 @njit
@@ -281,7 +351,7 @@ def _numba_extract_subgraph_edges(indptr, indices, nodes):
         if n > max_global:
             max_global = n
             
-    mapping = np.full(max_global + 1, -1, dtype=np.int64)
+    mapping = np.full(max_global + 1, -1, dtype=np.int32)
     for i in range(len(nodes)):
         mapping[nodes[i]] = i
         
@@ -301,8 +371,8 @@ def _numba_extract_subgraph_edges(indptr, indices, nodes):
                     count += 1
                     
     # Pass 2: fill edges
-    local_src = np.empty(count, dtype=np.int64)
-    local_dst = np.empty(count, dtype=np.int64)
+    local_src = np.empty(count, dtype=np.int32)
+    local_dst = np.empty(count, dtype=np.int32)
     curr = 0
     for i in range(num_nodes):
         u_global = nodes[i]
@@ -317,7 +387,15 @@ def _numba_extract_subgraph_edges(indptr, indices, nodes):
     return local_src, local_dst
 
 
-def build_ego_graph_dataset(data, num_hops: int = 1, limit: int | None = None, use_dgl_if_available: bool = True) -> list[dict]:
+def build_ego_graph_dataset(
+    data,
+    num_hops: int = 1,
+    limit: int | None = None,
+    use_dgl_if_available: bool = True,
+    num_workers: int = 0,
+    chunksize: int = 8,
+    max_nodes: int | None = None,
+) -> list[dict]:
     """
     Convert a node-labeled single graph into graph samples via ego subgraphs.
     """
@@ -326,36 +404,30 @@ def build_ego_graph_dataset(data, num_hops: int = 1, limit: int | None = None, u
     if limit is not None:
         centers = centers[: int(limit)]
 
-    if use_dgl_if_available:
-        fast = _build_ego_graph_dataset_dgl(data, centers=centers, num_hops=int(num_hops))
-        if fast is not None:
-            return fast
-
-    edge_index_np = data.edge_index.detach().cpu().numpy().astype(np.int64)
-    indptr, indices = _numba_build_csr_adj(n, edge_index_np)
-    
+    edge_index_np = data.edge_index.detach().cpu().numpy().astype(np.int32)
     x_all = data.x
     y_all = data.y
 
     samples: list[dict] = []
-    for center in tqdm(centers, desc=f"Building ego graphs (h={int(num_hops)})", leave=False):
-        # Numba-accelerated BFS
-        nodes = _numba_k_hop_nodes(indptr, indices, int(center), int(num_hops))
-        
-        # Numba-accelerated subgraph extraction
-        l_src, l_dst = _numba_extract_subgraph_edges(indptr, indices, nodes)
-        local_edges = list(zip(l_src.tolist(), l_dst.tolist()))
-
-        x_local = x_all[nodes].float()
-        y_local = torch.tensor([float(y_all[int(center)].item())], dtype=torch.float32)
-        samples.append(
-            {
-                "x": x_local,
-                "edges": local_edges,
-                "y": y_local,
-                "graph_id": int(center),
-            }
-        )
+    if int(num_workers) > 0 and len(centers) > 1:
+        ctx_name = "fork" if "fork" in mp.get_all_start_methods() else mp.get_start_method() or "spawn"
+        ctx = mp.get_context(ctx_name)
+        with ctx.Pool(
+            processes=int(num_workers),
+            initializer=_ego_graph_worker_init,
+            initargs=(edge_index_np, x_all, y_all, int(num_hops), max_nodes),
+        ) as pool:
+            for sample in tqdm(
+                pool.imap(_ego_graph_worker, centers, chunksize=max(1, int(chunksize))),
+                total=len(centers),
+                desc=f"Building ego graphs (h={int(num_hops)})",
+                leave=False,
+            ):
+                samples.append(sample)
+    else:
+        _ego_graph_worker_init(edge_index_np, x_all, y_all, int(num_hops), max_nodes)
+        for center in tqdm(centers, desc=f"Building ego graphs (h={int(num_hops)})", leave=False):
+            samples.append(_ego_graph_worker(int(center)))
     return samples
 
 
@@ -551,13 +623,18 @@ class GETTrainer:
         return total_loss / max(len(loader), 1)
 
     @torch.no_grad()
-    def evaluate(self, loader, inference_mode='fixed'):
+    def evaluate(self, loader, inference_mode='fixed', capture_energy_trace=False):
         self.model.eval()
-        all_preds, all_y = [], []
+        pred_chunks: list[torch.Tensor] = []
+        y_chunks: list[torch.Tensor] = []
+        energy_trace: list[float] = []
+        captured_trace = False
         total_loss = 0
         if len(loader) == 0:
             metrics = {'loss': 0.0}
             metrics['metric'] = 0.5 if self.task_type == 'binary' else 0.0
+            if capture_energy_trace:
+                metrics['energy_trace'] = []
             return metrics
         for batch in loader:
             batch = batch.to(self.device, non_blocking=True)
@@ -570,33 +647,42 @@ class GETTrainer:
                 if inference_mode == 'armijo' and self.supports_armijo:
                     forward_kwargs['inference_mode'] = 'armijo'
                 
-                out, _ = self.model(batch, **forward_kwargs)
+                out, batch_energy_trace = self.model(batch, **forward_kwargs)
+                if capture_energy_trace and not captured_trace and batch_energy_trace is not None:
+                    captured_trace = True
+                    for step_energy in batch_energy_trace:
+                        if isinstance(step_energy, torch.Tensor):
+                            energy_trace.append(float(step_energy.detach().float().mean().cpu().item()))
+                        else:
+                            energy_trace.append(float(np.asarray(step_energy, dtype=np.float64).mean()))
                 if self.task_type in ['binary', 'regression']:
                     total_loss += self.criterion(out.view(-1), batch.y.view(-1).float()).item()
                     pred = torch.sigmoid(out).view(-1) if self.task_type == 'binary' else out.view(-1)
-                    all_preds.extend(pred.cpu().numpy().tolist())
-                    all_y.extend(batch.y.view(-1).cpu().numpy().tolist())
+                    pred_chunks.append(pred.detach())
+                    y_chunks.append(batch.y.view(-1).detach())
                 elif self.task_type == 'multilabel':
                     total_loss += self.criterion(out, batch.y.view(out.shape).float()).item()
-                    pred = torch.sigmoid(out)
-                    all_preds.append(pred.cpu().numpy())
-                    all_y.append(batch.y.view(out.shape).cpu().numpy())
+                    pred_chunks.append(torch.sigmoid(out).detach())
+                    y_chunks.append(batch.y.view(out.shape).detach())
                 else:
                     total_loss += self.criterion(out, batch.y.view(-1).long()).item()
-                    pred = out.argmax(dim=-1)
-                    all_preds.extend(pred.cpu().numpy().tolist())
-                    all_y.extend(batch.y.view(-1).cpu().numpy().tolist())
+                    pred_chunks.append(out.argmax(dim=-1).detach())
+                    y_chunks.append(batch.y.view(-1).detach())
         
         metrics = {'loss': total_loss / max(len(loader), 1)}
         if self.task_type == 'binary':
+            all_preds = torch.cat(pred_chunks, dim=0).cpu().numpy().tolist()
+            all_y = torch.cat(y_chunks, dim=0).cpu().numpy().tolist()
             metrics['metric'] = roc_auc_score(all_y, all_preds) if len(set(all_y)) > 1 else 0.5
             y_pred_bin = [int(p >= 0.5) for p in all_preds]
             metrics['accuracy'] = accuracy_score(all_y, y_pred_bin)
         elif self.task_type == 'regression':
+            all_preds = torch.cat(pred_chunks, dim=0).cpu().numpy().tolist()
+            all_y = torch.cat(y_chunks, dim=0).cpu().numpy().tolist()
             metrics['metric'] = mean_absolute_error(all_y, all_preds)
         elif self.task_type == 'multilabel':
-            y_true_arr = np.concatenate(all_y, axis=0)
-            y_pred_arr = np.concatenate(all_preds, axis=0)
+            y_true_arr = torch.cat(y_chunks, dim=0).cpu().numpy()
+            y_pred_arr = torch.cat(pred_chunks, dim=0).cpu().numpy()
             from sklearn.metrics import average_precision_score
             aps = []
             for c in range(y_true_arr.shape[1]):
@@ -605,7 +691,11 @@ class GETTrainer:
                 aps.append(average_precision_score(y_true_arr[:, c], y_pred_arr[:, c]))
             metrics['metric'] = float(np.mean(aps)) if aps else 0.0
         else:
+            all_preds = torch.cat(pred_chunks, dim=0).cpu().numpy().tolist()
+            all_y = torch.cat(y_chunks, dim=0).cpu().numpy().tolist()
             metrics['metric'] = accuracy_score(all_y, all_preds)
+        if capture_energy_trace:
+            metrics['energy_trace'] = energy_trace
         return metrics
 
     def _capture_energy_trace(self, loader, inference_mode='armijo'):
@@ -703,12 +793,11 @@ class GETTrainer:
         if best_state:
             self.model.load_state_dict(best_state, strict=False)
 
-        energy_trace = self._capture_energy_trace(test_loader, inference_mode='armijo' if use_armijo_at_test else 'fixed')
-        
         # Use Armijo for the final test evaluation as per paper
         test_mode = 'armijo' if use_armijo_at_test else 'fixed'
-        test_res = self.evaluate(test_loader, inference_mode=test_mode)
+        test_res = self.evaluate(test_loader, inference_mode=test_mode, capture_energy_trace=True)
         test_res['history'] = history
+        energy_trace = test_res.pop('energy_trace', [])
         if energy_trace:
             test_res['energy_trace'] = energy_trace
         return test_res

@@ -5,8 +5,8 @@ from .et_core import (
     ETAttentionCore,
     ETHopfieldCore,
     ETCoreBlock,
+    ETFaithfulGraphModel,
 )
-from .et_faithful import ETFaithfulGraphModel
 from .baselines import (
     GINBaseline,
     PairwiseGET,

@@ -1,48 +1,9 @@
 import argparse
-import random
 import torch
-import networkx as nx
-from tqdm.auto import tqdm
-import numpy as np
 
-from get import FullGET, PairwiseGET, GINBaseline
-from experiments.common import set_seed, GETTrainer, save_results, split_grouped_dataset
-
-def generate_true_triangle_regression_dataset(num_graphs=2000, n_nodes=24, degree_range=(2, 6), seed=0):
-    dataset = []
-    pbar = tqdm(total=num_graphs, desc="Generating Graphs")
-    rng = random.Random(seed)
-    
-    for i in range(num_graphs):
-        degree = rng.randint(degree_range[0], degree_range[1])
-        base_seed = rng.randint(0, 10**9)
-        
-        try:
-            G = nx.random_regular_graph(degree, n_nodes, seed=base_seed)
-        except nx.NetworkXError:
-            G = nx.fast_gnp_random_graph(n_nodes, degree/n_nodes, seed=base_seed)
-            
-        nswap = rng.randint(4, degree * n_nodes)
-        try:
-            nx.double_edge_swap(G, nswap=nswap, max_tries=nswap * 10, seed=rng.randint(0, 10**9))
-        except nx.NetworkXAlgorithmError:
-            pass
-            
-        tri_count = sum(nx.triangles(G).values()) // 3
-        
-        dataset.append({
-            "x": torch.ones(n_nodes, 1), 
-            "edges": list(G.edges()), 
-            "y": torch.tensor([float(tri_count)], dtype=torch.float32),
-            "degree": float(degree),
-            "graph_id": i,
-            "tri_count": float(tri_count),
-        })
-        pbar.update(1)
-        
-    counts = np.array([g["tri_count"] for g in dataset])
-    print(f"Triangle range: [{counts.min():.0f}, {counts.max():.0f}], mean: {counts.mean():.2f}")
-    return dataset
+from get import ETFaithful, FullGET, PairwiseGET, GINBaseline
+from experiments.shared.common import set_seed, save_results, split_grouped_dataset
+from experiments.stage1.common import generate_true_triangle_regression_dataset, run_model_suite
 
 def main():
     parser = argparse.ArgumentParser()
@@ -64,19 +25,21 @@ def main():
     
     train_ds, val_ds, test_ds = split_grouped_dataset(dataset, "graph_id", seed=args.seed)
 
-    results = {}
-    models = [
-        ("FullGET", FullGET(1, 64, 1, num_steps=16, R=2, lambda_3=1.0, update_damping=0.1), 5e-4),
-        ("PairwiseGET", PairwiseGET(1, 110, 1, num_steps=8), 5e-4),
-        ("GIN", GINBaseline(1, 64, 1), 5e-4),
-    ]
-
-    for name, model, lr in models:
-        print(f"\n--- Training {name} ---")
-        trainer = GETTrainer(model, task_type='regression', device=device, lr=lr)
-        res = trainer.run(train_ds, val_ds, test_ds, args.epochs, args.batch_size)
-        results[name] = res
-        print(f"{name} Test MAE: {res['metric']:.4f}")
+    results = run_model_suite(
+        train_ds,
+        val_ds,
+        test_ds,
+        [
+            {"name": "FullGET", "model": FullGET(1, 64, 1, num_steps=16, R=2, lambda_3=1.0, update_damping=0.1), "trainer_kwargs": {"lr": 5e-4}, "report_label": "Test MAE"},
+            {"name": "ETFaithful", "model": ETFaithful(1, 64, 1, num_steps=16, mask_mode="sparse", et_official_mode=False), "trainer_kwargs": {"lr": 5e-4}, "report_label": "Test MAE"},
+            {"name": "PairwiseGET", "model": PairwiseGET(1, 110, 1, num_steps=8), "trainer_kwargs": {"lr": 5e-4}, "report_label": "Test MAE"},
+            {"name": "GIN", "model": GINBaseline(1, 64, 1), "trainer_kwargs": {"lr": 5e-4}, "report_label": "Test MAE"},
+        ],
+        device=device,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        task_type="regression",
+    )
 
     save_results("exp1_triangle_regression_v2", results)
 

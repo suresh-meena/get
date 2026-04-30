@@ -3,21 +3,7 @@ import torch
 
 from get import FullGET, PairwiseGET, GINBaseline, ETFaithful
 from get.data import CachedGraphDataset
-from experiments.common import set_seed, GETTrainer, save_results
-
-
-def add_cached_structural_features(dataset):
-    augmented = []
-    for item in dataset:
-        copied = dict(item)
-        feats = [copied["x"]]
-        if copied.get("pe") is not None:
-            feats.append(copied["pe"].to(dtype=copied["x"].dtype))
-        if copied.get("rwse") is not None:
-            feats.append(copied["rwse"].to(dtype=copied["x"].dtype))
-        copied["x"] = torch.cat(feats, dim=-1)
-        augmented.append(copied)
-    return augmented
+from experiments.shared.common import add_cached_structural_features, set_seed, GETTrainer, save_results
 
 def load_molhiv(root="data/OGB"):
     try:
@@ -61,7 +47,7 @@ def load_molhiv(root="data/OGB"):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)

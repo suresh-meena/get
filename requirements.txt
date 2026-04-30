@@ -18,6 +18,7 @@ numpy
 numba
 networkx
 scikit-learn
+scipy
 tqdm
 matplotlib
 seaborn

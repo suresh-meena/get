@@ -13,67 +13,27 @@ internal compatibility; new code should import from subpackages.
 
 # --- Data pipeline ---
 from .data import (
-    add_structural_node_features as add_structural_node_features,
-    collate_get_batch as collate_get_batch,
-    GETBatch as GETBatch,
-    CachedGraphDataset as CachedGraphDataset,
-    validate_get_batch as validate_get_batch,
+    add_structural_node_features,
+    collate_get_batch,
+    GETBatch,
+    CachedGraphDataset,
+    validate_get_batch,
 )
 
 # --- Core model ---
-from .models.get_model import GETModel as GETModel
+from .models.get_model import GETModel
 
 # --- ET core ---
-from .models.et_core import (
-    ETAttentionCore as ETAttentionCore,
-    ETHopfieldCore as ETHopfieldCore,
-    ETCoreBlock as ETCoreBlock,
-)
+from .models.et_core import ETAttentionCore, ETHopfieldCore, ETCoreBlock
 
 # --- NN primitives ---
-from .nn import (
-    EnergyLayerNorm as EnergyLayerNorm,
-    ETGraphMaskModulator as ETGraphMaskModulator,
-)
+from .nn import EnergyLayerNorm, ETGraphMaskModulator
 
 # --- Baselines & factories ---
-from .models.baselines import (
-    PairwiseGET as PairwiseGET,
-    FullGET as FullGET,
-    GINBaseline as GINBaseline,
-    GCNBaseline as GCNBaseline,
-    GATBaseline as GATBaseline,
-    ETFaithful as ETFaithful,
-)
-
-# --- Registry ---
-from .utils.registry import (
-    MODEL_REGISTRY as MODEL_REGISTRY,
-    available_models as available_models,
-    build_model as build_model,
-    register_model as register_model,
-)
-
-# --- Graph utilities ---
-from .utils.graph import (
-    build_undirected_adjacency as build_undirected_adjacency,
-    shortest_path_distances as shortest_path_distances,
-    degree_centrality as degree_centrality,
-    augment_with_virtual_node as augment_with_virtual_node,
-)
+from .models.baselines import PairwiseGET, FullGET, GINBaseline, GCNBaseline, GATBaseline, ETFaithful
 
 # --- Training utilities ---
-from .utils.training import (
-    build_adamw_optimizer as build_adamw_optimizer,
-    maybe_compile_model as maybe_compile_model,
-    random_flip_pe_signs as random_flip_pe_signs,
-)
-
-# --- Encoding utilities ---
-from .utils.encoding import (
-    laplacian_pe_from_adjacency as laplacian_pe_from_adjacency,
-    rwse_from_adjacency as rwse_from_adjacency,
-)
+from .utils.training import build_adamw_optimizer, maybe_compile_model, random_flip_pe_signs
 
 __all__ = [
     # Data
@@ -97,20 +57,8 @@ __all__ = [
     "GCNBaseline",
     "GATBaseline",
     "ETFaithful",
-    # Registry
-    "MODEL_REGISTRY",
-    "available_models",
-    "build_model",
-    "register_model",
-    # Graph utilities
-    "build_undirected_adjacency",
-    "shortest_path_distances",
-    "degree_centrality",
-    "augment_with_virtual_node",
     # Training
     "build_adamw_optimizer",
     "maybe_compile_model",
-    "laplacian_pe_from_adjacency",
     "random_flip_pe_signs",
-    "rwse_from_adjacency",
 ]

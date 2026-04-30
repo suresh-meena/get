@@ -18,6 +18,13 @@ except (ImportError, OSError):
     pyg_scatter_lse = None
 
 
+def _is_compiling():
+    dynamo = getattr(torch, "_dynamo", None)
+    if dynamo is None:
+        return False
+    return bool(getattr(dynamo, "is_compiling", lambda: False)())
+
+
 # ---------------------------------------------------------------------------
 # Segment reduce
 # ---------------------------------------------------------------------------
@@ -57,7 +64,7 @@ def segment_reduce_1d(src, segment_ids, num_segments, reduce="sum"):
     src: [..., L, ...] tensor of values.
     segment_ids: [L] tensor of target segment indices.
     """
-    if _torch_scatter is not None:
+    if _torch_scatter is not None and not _is_compiling():
         try:
             dim = -1
             if src.dim() > 2 and src.size(-1) != len(segment_ids):
@@ -76,7 +83,7 @@ def segment_reduce_1d(src, segment_ids, num_segments, reduce="sum"):
 # ---------------------------------------------------------------------------
 
 def segment_logsumexp(x, segment_ids, num_segments):
-    if pyg_scatter_lse is not None:
+    if pyg_scatter_lse is not None and not _is_compiling():
         try:
             lse = pyg_scatter_lse(x, segment_ids, dim=-1, dim_size=num_segments)
             return torch.where(torch.isinf(lse) & (lse < 0), torch.zeros_like(lse), lse)
@@ -105,7 +112,7 @@ def segment_softmax(x, segment_ids, num_segments):
 
 def scatter_add_nd(grad_buffer, indices, src, dim):
     """Memory-efficient N-dimensional scatter-add."""
-    if pyg_scatter is not None:
+    if pyg_scatter is not None and not _is_compiling():
         try:
             return pyg_scatter(src, indices, dim=dim, dim_size=grad_buffer.size(dim), reduce="sum")
         except Exception:

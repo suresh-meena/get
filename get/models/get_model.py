@@ -270,9 +270,7 @@ class GETModel(nn.Module):
 
         if compile and hasattr(torch, "compile"):
             try:
-                for layer in self.get_layers:
-                    layer.energy_and_grad = torch.compile(layer.energy_and_grad, dynamic=True)
-                self._run_fixed_solver = torch.compile(self._run_fixed_solver, dynamic=True)
+                self._run_fixed_solver = torch.compile(self._run_fixed_solver, backend="aot_eager", dynamic=True)
                 print("INFO:    Successfully compiled GrET inference solvers.")
             except Exception:
                 pass
@@ -389,7 +387,7 @@ class GETModel(nn.Module):
         for block_idx, layer in enumerate(self.get_layers):
             static_projections = static_projections_list[block_idx]
             for step_idx in range(self.num_steps):
-                X_prev = X_current.detach().clone() if (self.tol > 0 and step_idx % check_freq == 0) else None
+                X_prev = X_current.detach() if (self.tol > 0 and step_idx % check_freq == 0) else None
                 
                 # Use the layer's forward which now returns next state and energy
                 X_next, E = layer(X_current, solver_batch, eta, static_projections, is_training=training_mode, degree_scaler=degree_scaler)
@@ -440,9 +438,13 @@ class GETModel(nn.Module):
                     end_bt = min(start_bt + chunk_size, armijo_max_backtracks)
                     etas = etas_all[start_bt:end_bt]
                     
-                    # Evaluate current chunk
-                    X_tries = X_current.unsqueeze(0) - etas.view(-1, 1, 1) * grad_X.unsqueeze(0)
-                    E_tries = layer.compute_energy(X_tries, batch_data, static_projections=static_projections, degree_scaler=degree_scaler)
+                    # Evaluate current chunk sequentially to avoid OOM
+                    E_tries = []
+                    for eta in etas:
+                        X_try = X_current - eta * grad_X
+                        E_try = layer.compute_energy(X_try, batch_data, static_projections=static_projections, degree_scaler=degree_scaler)
+                        E_tries.append(E_try)
+                    E_tries = torch.stack(E_tries, dim=0)
                     E_target = E_t.unsqueeze(0) - armijo_c * etas.view(-1, 1) * gn_sq_graph.unsqueeze(0)
                     
                     valid = (E_tries <= E_target)

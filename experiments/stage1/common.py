@@ -334,3 +334,198 @@ def match_pairwise_hidden_dim(
         "matched_params": match["pairwise_params"],
         "relative_error": match["relative_error"],
     }
+
+
+def generate_true_triangle_regression_dataset(num_graphs=2000, n_nodes=24, degree_range=(2, 6), seed=0):
+    dataset = []
+    rng = random.Random(seed)
+
+    for i in range(num_graphs):
+        degree = rng.randint(degree_range[0], degree_range[1])
+        base_seed = rng.randint(0, 10**9)
+
+        try:
+            graph = nx.random_regular_graph(degree, n_nodes, seed=base_seed)
+        except nx.NetworkXError:
+            graph = nx.fast_gnp_random_graph(n_nodes, degree / n_nodes, seed=base_seed)
+
+        nswap = rng.randint(4, degree * n_nodes)
+        try:
+            nx.double_edge_swap(graph, nswap=nswap, max_tries=nswap * 10, seed=rng.randint(0, 10**9))
+        except nx.NetworkXAlgorithmError:
+            pass
+
+        tri_count = sum(nx.triangles(graph).values()) // 3
+        dataset.append(
+            {
+                "x": torch.ones(n_nodes, 1),
+                "edges": list(graph.edges()),
+                "y": torch.tensor([float(tri_count)], dtype=torch.float32),
+                "degree": float(degree),
+                "graph_id": i,
+                "tri_count": float(tri_count),
+            }
+        )
+
+    counts = np.array([g["tri_count"] for g in dataset], dtype=np.float64)
+    print(f"Triangle range: [{counts.min():.0f}, {counts.max():.0f}], mean: {counts.mean():.2f}")
+    return dataset
+
+
+def generate_degree_controlled_triangle_dataset(
+    num_graphs=2000,
+    n_nodes=24,
+    degree=4,
+    seed=0,
+    rwse_k=0,
+    include_degree=False,
+    include_motif_counts=False,
+    support_mode="exact",
+    max_motifs=None,
+    feature_mode="core",
+):
+    rows = []
+    rng = random.Random(seed)
+    while len(rows) < num_graphs:
+        base_seed = rng.randint(0, 10**9)
+        graph = nx.random_regular_graph(degree, n_nodes, seed=base_seed)
+        nswap = rng.randint(max(4, degree * 2), max(8, degree * n_nodes))
+        try:
+            nx.double_edge_swap(graph, nswap=nswap, max_tries=max(100, nswap * 20), seed=rng.randint(0, 10**9))
+        except nx.NetworkXException:
+            continue
+        tri_count = sum(nx.triangles(graph).values()) // 3
+        rows.append({"graph": graph, "tri_count": tri_count})
+
+    counts = np.array([r["tri_count"] for r in rows], dtype=np.float64)
+
+    dataset = []
+    for i, r in enumerate(rows):
+        base_item = build_stage1_graph_item(
+            r["graph"],
+            float(r["tri_count"]),
+            i,
+            rwse_k=0,
+            include_degree=include_degree,
+            include_motif_counts=include_motif_counts,
+        )
+        item = prepare_stage1_graph(
+            base_item,
+            feature_mode=feature_mode,
+            support_mode=support_mode,
+            max_motifs=max_motifs,
+            rwse_k=rwse_k,
+            seed=seed + i,
+        )
+        item["degree"] = float(degree)
+        item["tri_count"] = float(r["tri_count"])
+        dataset.append(item)
+
+    print(
+        f"count range: [{counts.min():.0f}, {counts.max():.0f}], "
+        f"mean: {counts.mean():.2f}, std: {counts.std():.2f}"
+    )
+    return dataset
+
+
+def generate_srg_dataset(num_pairs=500, seed=0):
+    nodes = [(x, y) for x in range(4) for y in range(4)]
+    node_to_idx = {p: i for i, p in enumerate(nodes)}
+
+    gens0 = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1)]
+    edges0_base = []
+    for x, y in nodes:
+        for dx, dy in gens0:
+            nx_, ny_ = (x + dx) % 4, (y + dy) % 4
+            u, v = node_to_idx[(x, y)], node_to_idx[(nx_, ny_)]
+            if u < v:
+                edges0_base.append((u, v))
+
+    edges1_base = []
+    for x, y in nodes:
+        for i in range(1, 4):
+            nx_, ny_ = (x + i) % 4, y
+            u, v = node_to_idx[(x, y)], node_to_idx[(nx_, ny_)]
+            if u < v:
+                edges1_base.append((u, v))
+            nx_, ny_ = x, (y + i) % 4
+            u, v = node_to_idx[(x, y)], node_to_idx[(nx_, ny_)]
+            if u < v:
+                edges1_base.append((u, v))
+    edges1_base = list(set(tuple(sorted(e)) for e in edges1_base))
+
+    rng = np.random.default_rng(seed)
+    dataset = []
+    for pair_id in range(num_pairs):
+        perm = rng.permutation(16)
+        mapping = {i: int(perm[i]) for i in range(16)}
+        edges0 = [(mapping[u], mapping[v]) for u, v in edges0_base]
+        dataset.append({"x": torch.ones(16, 1), "edges": edges0, "y": torch.tensor([0.0]), "graph_id": f"shrikhande_{pair_id}"})
+
+        perm = rng.permutation(16)
+        mapping = {i: int(perm[i]) for i in range(16)}
+        edges1 = [(mapping[u], mapping[v]) for u, v in edges1_base]
+        dataset.append({"x": torch.ones(16, 1), "edges": edges1, "y": torch.tensor([1.0]), "graph_id": f"rook_{pair_id}"})
+    return dataset
+
+
+def generate_cycle_parity_dataset(num_pairs=500, n=20, seed=0):
+    rng = np.random.default_rng(seed)
+    dataset = []
+    for pair_id in range(num_pairs):
+        g0 = nx.random_regular_graph(3, n, seed=int(rng.integers(0, 2**32 - 1)))
+        while not nx.is_bipartite(g0):
+            g0 = nx.random_regular_graph(3, n, seed=int(rng.integers(0, 2**32 - 1)))
+        dataset.append({"x": torch.ones(n, 1), "edges": list(g0.edges()), "y": torch.tensor([0.0]), "graph_id": f"bipartite_{pair_id}"})
+
+        g1 = nx.random_regular_graph(3, n, seed=int(rng.integers(0, 2**32 - 1)))
+        while nx.is_bipartite(g1):
+            g1 = nx.random_regular_graph(3, n, seed=int(rng.integers(0, 2**32 - 1)))
+        dataset.append({"x": torch.ones(n, 1), "edges": list(g1.edges()), "y": torch.tensor([1.0]), "graph_id": f"nonbipartite_{pair_id}"})
+    return dataset
+
+
+def stratified_split(dataset, seed):
+    from sklearn.model_selection import train_test_split
+
+    labels = np.array([int(float(item["y"].view(-1)[0].item()) >= 0.5) for item in dataset])
+    idx = np.arange(len(dataset))
+    train_idx, tmp_idx, y_train, y_tmp = train_test_split(
+        idx,
+        labels,
+        train_size=0.70,
+        random_state=seed,
+        stratify=labels,
+    )
+    val_idx, test_idx = train_test_split(
+        tmp_idx,
+        train_size=0.50,
+        random_state=seed + 1,
+        stratify=y_tmp,
+    )
+    return [dataset[i] for i in train_idx], [dataset[i] for i in val_idx], [dataset[i] for i in test_idx]
+
+
+def run_model_suite(
+    train_ds,
+    val_ds,
+    test_ds,
+    model_specs,
+    *,
+    device,
+    epochs,
+    batch_size,
+    task_type,
+):
+    results = {}
+    for spec in model_specs:
+        name = spec["name"]
+        model_obj = spec["model"]
+        model = model_obj() if callable(model_obj) and not isinstance(model_obj, torch.nn.Module) else model_obj
+        trainer_kwargs = dict(spec.get("trainer_kwargs", {}))
+        trainer = GETTrainer(model, task_type=task_type, device=device, **trainer_kwargs)
+        res = trainer.run(train_ds, val_ds, test_ds, epochs, batch_size)
+        results[name] = res
+        metric_name = spec.get("metric_name", "metric")
+        print(f"{name} {spec.get('report_label', metric_name)}: {res[metric_name]:.4f}")
+    return results

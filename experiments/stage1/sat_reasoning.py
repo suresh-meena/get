@@ -10,8 +10,8 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from get import FullGET, PairwiseGET, collate_get_batch  # noqa: E402
-from experiments.common import set_seed, build_dataloader_kwargs, get_num_params, save_results  # noqa: E402
+from get import ETFaithful, FullGET, PairwiseGET, collate_get_batch  # noqa: E402
+from experiments.shared.common import set_seed, build_dataloader_kwargs, get_num_params, save_results  # noqa: E402
 
 def generate_random_3cnf(num_vars=20, num_clauses=80, seed=42):
     rng = random.Random(seed)
@@ -297,7 +297,7 @@ def train(model, train_loader, val_loader, test_loader, epochs, device, model_na
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_graphs", type=int, default=100)
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--xor", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
@@ -315,6 +315,7 @@ def main():
     models = {
         "PairwiseGET": PairwiseGET(4, int(args.hidden_dim * 1.73), 1, num_steps=8),
         "FullGET": FullGET(4, args.hidden_dim, 1, num_steps=8, R=2, lambda_3=1.0, lambda_m=1.0, num_motif_types=24),
+        "ETFaithful": ETFaithful(4, args.hidden_dim, 1, num_steps=8, mask_mode="sparse", et_official_mode=False),
     }
     results = {}
     for name, model in models.items():

@@ -1,77 +1,14 @@
 import argparse
-import random
-
-import networkx as nx
 import numpy as np
 import torch
-from tqdm.auto import tqdm
 
-from experiments.common import GETTrainer, build_dataloader_kwargs, save_results, set_seed, split_grouped_dataset
+from experiments.shared.common import GETTrainer, build_dataloader_kwargs, save_results, set_seed, split_grouped_dataset
 from experiments.stage1.common import (
-    build_stage1_graph_item,
+    generate_degree_controlled_triangle_dataset,
     match_pairwise_width,
-    prepare_stage1_graph,
     summarize_stage1_support,
 )
-from get import FullGET, GINBaseline, PairwiseGET
-
-def generate_degree_controlled_triangle_dataset(
-    num_graphs=2000,
-    n_nodes=24,
-    degree=4,
-    seed=0,
-    rwse_k=0,
-    include_degree=False,
-    include_motif_counts=False,
-    support_mode="exact",
-    max_motifs=None,
-    feature_mode="core",
-):
-    rows = []
-    pbar = tqdm(total=num_graphs, desc="Generating Graphs")
-    rng = random.Random(seed)
-    while len(rows) < num_graphs:
-        base_seed = rng.randint(0, 10**9)
-        G = nx.random_regular_graph(degree, n_nodes, seed=base_seed)
-        nswap = rng.randint(max(4, degree * 2), max(8, degree * n_nodes))
-        try:
-            nx.double_edge_swap(G, nswap=nswap, max_tries=max(100, nswap * 20), seed=rng.randint(0, 10**9))
-        except nx.NetworkXException:
-            continue
-        tri_count = sum(nx.triangles(G).values()) // 3
-        rows.append({"graph": G, "tri_count": tri_count})
-        pbar.update(1)
-
-    counts = np.array([r["tri_count"] for r in rows], dtype=np.float64)
-
-    dataset = []
-    for i, r in enumerate(rows):
-        y = float(r["tri_count"])
-        base_item = build_stage1_graph_item(
-            r["graph"],
-            y,
-            i,
-            rwse_k=0,
-            include_degree=include_degree,
-            include_motif_counts=include_motif_counts,
-        )
-        item = prepare_stage1_graph(
-            base_item,
-            feature_mode=feature_mode,
-            support_mode=support_mode,
-            max_motifs=max_motifs,
-            rwse_k=rwse_k,
-            seed=seed + i,
-        )
-        item["degree"] = float(degree)
-        item["tri_count"] = float(r["tri_count"])
-        dataset.append(item)
-
-    print(
-        f"count range: [{counts.min():.0f}, {counts.max():.0f}], "
-        f"mean: {counts.mean():.2f}, std: {counts.std():.2f}"
-    )
-    return dataset
+from get import ETFaithful, FullGET, GINBaseline, PairwiseGET
 
 
 def _predict(model, dataset, batch_size=256, device="cpu"):
@@ -229,7 +166,8 @@ def main():
     models = [
         ("PairwiseGET", lambda: PairwiseGET(in_dim, pairwise_d, 1, num_steps=8, eta=0.01, eta_max=0.05, beta_2=1.0, grad_clip_norm=0.5, state_clip_norm=5.0, beta_max=3.0), 1e-4, 0.5),
         ("FullGET", lambda: FullGET(in_dim, 96, 1, num_steps=8, R=2, lambda_3=0.8, lambda_m=1.0, beta_2=1.0, beta_3=1.2, eta=0.008, eta_max=0.04, grad_clip_norm=0.3, state_clip_norm=5.0, beta_max=3.0, update_damping=0.5, dropout=0.0, compile=False), 3e-5, 0.3),
-        ("GIN", lambda: GINBaseline(in_dim, 96, 1, num_layers=4), 2e-4, 1.0),
+        ("ETFaithful", lambda: ETFaithful(in_dim, 96, 1, num_steps=8, rwse_k=args.rwse_k, mask_mode="sparse", et_official_mode=False), 3e-5, 0.3),
+        ("GIN", lambda: GINBaseline(in_dim, 96, 1, num_layers=4, dropout=0.0), 5e-5, 0.5),
     ]
 
     for name, model_fn, lr, max_grad_norm in models:

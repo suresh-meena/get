@@ -1,22 +1,52 @@
 {
-  "PairwiseGET": {
-    "mean": 0.1,
-    "std": 0.0
+  "results": {
+    "PairwiseGET": {
+      "mean": 0.1,
+      "std": 0.0,
+      "per_seed_fold_mean": [
+        0.1
+      ],
+      "params": "142.50K"
+    },
+    "FullGET": {
+      "mean": 0.1,
+      "std": 0.0,
+      "per_seed_fold_mean": [
+        0.1
+      ],
+      "params": "91.17K"
+    },
+    "GIN": {
+      "mean": 0.1,
+      "std": 0.0,
+      "per_seed_fold_mean": [
+        0.1
+      ],
+      "params": "55.82K"
+    },
+    "GCN": {
+      "mean": 0.1,
+      "std": 0.0,
+      "per_seed_fold_mean": [
+        0.1
+      ],
+      "params": "17.42K"
+    },
+    "GAT": {
+      "mean": 0.1,
+      "std": 0.0,
+      "per_seed_fold_mean": [
+        0.1
+      ],
+      "params": "17.80K"
+    }
   },
-  "FullGET": {
-    "mean": 0.1,
-    "std": 0.0
-  },
-  "GIN": {
-    "mean": 0.1,
-    "std": 0.0
-  },
-  "GCN": {
-    "mean": 0.1,
-    "std": 0.0
-  },
-  "GAT": {
-    "mean": 0.1,
-    "std": 0.0
+  "metadata": {
+    "interpretation": "CSL supervised realized-expressivity diagnostic. rwse_k=0 is the pure architectural test; rwse_k>0 is a GET+structural-encoding practical variant.",
+    "rwse_k": 0,
+    "seeds": [
+      42
+    ],
+    "graphs_per_class": 5
   }
 }

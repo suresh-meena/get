@@ -9,7 +9,7 @@ import torch
 @njit
 def _edges_to_csr_structural(num_nodes, edges_arr):
     """Directly build CSR from edge array in Numba."""
-    indptr = np.zeros(num_nodes + 1, dtype=np.int64)
+    indptr = np.zeros(num_nodes + 1, dtype=np.int32)
     for i in range(edges_arr.shape[0]):
         u, v = edges_arr[i, 0], edges_arr[i, 1]
         if u == v or u >= num_nodes or v >= num_nodes:
@@ -20,7 +20,7 @@ def _edges_to_csr_structural(num_nodes, edges_arr):
     for i in range(num_nodes):
         indptr[i + 1] += indptr[i]
 
-    indices = np.empty(indptr[num_nodes], dtype=np.int64)
+    indices = np.empty(indptr[num_nodes], dtype=np.int32)
     curr_idx = indptr[:-1].copy()
     for i in range(edges_arr.shape[0]):
         u, v = edges_arr[i, 0], edges_arr[i, 1]
@@ -40,11 +40,11 @@ def _edges_to_csr_structural(num_nodes, edges_arr):
 @njit
 def _numba_msbfs(indptr, indices, max_distance, unreachable):
     num_nodes = len(indptr) - 1
-    dist = np.full((num_nodes, num_nodes), unreachable, dtype=np.int64)
+    dist = np.full((num_nodes, num_nodes), unreachable, dtype=np.int32)
 
     for src in range(num_nodes):
         dist[src, src] = 0
-        q = np.empty(num_nodes, dtype=np.int64)
+        q = np.empty(num_nodes, dtype=np.int32)
         head = 0
         tail = 0
 
@@ -92,7 +92,7 @@ def build_undirected_adjacency(num_nodes: int, edges_list: list[tuple[int, int]]
 
 
 def shortest_path_distances(num_nodes: int, edges_list: list[tuple[int, int]], max_distance: int | None = None) -> torch.Tensor:
-    edges_arr = np.ascontiguousarray(np.array(edges_list, dtype=np.int64).reshape(-1, 2))
+    edges_arr = np.ascontiguousarray(np.array(edges_list, dtype=np.int32).reshape(-1, 2))
     n = int(num_nodes)
     m_dist = int(max_distance) if max_distance is not None else -1
     unreachable = n if max_distance is None else int(max_distance) + 1
@@ -104,10 +104,10 @@ def shortest_path_distances(num_nodes: int, edges_list: list[tuple[int, int]], m
 
 
 def degree_centrality(num_nodes: int, edges_list: list[tuple[int, int]]) -> torch.Tensor:
-    edges_arr = np.ascontiguousarray(np.array(edges_list, dtype=np.int64).reshape(-1, 2))
+    edges_arr = np.ascontiguousarray(np.array(edges_list, dtype=np.int32).reshape(-1, 2))
     n = int(num_nodes)
     indptr, _ = _edges_to_csr_structural(n, edges_arr)
-    return torch.from_numpy(np.diff(indptr)).to(dtype=torch.long)
+    return torch.from_numpy(np.diff(indptr)).to(dtype=torch.int32)
 
 
 def augment_with_virtual_node(x: torch.Tensor, edges_list: list[tuple[int, int]], virtual_token: torch.Tensor):

@@ -4,8 +4,8 @@ import networkx as nx
 import numpy as np
 from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
 
-from get import FullGET, PairwiseGET, GINBaseline, GCNBaseline, GATBaseline, CachedGraphDataset
-from experiments.common import set_seed, GETTrainer, save_results, get_num_params
+from get import ETFaithful, FullGET, PairwiseGET, GINBaseline, GCNBaseline, GATBaseline, CachedGraphDataset
+from experiments.shared.common import set_seed, GETTrainer, save_results, get_num_params
 
 def generate_csl_dataset(graphs_per_class=15, seed=42):
     rng = np.random.default_rng(seed)
@@ -26,7 +26,7 @@ def generate_csl_dataset(graphs_per_class=15, seed=42):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--seeds", type=int, nargs="+", default=[42])
     parser.add_argument("--rwse_k", type=int, default=0, help="Keep 0 for the pure expressivity diagnostic; use >0 only for GET+RWSE.")
     parser.add_argument("--graphs_per_class", type=int, default=15)
@@ -44,6 +44,7 @@ def main():
     model_factories = [
         ("PairwiseGET", lambda: PairwiseGET(1, 96, 10, rwse_k=args.rwse_k)),
         ("FullGET", lambda: FullGET(1, 64, 10, R=2, lambda_3=0.5, rwse_k=args.rwse_k)),
+        ("ETFaithful", lambda: ETFaithful(1, 64, 10, num_steps=8, rwse_k=args.rwse_k, pe_k=0, mask_mode="sparse", et_official_mode=False)),
         ("GIN", lambda: GINBaseline(1, 64, 10)),
         ("GCN", lambda: GCNBaseline(1, 64, 10)),
         ("GAT", lambda: GATBaseline(1, 64, 10))

@@ -1,5 +1,4 @@
 import torch
-import pytest
 from get import GETModel
 from get.data import collate_get_batch
 
@@ -76,7 +75,6 @@ def test_permutation_equivariance():
     inv_perm = torch.argsort(perm)
     x_perm = x[perm].clone().requires_grad_(True)
     
-    new_edges = []
     # edge (u, v) becomes (perm_inv[u], perm_inv[v])? No, u, v are indices.
     # If node 0 is now at perm[0], then edge (0, 1) becomes (perm[0], perm[1]).
     # Wait, let's be careful.
