@@ -2,3 +2,11 @@ name: "synthetic_graph"
 device: "auto"  # auto | cpu | cuda
 inference_mode_train: "fixed"
 inference_mode_eval: "armijo"
+compile:
+  enabled: false
+  scope: "eval_only"  # eval_only | all
+  allow_double_backward: false
+  backend: "inductor"
+  dynamic: true
+  fullgraph: false
+  mode: null

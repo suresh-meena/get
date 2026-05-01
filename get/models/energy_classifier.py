@@ -5,7 +5,7 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from get.energy import GETEnergy
+from get.energy import build_energy
 from get.solvers import ArmijoSolver, FixedStepSolver
 
 
@@ -41,6 +41,7 @@ class EnergyGraphClassifier(nn.Module):
         armijo_max_backtracks: int = 20,
         inference_mode_train: str = "fixed",
         inference_mode_eval: str = "armijo",
+        energy_name: str = "get_full",
     ) -> None:
         super().__init__()
         if hidden_dim != num_heads * head_dim:
@@ -65,6 +66,9 @@ class EnergyGraphClassifier(nn.Module):
         self.update_damping = float(update_damping)
         self.inference_mode_train = inference_mode_train
         self.inference_mode_eval = inference_mode_eval
+        self.energy_name = str(energy_name).strip().lower()
+        # Training unroll uses create_graph=True, i.e. higher-order autodiff.
+        self.requires_double_backward = True
 
         self.encoder = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
@@ -83,7 +87,7 @@ class EnergyGraphClassifier(nn.Module):
         self.t_tau = nn.Parameter(torch.randn(num_motif_types, num_heads, R, head_dim) * 0.05)
         self.readout = nn.Linear(hidden_dim, num_classes)
 
-        self.energy = GETEnergy()
+        self.energy = build_energy(self.energy_name)
         self.fixed_solver = FixedStepSolver(num_steps=num_steps, step_size=fixed_step_size)
         self.armijo_solver = ArmijoSolver(
             num_steps=num_steps,
@@ -93,7 +97,15 @@ class EnergyGraphClassifier(nn.Module):
             max_backtracks=armijo_max_backtracks,
         )
 
+    def _enabled_branches(self) -> tuple[bool, bool, bool]:
+        if self.energy_name == "quadratic_only":
+            return False, False, False
+        if self.energy_name == "pairwise_only":
+            return True, False, False
+        return True, True, True
+
     def _build_params(self, dtype: torch.dtype, device: torch.device) -> Dict[str, torch.Tensor | float | int | bool]:
+        pairwise_on, motif_on, memory_on = self._enabled_branches()
         return {
             "d": self.hidden_dim,
             "R": self.R,
@@ -104,9 +116,9 @@ class EnergyGraphClassifier(nn.Module):
             "beta_2": self.beta_2,
             "beta_3": self.beta_3,
             "beta_m": self.beta_m,
-            "use_pairwise": self.lambda_2 > 0.0,
-            "use_motif": self.lambda_3 > 0.0,
-            "use_memory": self.lambda_m > 0.0,
+            "use_pairwise": pairwise_on and self.lambda_2 > 0.0,
+            "use_motif": motif_on and self.lambda_3 > 0.0,
+            "use_memory": memory_on and self.lambda_m > 0.0,
             "pairwise_symmetric": False,
             "lambda_sum": 0.0,
             "T_tau": self.t_tau.to(device=device, dtype=dtype),

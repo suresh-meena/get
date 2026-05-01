@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from get.data import SyntheticGraphDataset, collate_graph_samples
 from get.models import EnergyGraphClassifier
 from get.trainers import UnifiedTrainer
-from get.utils import seed_everything
+from get.utils import maybe_compile_model, seed_everything
 
 
 def _resolve_device(requested: str) -> torch.device:
@@ -108,6 +108,7 @@ def _build_model(cfg: DictConfig) -> EnergyGraphClassifier:
         armijo_max_backtracks=int(m.get("armijo_max_backtracks", 20)),
         inference_mode_train=str(exp.get("inference_mode_train", "fixed")),
         inference_mode_eval=str(exp.get("inference_mode_eval", "armijo")),
+        energy_name=str(m.get("energy_name", "get_full")),
     )
 
 
@@ -117,7 +118,28 @@ def run_from_cfg(cfg: DictConfig) -> Dict:
 
     train_loader, val_loader, test_loader = _build_loaders(cfg, seed=int(cfg.seed))
     model = _build_model(cfg)
-    trainer = UnifiedTrainer(model=model, device=device, trainer_cfg=OmegaConf.to_container(cfg.trainer, resolve=True))
+
+    compile_cfg = OmegaConf.to_container(cfg.experiment.get("compile", {}), resolve=True)
+    compile_scope = str(compile_cfg.get("scope", "eval_only")).lower()
+    eval_model = model
+    if bool(compile_cfg.get("enabled", False)):
+        if compile_scope == "all":
+            model = maybe_compile_model(model, compile_cfg)
+            eval_model = model
+        elif compile_scope == "eval_only":
+            eval_compile_cfg = dict(compile_cfg)
+            # Safe default for GET: compile eval path while keeping train path uncompiled.
+            eval_compile_cfg["allow_double_backward"] = True
+            eval_model = maybe_compile_model(model, eval_compile_cfg)
+        else:
+            raise ValueError(f"Unsupported compile.scope '{compile_scope}'. Use 'eval_only' or 'all'.")
+
+    trainer = UnifiedTrainer(
+        model=model,
+        eval_model=eval_model,
+        device=device,
+        trainer_cfg=OmegaConf.to_container(cfg.trainer, resolve=True),
+    )
     metrics = trainer.fit(train_loader, val_loader, test_loader)
 
     out_dir = Path("outputs") / "refactor"

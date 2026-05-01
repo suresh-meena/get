@@ -75,9 +75,34 @@ def scatter_add_nd(grad_buffer: torch.Tensor, indices: torch.Tensor, src: torch.
         
     return grad_buffer.permute(perm).index_add_(0, indices, src_p).permute(perm)
 
-def fused_motif_dot(Q3_c: torch.Tensor, K3_u: torch.Tensor, K3_v: torch.Tensor, T_tau: torch.Tensor):
-    """Trilinear motif score contraction."""
+def fused_motif_dot_baseline(
+    Q3_c: torch.Tensor,
+    K3_u: torch.Tensor,
+    K3_v: torch.Tensor,
+    T_tau: torch.Tensor,
+) -> torch.Tensor:
+    """Baseline trilinear motif score contraction with explicit elementwise chain."""
     return (Q3_c * (K3_u * K3_v + T_tau)).sum(dim=(-1, -2))
+
+
+def fused_motif_dot(
+    Q3_c: torch.Tensor,
+    K3_u: torch.Tensor,
+    K3_v: torch.Tensor,
+    T_tau: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Optimized trilinear motif contraction.
+
+    Uses addcmul to materialize one intermediate and einsum for contraction,
+    reducing explicit temporary tensors compared to baseline chaining.
+    """
+    # CPU kernels are typically faster with the plain elementwise chain.
+    if Q3_c.device.type != "cuda":
+        return fused_motif_dot_baseline(Q3_c, K3_u, K3_v, T_tau)
+
+    mixed = torch.addcmul(T_tau, K3_u, K3_v)
+    return torch.einsum("...rd,...rd->...", Q3_c, mixed)
 
 def positive_param(params: dict, name: str):
     val = params[name]

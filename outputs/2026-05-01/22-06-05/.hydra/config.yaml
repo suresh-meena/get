@@ -1,0 +1,53 @@
+task: binary_graph_classification
+seed: 42
+experiment:
+  name: synthetic_graph
+  device: cpu
+  inference_mode_train: fixed
+  inference_mode_eval: armijo
+model:
+  name: FullGET
+  energy_name: quadratic_only
+  in_dim: 1
+  hidden_dim: 128
+  num_classes: 1
+  num_steps: 8
+  num_heads: 4
+  head_dim: 32
+  lambda_2: 1.0
+  lambda_3: 0.5
+  lambda_m: 1.0
+  beta_2: 1.0
+  beta_3: 1.0
+  beta_m: 1.0
+  num_motif_types: 24
+  R: 2
+  K: 32
+  dropout: 0.0
+  update_damping: 0.05
+  fixed_step_size: 0.08
+  armijo_eta0: 0.2
+  armijo_gamma: 0.5
+  armijo_c: 0.0001
+  armijo_max_backtracks: 20
+dataset:
+  name: synthetic_graph
+  in_dim: 8
+  num_train_graphs: 12
+  num_val_graphs: 6
+  num_test_graphs: 6
+  min_nodes: 6
+  max_nodes: 10
+  edge_prob: 0.2
+  max_motifs_per_anchor: 8
+trainer:
+  epochs: 1
+  batch_size: 32
+  lr: 0.0001
+  weight_decay: 0.0001
+  max_grad_norm: 1.0
+  use_amp: false
+  log_every_steps: 10
+  patience: 1
+  eval_batch_size: 64
+  num_workers: 0

@@ -43,6 +43,27 @@ Run a tiny end-to-end refactor smoke:
 PYTHONPATH=. python main.py trainer.epochs=2 dataset.num_train_graphs=16 dataset.num_val_graphs=8 dataset.num_test_graphs=8 experiment.device=cpu
 ```
 
+Swap energy function from config:
+
+```bash
+PYTHONPATH=. python main.py model.energy_name=quadratic_only
+```
+
+Supported values: `get_full`, `pairwise_only`, `quadratic_only`.
+
+Enable `torch.compile` (optional):
+
+```bash
+PYTHONPATH=. python main.py experiment.compile.enabled=true
+```
+
+Default scope is `experiment.compile.scope=eval_only`, which compiles eval path only and keeps training uncompiled (safer for solver training).
+Use `experiment.compile.scope=all` to compile both train and eval paths.
+For GET training, compile is guarded by default because solver training uses higher-order autodiff.
+Set `experiment.compile.allow_double_backward=true` only if your backend supports it.
+
+AMP is config-driven via `trainer.use_amp` and `trainer.amp_dtype` (`fp16` or `bf16`).
+
 For older end-to-end training scripts, see `legacy/`.
 
 ## Running Tests

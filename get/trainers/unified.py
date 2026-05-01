@@ -30,8 +30,10 @@ class UnifiedTrainer:
         model: torch.nn.Module,
         device: torch.device,
         trainer_cfg: Dict,
+        eval_model: torch.nn.Module | None = None,
     ) -> None:
         self.model = model.to(device)
+        self.eval_model = (eval_model if eval_model is not None else self.model).to(device)
         self.device = device
         self.epochs = int(trainer_cfg["epochs"])
         self.max_grad_norm = float(trainer_cfg.get("max_grad_norm", 1.0))
@@ -55,10 +57,12 @@ class UnifiedTrainer:
         return torch.float16
 
     def _run_epoch(self, loader: Iterable[Dict[str, torch.Tensor]], train: bool) -> Dict[str, float]:
+        active_model = self.model if train else self.eval_model
         if train:
             self.model.train()
         else:
             self.model.eval()
+            self.eval_model.eval()
 
         self.metric.reset()
         loss_sum = 0.0
@@ -80,7 +84,7 @@ class UnifiedTrainer:
                     dtype=self._autocast_dtype(),
                     enabled=self.use_amp,
                 ):
-                    logits = self.model(batch)
+                    logits = active_model(batch)
                     loss = self.criterion(logits, targets)
 
             if train:

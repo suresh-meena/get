@@ -1,4 +1,5 @@
 name: "PairwiseGET"
+energy_name: "pairwise_only"
 in_dim: 1  # To be overridden by dataset
 hidden_dim: 128
 num_classes: 1

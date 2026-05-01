@@ -4,6 +4,7 @@ lr: 1e-4
 weight_decay: 1e-4
 max_grad_norm: 1.0
 use_amp: true
+amp_dtype: fp16
 log_every_steps: 10
 patience: 5
 eval_batch_size: 64
