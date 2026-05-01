@@ -1,7 +1,0 @@
-- trainer.epochs=1
-- trainer.patience=1
-- trainer.use_amp=false
-- experiment.device=cpu
-- dataset.num_train_graphs=12
-- dataset.num_val_graphs=6
-- dataset.num_test_graphs=6

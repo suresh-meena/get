@@ -27,8 +27,6 @@ class PairwiseEnergy(nn.Module):
 
         beta_2 = inverse_temperature(params, 'beta_2', beta_max=beta_max)
         lse_2 = segment_logsumexp(beta_2 * ell_2, c_2, num_nodes, dim=0)
-        # Paper convention: empty supports contribute zero, not -inf.
-        lse_2 = torch.where(torch.isfinite(lse_2), lse_2, torch.zeros_like(lse_2))
         
         if degree_scaler is not None:
             lse_2 = lse_2 * degree_scaler.unsqueeze(-1)

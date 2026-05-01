@@ -33,8 +33,6 @@ class MotifEnergy(nn.Module):
         # We rely on torch.compile for fusion, dropping the chunking loop for speed and simplicity
         ell_3 = fused_motif_dot(Q3[c_3], K3[u_3], K3[v_3], T_tau_selected) / scale
         lse_3 = segment_logsumexp(beta_3 * ell_3, c_3, num_nodes, dim=0)
-        # Paper convention: empty supports contribute zero, not -inf.
-        lse_3 = torch.where(torch.isfinite(lse_3), lse_3, torch.zeros_like(lse_3))
         
         if degree_scaler is not None:
             lse_3 = lse_3 * degree_scaler.unsqueeze(-1)

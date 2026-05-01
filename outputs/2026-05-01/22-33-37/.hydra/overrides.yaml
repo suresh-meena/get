@@ -1,8 +1,0 @@
-- trainer.epochs=1
-- trainer.patience=1
-- trainer.use_amp=false
-- experiment.device=cpu
-- experiment.compile.enabled=true
-- dataset.num_train_graphs=8
-- dataset.num_val_graphs=4
-- dataset.num_test_graphs=4

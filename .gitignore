@@ -219,3 +219,12 @@ __marimo__/
 /data/
 !get/data/
 !get/data/**
+
+# Experiment outputs
+outputs/
+
+# Temporary and profiling files
+scratch/
+legacy/
+trace.json
+profile*.txt
