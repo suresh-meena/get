@@ -46,7 +46,7 @@ class MotifEnergy(nn.Module):
         scale = (R * d) ** 0.5
         beta_3 = inverse_temperature(params, 'beta_3', beta_max=beta_max)
         motif_count = int(c_3.numel())
-        chunk_size = int(params.get("motif_chunk_size", 8192))
+        chunk_size = int(params.get("motif_chunk_size", 131072))
         use_chunked = motif_count > max(0, chunk_size)
 
         if not use_chunked:
