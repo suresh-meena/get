@@ -25,7 +25,7 @@ from experiments.protocol.training import fit_once, make_loaders
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Full protocol runner (Stage 1-4)")
     p.add_argument("--task", type=str, required=True, choices=sorted(TASK_SPECS.keys()))
-    p.add_argument("--model_name", type=str, default="fullget", choices=["fullget", "pairwiseget", "external_baseline", "gin", "gcn", "gat"])
+    p.add_argument("--model_name", type=str, default="fullget", choices=["fullget", "pairwiseget", "et", "external_baseline", "gin", "gcn", "gat"])
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--dataset_root", type=str, default="data")
     p.add_argument("--brec_file", type=str, default="")
@@ -48,7 +48,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--R", type=int, default=2)
     p.add_argument("--K", type=int, default=8)
     p.add_argument("--lambda_2", type=float, default=1.0)
-    p.add_argument("--lambda_3", type=float, default=1.0)
+    p.add_argument("--lambda_3", type=float, default=10.0)
     p.add_argument("--lambda_m", type=float, default=0.0)
     p.add_argument("--beta_2", type=float, default=1.0)
     p.add_argument("--beta_3", type=float, default=1.0)
@@ -59,7 +59,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--armijo_gamma", type=float, default=0.5)
     p.add_argument("--armijo_c", type=float, default=1e-4)
     p.add_argument("--armijo_max_backtracks", type=int, default=20)
-    p.add_argument("--inference_mode_train", type=str, default="fixed", choices=["fixed", "armijo"])
+    p.add_argument("--inference_mode_train", type=str, default="armijo", choices=["fixed", "armijo"])
     p.add_argument("--inference_mode_eval", type=str, default="armijo", choices=["fixed", "armijo"])
 
     p.add_argument("--epochs", type=int, default=3)

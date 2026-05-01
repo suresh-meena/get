@@ -1,7 +1,7 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 **/__pycache__/
-*.py[codz]
+*.py[cod]
 **/*.py[cod]
 *$py.class
 
@@ -219,6 +219,11 @@ __marimo__/
 /data/
 !get/data/
 !get/data/**
+get/data/__pycache__/
+get/data/**/__pycache__/
+get/data/**/*.pyc
+**/__pycache__/
+**/*.pyc
 
 # Experiment outputs
 outputs/

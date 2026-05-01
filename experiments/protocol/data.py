@@ -161,9 +161,7 @@ def _make_stage1_cycle_parity(args) -> List[Dict[str, torch.Tensor]]:
         extra = nx.gnp_random_graph(max(n - cycle_len, 1), 0.2, seed=int(rng.integers(1, 1_000_000)))
         extra = nx.relabel_nodes(extra, lambda u: u + cycle_len)
         g = nx.disjoint_union(g, extra)
-        if g.number_of_nodes() < n:
-            for k in range(g.number_of_nodes(), n):
-                g.add_node(k)
+        n = g.number_of_nodes()
         adj = torch.zeros((n, n), dtype=torch.bool)
         for u, v in g.edges():
             adj[u, v] = True

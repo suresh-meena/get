@@ -267,8 +267,20 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
     name = args.model_name.lower()
     if name == "external_baseline":
         return ExternalGraphBaseline(in_dim=args.in_dim, hidden_dim=args.hidden_dim)
+    if name == "gcn":
+        from external.graph_baselines.torch_baselines import GCNGraphBaseline
+        return GCNGraphBaseline(in_dim=args.in_dim, hidden_dim=args.hidden_dim)
+    if name == "gat":
+        from external.graph_baselines.torch_baselines import GATGraphBaseline
+        return GATGraphBaseline(in_dim=args.in_dim, hidden_dim=args.hidden_dim)
+    if name == "gin":
+        from external.graph_baselines.torch_baselines import GINGraphBaseline
+        return GINGraphBaseline(in_dim=args.in_dim, hidden_dim=args.hidden_dim)
+
     if name == "pairwiseget":
         energy_name = "pairwise_only"
+    elif name == "et":
+        energy_name = "quadratic_only"
     elif name == "fullget":
         energy_name = "get_full"
     else:
@@ -315,7 +327,7 @@ def main() -> None:
     p.add_argument("--brec_file", type=str, default="")
     p.add_argument("--max_graphs", type=int, default=0)
     p.add_argument("--cv_folds", type=int, default=1)
-    p.add_argument("--model_name", type=str, default="fullget", choices=["fullget", "pairwiseget", "external_baseline"])
+    p.add_argument("--model_name", type=str, default="fullget", choices=["fullget", "pairwiseget", "et", "gcn", "gat", "gin", "external_baseline"])
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--seed", type=int, default=123)
 
@@ -336,7 +348,7 @@ def main() -> None:
     p.add_argument("--K", type=int, default=8)
 
     p.add_argument("--lambda_2", type=float, default=1.0)
-    p.add_argument("--lambda_3", type=float, default=1.0)
+    p.add_argument("--lambda_3", type=float, default=10.0)
     p.add_argument("--lambda_m", type=float, default=0.0)
     p.add_argument("--beta_2", type=float, default=1.0)
     p.add_argument("--beta_3", type=float, default=1.0)
@@ -348,7 +360,7 @@ def main() -> None:
     p.add_argument("--armijo_gamma", type=float, default=0.5)
     p.add_argument("--armijo_c", type=float, default=1e-4)
     p.add_argument("--armijo_max_backtracks", type=int, default=20)
-    p.add_argument("--inference_mode_train", type=str, default="fixed", choices=["fixed", "armijo"])
+    p.add_argument("--inference_mode_train", type=str, default="armijo", choices=["fixed", "armijo"])
     p.add_argument("--inference_mode_eval", type=str, default="armijo", choices=["fixed", "armijo"])
 
     p.add_argument("--epochs", type=int, default=3)

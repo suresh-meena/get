@@ -89,7 +89,6 @@ def _build_random_graph(
     y_val = float(tri_count > 0)
     
     x = rng.standard_normal((n, in_dim)).astype(np.float32)
-    x[:, 0] += 0.35 if y_val > 0.5 else -0.35
 
     # Vectorized edge extraction
     c2, u2 = np.nonzero(adj)
