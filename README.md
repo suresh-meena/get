@@ -52,6 +52,32 @@ export PYTHONPATH=.
 python experiments/stage3/zinc_regression.py --epochs 200
 ```
 
+### Model Configuration Presets
+
+Model presets and training defaults are centralized in:
+
+- `configs/models/catalog.yaml`
+- `configs/models/stage4.yaml`
+
+The catalog supports a top-level `training:` block for runtime defaults:
+
+```yaml
+training:
+  use_amp: true
+  amp_dtype: fp16
+```
+
+Meaning:
+- `use_amp: true` enables autocast for GET-family models on CUDA.
+- `amp_dtype: fp16` uses fp16 autocast. Set `bf16` if you want bfloat16 instead.
+- `use_amp: false` disables AMP entirely.
+
+The Stage-4 runner loads the catalog by default and supports override via:
+
+```bash
+python experiments/stage4/runner.py --task graph_classification --model_config configs/models/stage4.yaml
+```
+
 ## Running Tests
 
 We use `pytest` for unit testing and verification of mathematical properties:

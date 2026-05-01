@@ -1,0 +1,6 @@
+graphs_per_class: 5
+interpretation: CSL supervised realized-expressivity diagnostic. rwse_k=0 is the pure
+  architectural test; rwse_k>0 is a GET+structural-encoding practical variant.
+rwse_k: 0
+seeds:
+- 42

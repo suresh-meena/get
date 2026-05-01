@@ -3,8 +3,11 @@ from __future__ import annotations
 import csv
 import json
 import os
-from datetime import datetime
 from pathlib import Path
+
+import torch
+
+from experiments.shared.artifacts import build_artifact_path, build_run_directory
 
 
 def _to_jsonable(data):
@@ -17,6 +20,20 @@ def _to_jsonable(data):
         if isinstance(data, (list, tuple)):
             return [_to_jsonable(v) for v in data]
         return str(data)
+
+
+def _to_configable(data):
+    if isinstance(data, torch.dtype):
+        if data == torch.float16:
+            return "fp16"
+        if data == torch.bfloat16:
+            return "bf16"
+        return str(data).replace("torch.", "")
+    if isinstance(data, dict):
+        return {str(k): _to_configable(v) for k, v in data.items()}
+    if isinstance(data, (list, tuple)):
+        return [_to_configable(v) for v in data]
+    return data
 
 
 def _iter_histories(node, prefix=()):
@@ -67,11 +84,8 @@ def _write_curves_csv(path: Path, payload: dict):
 
 
 def save_results(name, payload, metadata=None):
-    outputs_dir = Path("outputs")
-    outputs_dir.mkdir(parents=True, exist_ok=True)
-
-    suffix = os.environ.get("EXPERIMENT_OUTPUT_SUFFIX", "")
-    base_path = outputs_dir / f"{name}{suffix}.json"
+    base_path = build_artifact_path(name, metadata=metadata)
+    base_path.parent.mkdir(parents=True, exist_ok=True)
 
     result_data = payload if metadata is None else {"results": payload, "metadata": metadata}
     with base_path.open("w", encoding="utf-8") as f:
@@ -79,10 +93,9 @@ def save_results(name, payload, metadata=None):
     print(f"Saved {base_path}")
 
     if os.environ.get("EXPERIMENT_LEGACY_ONLY", "0") == "1":
-        return
+        return base_path
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = outputs_dir / "runs" / f"{name}{suffix}_{ts}"
+    run_dir = build_run_directory(name, metadata=metadata)
     run_dir.mkdir(parents=True, exist_ok=True)
 
     metrics_path = run_dir / "metrics.json"
@@ -93,9 +106,10 @@ def save_results(name, payload, metadata=None):
         config_path = run_dir / "config.yaml"
         try:
             import yaml  # type: ignore
-            config_text = yaml.safe_dump(_to_jsonable(metadata), sort_keys=True)
+            config_text = yaml.safe_dump(_to_configable(metadata), sort_keys=True)
         except Exception:
-            config_text = json.dumps(_to_jsonable(metadata), indent=2)
+            config_text = json.dumps(_to_configable(metadata), indent=2)
         config_path.write_text(config_text, encoding="utf-8")
 
     _write_curves_csv(run_dir / "curves.csv", payload if isinstance(payload, dict) else {})
+    return base_path

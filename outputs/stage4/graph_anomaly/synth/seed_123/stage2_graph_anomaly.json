@@ -1,0 +1,138 @@
+{
+  "results": {
+    "task": "graph_anomaly",
+    "dataset": "synth",
+    "summary": {
+      "0.4": {
+        "pairwise_mean": 0.8333333333333334,
+        "pairwise_std": 0.0,
+        "pairwise_f1_mean": 0.75,
+        "pairwise_f1_std": 0.0,
+        "fullget_mean": 0.8333333333333333,
+        "fullget_std": 0.0,
+        "fullget_f1_mean": 0.6785714285714286,
+        "fullget_f1_std": 0.0,
+        "et_faithful_mean": 0.6666666666666667,
+        "et_faithful_std": 0.0,
+        "et_faithful_f1_mean": 0.4,
+        "et_faithful_f1_std": 0.0
+      }
+    },
+    "runs": {
+      "0.4": [
+        {
+          "seed": 123,
+          "pairwise_auc": 0.8333333333333334,
+          "pairwise_f1": 0.75,
+          "fullget_auc": 0.8333333333333333,
+          "fullget_f1": 0.6785714285714286,
+          "et_faithful_auc": 0.6666666666666667,
+          "et_faithful_f1": 0.4,
+          "histories": {
+            "pairwise": {
+              "train_loss": [
+                0.9803100824356079
+              ],
+              "val_auc": [
+                1.0
+              ],
+              "val_f1": [
+                1.0
+              ],
+              "test_auc": [
+                0.8333333333333334
+              ],
+              "test_f1": [
+                0.75
+              ]
+            },
+            "fullget": {
+              "train_loss": [
+                0.9492166638374329
+              ],
+              "val_auc": [
+                1.0
+              ],
+              "val_f1": [
+                1.0
+              ],
+              "test_auc": [
+                0.8333333333333333
+              ],
+              "test_f1": [
+                0.6785714285714286
+              ]
+            },
+            "et_faithful": {
+              "train_loss": [
+                0.970557689666748
+              ],
+              "val_auc": [
+                1.0
+              ],
+              "val_f1": [
+                0.4444444444444444
+              ],
+              "test_auc": [
+                0.6666666666666667
+              ],
+              "test_f1": [
+                0.4
+              ]
+            }
+          }
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "task": "graph_anomaly",
+    "model_config": "configs/models/catalog.yaml",
+    "dataset": "synth",
+    "data_root": "data/stage4",
+    "num_graphs": 24,
+    "limit_graphs": 0,
+    "in_dim": 8,
+    "hidden_dim": 512,
+    "epochs": 1,
+    "batch_size": 8,
+    "num_steps": 1,
+    "get_num_heads": 4,
+    "get_num_blocks": 6,
+    "cv_folds": 1,
+    "lambda_3": 0.5,
+    "seeds": [
+      123
+    ],
+    "device": "cpu",
+    "num_workers": 8,
+    "prefetch_factor": 2,
+    "cache_processed": false,
+    "cache_dir": ".cache/get_data",
+    "max_motifs": 16,
+    "anomaly_node_budget": 2048,
+    "anomaly_batch_cap": 16,
+    "anomaly_motif_budget": 4096,
+    "anomaly_motif_cap": 8,
+    "get_pe_k": 0,
+    "rwse_k": 0,
+    "ego_hops": 1,
+    "ego_limit": 0,
+    "ego_node_cap": 512,
+    "get_pairwise_et_mask": false,
+    "get_norm_style": "et",
+    "anomaly_label_rates": [
+      0.4
+    ],
+    "weighted_bce": true,
+    "et_num_heads": 4,
+    "et_head_dim": 64,
+    "et_num_blocks": 6,
+    "et_pe_k": 8,
+    "et_mask_mode": "sparse",
+    "et_node_cap": null,
+    "use_amp": true,
+    "amp_dtype": "torch.float16",
+    "stage": "stage4"
+  }
+}

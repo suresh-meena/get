@@ -4,6 +4,7 @@ import torch
 from get import FullGET, PairwiseGET, GINBaseline, ETFaithful
 from get.data import CachedGraphDataset
 from experiments.shared.common import add_cached_structural_features, set_seed, GETTrainer, save_results
+from experiments.shared.model_config import load_training_defaults
 
 def load_peptides(task: str, root="data/LRGB"):
     from torch_geometric.datasets import LRGBDataset
@@ -35,7 +36,9 @@ def main():
     parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--data_root", default="data/LRGB")
+    parser.add_argument("--model_config", default="configs/models/catalog.yaml")
     args = parser.parse_args()
+    training_defaults = load_training_defaults(args.model_config)
 
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -61,12 +64,22 @@ def main():
     task_type = 'multilabel' if args.task == 'func' else 'regression'
     for name, (model, train_data, val_data, test_data) in models.items():
         print(f"--- Training {name} on Peptides-{args.task} ---")
-        trainer = GETTrainer(model, task_type=task_type, device=device, model_name=name, lr=1e-4, weight_decay=1e-4)
+        trainer = GETTrainer(
+            model,
+            task_type=task_type,
+            device=device,
+            model_name=name,
+            lr=1e-4,
+            weight_decay=1e-4,
+            use_amp=training_defaults.get("use_amp", None),
+            amp_dtype=training_defaults.get("amp_dtype", None),
+        )
         res = trainer.run(train_data, val_data, test_data, args.epochs, args.batch_size)
         print(f"{name} Test Metric ({'AP' if args.task == 'func' else 'MAE'}): {res['metric']:.4f}")
         results[name] = res
-
-    save_results(f"exp9_peptides_{args.task}_results", results, metadata=vars(args))
+        
+        # Save incremental results
+        save_results(f"exp9_peptides_{args.task}_results", results, metadata=vars(args))
 
 if __name__ == "__main__":
     main()

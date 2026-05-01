@@ -1,0 +1,6 @@
+batch_size: 64
+data_root: data/LRGB
+epochs: 30
+hidden_dim: 512
+seed: 42
+task: struct

@@ -4,15 +4,15 @@
     "dataset": "synth",
     "summary": {
       "0.4": {
-        "pairwise_mean": 0.7777777777777778,
+        "pairwise_mean": 0.8333333333333334,
         "pairwise_std": 0.0,
         "pairwise_f1_mean": 0.75,
         "pairwise_f1_std": 0.0,
-        "fullget_mean": 0.888888888888889,
+        "fullget_mean": 0.8333333333333333,
         "fullget_std": 0.0,
         "fullget_f1_mean": 0.6785714285714286,
         "fullget_f1_std": 0.0,
-        "et_faithful_mean": 0.6111111111111112,
+        "et_faithful_mean": 0.6666666666666667,
         "et_faithful_std": 0.0,
         "et_faithful_f1_mean": 0.4,
         "et_faithful_f1_std": 0.0
@@ -22,16 +22,16 @@
       "0.4": [
         {
           "seed": 123,
-          "pairwise_auc": 0.7777777777777778,
+          "pairwise_auc": 0.8333333333333334,
           "pairwise_f1": 0.75,
-          "fullget_auc": 0.888888888888889,
+          "fullget_auc": 0.8333333333333333,
           "fullget_f1": 0.6785714285714286,
-          "et_faithful_auc": 0.6111111111111112,
+          "et_faithful_auc": 0.6666666666666667,
           "et_faithful_f1": 0.4,
           "histories": {
             "pairwise": {
               "train_loss": [
-                1.1103355884552002
+                0.9803100824356079
               ],
               "val_auc": [
                 1.0
@@ -40,7 +40,7 @@
                 1.0
               ],
               "test_auc": [
-                0.7777777777777778
+                0.8333333333333334
               ],
               "test_f1": [
                 0.75
@@ -48,16 +48,16 @@
             },
             "fullget": {
               "train_loss": [
-                1.0296958684921265
+                0.9492166638374329
               ],
               "val_auc": [
                 1.0
               ],
               "val_f1": [
-                0.4444444444444444
+                1.0
               ],
               "test_auc": [
-                0.888888888888889
+                0.8333333333333333
               ],
               "test_f1": [
                 0.6785714285714286
@@ -65,7 +65,7 @@
             },
             "et_faithful": {
               "train_loss": [
-                0.9708352088928223
+                0.970557689666748
               ],
               "val_auc": [
                 1.0
@@ -74,7 +74,7 @@
                 0.4444444444444444
               ],
               "test_auc": [
-                0.6111111111111112
+                0.6666666666666667
               ],
               "test_f1": [
                 0.4
@@ -87,7 +87,7 @@
   },
   "metadata": {
     "task": "graph_anomaly",
-    "model_config": "configs/models/stage4.yaml",
+    "model_config": "configs/models/catalog.yaml",
     "dataset": "synth",
     "data_root": "data/stage4",
     "num_graphs": 24,
@@ -97,13 +97,15 @@
     "epochs": 1,
     "batch_size": 8,
     "num_steps": 1,
+    "get_num_heads": 4,
+    "get_num_blocks": 6,
     "cv_folds": 1,
     "lambda_3": 0.5,
     "seeds": [
       123
     ],
     "device": "cpu",
-    "num_workers": -1,
+    "num_workers": 8,
     "prefetch_factor": 2,
     "cache_processed": false,
     "cache_dir": ".cache/get_data",
@@ -123,11 +125,12 @@
       0.4
     ],
     "weighted_bce": true,
-    "et_num_heads": 12,
+    "et_num_heads": 4,
     "et_head_dim": 64,
-    "et_num_blocks": 4,
+    "et_num_blocks": 6,
     "et_pe_k": 8,
     "et_mask_mode": "sparse",
-    "et_node_cap": null
+    "et_node_cap": null,
+    "stage": "stage4"
   }
 }

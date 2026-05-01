@@ -45,6 +45,29 @@ def _signed_margin_loss(logits, target, margin):
     return torch.relu(float(margin) - signed_target * logits.view(-1)).mean()
 
 
+def _should_enable_amp(model, device):
+    if not str(device).startswith("cuda"):
+        return False
+
+    candidate = getattr(model, "module", model)
+    model_name = candidate.__class__.__name__
+    return model_name in {"GETModel", "ETFaithfulGraphModel"}
+
+
+def _normalize_amp_dtype(value, device):
+    if value is None:
+        return torch.float16 if str(device).startswith("cuda") else torch.bfloat16
+    if isinstance(value, torch.dtype):
+        return value
+    if isinstance(value, str):
+        key = value.strip().lower()
+        if key in {"fp16", "float16", "half"}:
+            return torch.float16
+        if key in {"bf16", "bfloat16"}:
+            return torch.bfloat16
+    return value
+
+
 def split_grouped_dataset(dataset, split_key, seed, train_ratio=0.70, val_ratio=0.15):
     ids = sorted({g[split_key] for g in dataset})
     if len(ids) == 0:
@@ -494,7 +517,7 @@ class GETTrainer:
         self.device = device
         self.model_name = model_name or model.__class__.__name__
         
-        self.lr = kwargs.get('lr', 1e-3)
+        self.lr = kwargs.get('lr', 1e-4)
         self.weight_decay = kwargs.get('weight_decay', 1e-5)
         self.max_grad_norm = kwargs.get('max_grad_norm', 1.0)
         self.max_grad_val = kwargs.get('max_grad_val', 0.01) # Hard value clip
@@ -502,9 +525,17 @@ class GETTrainer:
         self.margin_loss_weight = float(kwargs.get('margin_loss_weight', 0.0))
         self.logit_margin = float(kwargs.get('logit_margin', 1.0))
         
-        self.use_amp = (device == 'cuda' or 'cuda' in str(device))
+        self.use_amp = bool(kwargs.get('use_amp', _should_enable_amp(self.model, self.device)))
         self.autocast_device_type = torch.device(self.device).type
-        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+        self.autocast_dtype = _normalize_amp_dtype(kwargs.get('amp_dtype', None), self.device)
+        self.scaler = torch.amp.GradScaler(
+            "cuda",
+            enabled=bool(
+                self.use_amp
+                and self.autocast_device_type == "cuda"
+                and self.autocast_dtype == torch.float16
+            ),
+        )
         self.supports_armijo = 'inference_mode' in inspect.signature(self.model.forward).parameters
         self.validate_batches = bool(kwargs.get('validate_batches', True))
         
@@ -583,7 +614,7 @@ class GETTrainer:
             if self.validate_batches:
                 validate_get_batch(batch)
             self.optimizer.zero_grad()
-            with torch.autocast(device_type=self.autocast_device_type, enabled=self.use_amp):
+            with torch.autocast(device_type=self.autocast_device_type, dtype=self.autocast_dtype, enabled=self.use_amp):
                 out, _ = self.model(batch, task_level='graph')
                 # Align shapes
                 if self.task_type in ['binary', 'regression']:
@@ -629,7 +660,7 @@ class GETTrainer:
             if self.validate_batches:
                 validate_get_batch(batch)
             use_autocast = self.use_amp and not (inference_mode == 'armijo' and self.supports_armijo)
-            with torch.autocast(device_type=self.autocast_device_type, enabled=use_autocast):
+            with torch.autocast(device_type=self.autocast_device_type, dtype=self.autocast_dtype, enabled=use_autocast):
                 # Use Armijo if requested and supported by the model
                 forward_kwargs = {'task_level': 'graph'}
                 if inference_mode == 'armijo' and self.supports_armijo:

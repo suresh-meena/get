@@ -7,6 +7,8 @@ models:
       d: ${pairwise_hidden_dim}
       num_classes: ${num_classes}
       num_steps: ${num_steps}
+      num_heads: ${get_num_heads}
+      num_blocks: ${get_num_blocks}
       norm_style: ${get_norm_style}
       pairwise_et_mask: ${get_pairwise_et_mask}
       pe_k: ${get_pe_k}
@@ -21,6 +23,8 @@ models:
       d: ${hidden_dim}
       num_classes: ${num_classes}
       num_steps: ${num_steps}
+      num_heads: ${get_num_heads}
+      num_blocks: ${get_num_blocks}
       lambda_3: ${lambda_3}
       norm_style: ${get_norm_style}
       pairwise_et_mask: ${get_pairwise_et_mask}
@@ -44,3 +48,7 @@ models:
       mask_mode: ${et_mask_mode}
       et_official_mode: ${et_official_mode}
       node_cap: ${et_node_cap}
+
+training:
+  use_amp: true
+  amp_dtype: fp16

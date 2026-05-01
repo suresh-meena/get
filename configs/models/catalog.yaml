@@ -1,0 +1,85 @@
+models:
+  PairwiseGET:
+    factory: pairwiseget
+    enabled: true
+    params:
+      in_dim: ${in_dim}
+      d: ${pairwise_hidden_dim}
+      num_classes: ${num_classes}
+      num_steps: ${num_steps}
+      num_heads: ${get_num_heads}
+      num_blocks: ${get_num_blocks}
+      norm_style: ${get_norm_style}
+      pairwise_et_mask: ${get_pairwise_et_mask}
+      pe_k: ${get_pe_k}
+      rwse_k: ${rwse_k}
+      use_cls_token: false
+
+  FullGET:
+    factory: fullget
+    enabled: true
+    params:
+      in_dim: ${in_dim}
+      d: ${hidden_dim}
+      num_classes: ${num_classes}
+      num_steps: ${num_steps}
+      num_heads: ${get_num_heads}
+      num_blocks: ${get_num_blocks}
+      lambda_3: ${lambda_3}
+      norm_style: ${get_norm_style}
+      pairwise_et_mask: ${get_pairwise_et_mask}
+      pe_k: ${get_pe_k}
+      rwse_k: ${rwse_k}
+      use_cls_token: false
+
+  ETFaithful:
+    factory: etfaithful
+    enabled: true
+    params:
+      in_dim: ${in_dim}
+      d: ${hidden_dim}
+      num_classes: ${num_classes}
+      num_steps: ${num_steps}
+      num_blocks: ${et_num_blocks}
+      num_heads: ${et_num_heads}
+      head_dim: ${et_head_dim_or_none}
+      pe_k: ${et_pe_k}
+      rwse_k: ${rwse_k}
+      mask_mode: ${et_mask_mode}
+      et_official_mode: ${et_official_mode}
+      node_cap: ${et_node_cap}
+
+  GIN:
+    factory: ginbaseline
+    enabled: true
+    params:
+      in_dim: ${gin_in_dim}
+      d: ${hidden_dim}
+      num_classes: ${num_classes}
+
+  GCN:
+    factory: gcnbaseline
+    enabled: true
+    params:
+      in_dim: ${gin_in_dim}
+      d: ${hidden_dim}
+      num_classes: ${num_classes}
+
+  GAT:
+    factory: gatbaseline
+    enabled: true
+    params:
+      in_dim: ${gin_in_dim}
+      d: ${hidden_dim}
+      num_classes: ${num_classes}
+
+training:
+  use_amp: true
+  amp_dtype: fp16
+
+stages:
+  stage4:
+    graph_classification: [PairwiseGET, FullGET, ETFaithful, GIN]
+    graph_anomaly: [PairwiseGET, FullGET, ETFaithful]
+  stage2:
+    default: [PairwiseGET, FullGET, ETFaithful, GIN, GCN, GAT]

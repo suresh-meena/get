@@ -1,0 +1,7 @@
+batch_size: 64
+epochs: 100
+hidden_dim: 512
+model_config: configs/models/catalog.yaml
+num_samples: -1
+rwse_k: 20
+seed: 42
