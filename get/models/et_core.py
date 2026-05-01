@@ -82,6 +82,8 @@ class ETAttentionCore(nn.Module):
         logits = torch.matmul(logits, self.Hw)
         if dense_modulation is not None:
             logits = logits * self._format_dense_modulation(dense_modulation)
+        compute_dtype = torch.float32 if logits.dtype in (torch.float16, torch.bfloat16) else logits.dtype
+        logits = logits.to(dtype=compute_dtype)
         if dense_sizes is None:
             max_n = int(g.size(1))
             dense_sizes = torch.full((g.size(0),), max_n, dtype=torch.long, device=g.device)
@@ -90,8 +92,7 @@ class ETAttentionCore(nn.Module):
         node_ids = torch.arange(max_n, device=g.device)
         node_mask = node_ids[None, :] < dense_sizes[:, None]
         pair_mask = node_mask[:, :, None] & node_mask[:, None, :]
-        finfo_min = torch.finfo(g.dtype).min
-        logits = logits.masked_fill(~pair_mask[:, :, :, None], finfo_min)
+        logits = logits.masked_fill(~pair_mask[:, :, :, None], float("-inf"))
         lse = torch.logsumexp(logits, dim=2)
         lse = torch.where(node_mask[:, :, None], lse, torch.zeros_like(lse))
         e = -(((lse.sum(dim=1) / self.betas[None, :]).sum()))
@@ -106,6 +107,7 @@ class ETAttentionCore(nn.Module):
         wq_t = self.Wq.transpose(1, 2)
         wk_t = self.Wk.transpose(1, 2)
         grad_g = torch.einsum("bnhz,hdz->bnd", grad_q_all, wq_t) + torch.einsum("bnhz,hdz->bnd", grad_k_all, wk_t)
+        grad_g = grad_g.to(dtype=g.dtype)
         return e, grad_g
 
     def _dense_energy(self, g, graph_chunks, dense_modulation=None, dense_sizes=None, return_grad=False):
@@ -368,6 +370,12 @@ class ETFaithfulGraphModel(nn.Module):
 
         nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
 
+    @staticmethod
+    def _energy_to_float(energy):
+        if isinstance(energy, torch.Tensor):
+            return float(energy.detach().float().mean().item())
+        return float(energy)
+
     @property
     def eta(self):
         return self.eta_max * torch.sigmoid(self.eta_logit)
@@ -546,7 +554,7 @@ class ETFaithfulGraphModel(nn.Module):
                     snorm = x.norm(dim=-1, keepdim=True).clamp_min(1e-6)
                     x = x * (self.state_clip_norm / snorm).clamp(max=1.0)
 
-                energy_trace.append(float(e.detach().item()))
+                energy_trace.append(self._energy_to_float(e))
         return x, energy_trace
 
     def _init_solver_stats(self, inference_mode):
@@ -627,7 +635,7 @@ class ETFaithfulGraphModel(nn.Module):
                 solver_stats['grad_norms'].append(grad_norm)
 
                 if grad_norm_sq.detach().item() <= 1e-16:
-                    energy_trace.append(float(e_t.detach().item()))
+                    energy_trace.append(self._energy_to_float(e_t))
                     solver_stats['step_sizes'].append(0.0)
                     solver_stats['backtracks'].append(0)
                     solver_stats['accepted'].append(True)
@@ -635,7 +643,7 @@ class ETFaithfulGraphModel(nn.Module):
 
                 accepted_eta = 0.0
                 accepted_backtracks = armijo_max_backtracks
-                accepted_energy = float(e_t.detach().item())
+                accepted_energy = self._energy_to_float(e_t)
                 accepted_state = x.detach()
                 found = False
 
@@ -683,7 +691,7 @@ class ETFaithfulGraphModel(nn.Module):
                         idx = int(success_indices[0].item())
                         accepted_eta = float(etas[idx].item())
                         accepted_backtracks = start_bt + idx
-                        accepted_energy = float(e_tries[idx].item())
+                        accepted_energy = self._energy_to_float(e_tries[idx])
                         accepted_state = x_tries[idx]
                         found = True
                         break

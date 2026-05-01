@@ -18,6 +18,7 @@ from .shared import (
     _maybe_cache_ego_dataset,
     _normalized_name,
     _prepare_get_cached_dataset,
+    _resolve_stage4_num_workers,
     _recommend_anomaly_batch_size,
     _recommend_anomaly_motif_cap,
     _load_anomaly_graph,
@@ -52,7 +53,7 @@ def run_graph_anomaly(args: argparse.Namespace) -> dict:
                 num_hops=args.ego_hops,
                 limit=limit,
                 cache_dir=args.cache_dir,
-                num_workers=max(0, int(args.num_workers)),
+                num_workers=_resolve_stage4_num_workers(args.device, int(args.num_workers)),
                 max_nodes=int(args.ego_node_cap) if int(args.ego_node_cap) > 0 else None,
             )
         else:
@@ -60,7 +61,7 @@ def run_graph_anomaly(args: argparse.Namespace) -> dict:
                 base_graph,
                 num_hops=args.ego_hops,
                 limit=limit,
-                num_workers=max(0, int(args.num_workers)),
+                num_workers=_resolve_stage4_num_workers(args.device, int(args.num_workers)),
                 max_nodes=int(args.ego_node_cap) if int(args.ego_node_cap) > 0 else None,
             )
         effective_max_motifs = _recommend_anomaly_motif_cap(
@@ -130,7 +131,7 @@ def run_graph_anomaly(args: argparse.Namespace) -> dict:
                 args=args,
                 get_pe_k=get_pe_k,
             )
-            loader_num_workers = None if int(args.num_workers) < 0 else int(args.num_workers)
+            loader_num_workers = _resolve_stage4_num_workers(args.device, int(args.num_workers))
             loader_kwargs = build_dataloader_kwargs(
                 args.device,
                 num_workers=loader_num_workers,
@@ -149,6 +150,8 @@ def run_graph_anomaly(args: argparse.Namespace) -> dict:
                 eval_batch_sampler=make_eval_batch_sampler,
                 train_batch_sampler=make_train_batch_sampler(),
                 model_name="PairwiseGET",
+                use_amp=getattr(args, "use_amp", None),
+                amp_dtype=getattr(args, "amp_dtype", None),
             )
             full_res = _train_graph_binary_with_val(
                 fullget,
@@ -163,6 +166,8 @@ def run_graph_anomaly(args: argparse.Namespace) -> dict:
                 eval_batch_sampler=make_eval_batch_sampler,
                 train_batch_sampler=make_train_batch_sampler(),
                 model_name="FullGET",
+                use_amp=getattr(args, "use_amp", None),
+                amp_dtype=getattr(args, "amp_dtype", None),
             )
             et_res = _train_graph_binary_with_val(
                 et_faithful,
@@ -177,6 +182,8 @@ def run_graph_anomaly(args: argparse.Namespace) -> dict:
                 eval_batch_sampler=make_eval_batch_sampler,
                 train_batch_sampler=make_train_batch_sampler(),
                 model_name="ETFaithful",
+                use_amp=getattr(args, "use_amp", None),
+                amp_dtype=getattr(args, "amp_dtype", None),
             )
             runs.append(
                 {

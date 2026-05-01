@@ -13,12 +13,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from experiments.shared.common import load_tu_dataset, save_results  # noqa: E402
+from experiments.shared.plotting import load_and_plot  # noqa: E402
+from experiments.shared.model_config import load_training_defaults  # noqa: E402
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Unified Stage-2 runner for ET-style transfer tasks.")
     parser.add_argument("--task", choices=["graph_classification", "graph_anomaly"], required=True)
-    parser.add_argument("--model_config", default="configs/models/stage4.yaml")
+    parser.add_argument("--model_config", default="configs/models/catalog.yaml")
     parser.add_argument("--dataset", default="synth")
     parser.add_argument("--data_root", default="data/stage4")
     parser.add_argument("--num_graphs", type=int, default=120)
@@ -28,11 +30,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_steps", type=int, default=1)
+    parser.add_argument("--get_num_heads", type=int, default=4)
+    parser.add_argument("--get_num_blocks", type=int, default=6)
     parser.add_argument("--cv_folds", type=int, default=1)
     parser.add_argument("--lambda_3", type=float, default=0.5)
     parser.add_argument("--seeds", nargs="+", type=int, default=[123])
     parser.add_argument("--device", default=("cuda" if torch.cuda.is_available() else "cpu"))
-    parser.add_argument("--num_workers", type=int, default=-1)
+    parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--prefetch_factor", type=int, default=2)
     parser.add_argument("--cache_processed", action="store_true", default=False)
     parser.add_argument("--cache_dir", default=".cache/get_data")
@@ -50,9 +54,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--get_norm_style", choices=["standard", "et"], default="et")
     parser.add_argument("--anomaly_label_rates", nargs="+", type=float, default=[0.01, 0.4])
     parser.add_argument("--weighted_bce", action="store_true", default=False)
-    parser.add_argument("--et_num_heads", type=int, default=12)
+    parser.add_argument("--et_num_heads", type=int, default=4)
     parser.add_argument("--et_head_dim", type=int, default=64)
-    parser.add_argument("--et_num_blocks", type=int, default=4)
+    parser.add_argument("--et_num_blocks", type=int, default=6)
     parser.add_argument("--et_pe_k", type=int, default=8)
     parser.add_argument("--et_mask_mode", choices=["sparse", "official_dense"], default="sparse")
     parser.add_argument("--et_node_cap", type=int, default=0)
@@ -61,6 +65,9 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
+    training_defaults = load_training_defaults(args.model_config)
+    args.use_amp = training_defaults.get("use_amp", None)
+    args.amp_dtype = training_defaults.get("amp_dtype", None)
     if args.et_node_cap <= 0:
         args.et_node_cap = None
     if args.task == "graph_anomaly" and not args.weighted_bce:
@@ -78,15 +85,17 @@ def main() -> int:
         from experiments.stage4.classification import run_graph_classification
 
         payload = run_graph_classification(args)
-        out_path = Path("outputs/stage2_graph_classification.json")
+        out_name = "stage2_graph_classification"
     else:
         from experiments.stage4.anomaly import run_graph_anomaly
 
         payload = run_graph_anomaly(args)
-        out_path = Path("outputs/stage2_graph_anomaly.json")
+        out_name = "stage2_graph_anomaly"
 
-    out_name = "stage2_graph_classification" if args.task == "graph_classification" else "stage2_graph_anomaly"
-    save_results(out_name, payload, metadata=vars(args))
+    metadata = {**vars(args), "stage": "stage4", "task": args.task, "dataset": args.dataset}
+    json_path = save_results(out_name, payload, metadata=metadata)
+    print(f"Saved outputs/{out_name}.json")
+    load_and_plot(json_path, title=f"Stage 4 / {args.task.replace('_', ' ').title()} / {args.dataset}")
     return 0
 
 

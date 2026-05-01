@@ -10,12 +10,15 @@ from experiments.shared.common import set_seed
 
 # Real-world only experiments
 EXPERIMENTS = [
-    "experiments/stage3/zinc_regression.py",
-    "experiments/stage3/molhiv_classification.py",
+    "experiments/stage1/wedge_discrimination.py --num_pairs 500 --epochs 20",
+    "experiments/stage1/triangle_regression_v2.py --num_graphs 500 --epochs 30",
+    "experiments/stage2/csl_expressivity.py --epochs 20 --graphs_per_class 5",
+    "experiments/stage4/runner.py --task graph_classification --dataset MUTAG --epochs 30",
     "experiments/stage3/peptides_transfer.py --task func",
     "experiments/stage3/peptides_transfer.py --task struct",
-    "experiments/stage4/runner.py --task graph_classification --dataset MUTAG --epochs 30",
-    "experiments/stage4/runner.py --task graph_anomaly --dataset YelpChi --ego_limit 1000 --epochs 30",
+    "experiments/stage4/runner.py --task graph_anomaly --dataset YelpChi --ego_limit 1000 --epochs 30 --batch_size 16",
+    "experiments/stage3/zinc_regression.py",
+    "experiments/stage3/molhiv_classification.py",
 ]
 
 _CHILDREN: set[subprocess.Popen] = set()

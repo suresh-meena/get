@@ -6,7 +6,7 @@ import statistics
 from tqdm.auto import tqdm
 
 from experiments.shared.common import add_cached_structural_features, build_dataloader_kwargs, load_tu_dataset, set_seed
-from get import GINBaseline
+from experiments.shared.model_config import instantiate_models_from_catalog
 
 from .shared import (
     TU8_DATASETS,
@@ -15,6 +15,7 @@ from .shared import (
     _mean_std,
     _normalized_name,
     _prepare_get_cached_dataset,
+    _resolve_stage4_num_workers,
     _split_train_val_indices,
     _train_graph_classification,
     make_synth_classification_dataset,
@@ -70,7 +71,7 @@ def run_graph_classification(args: argparse.Namespace) -> dict:
             split_indices = _build_classification_folds(labels, int(args.cv_folds), int(seed))
 
             fold_runs = []
-            loader_num_workers = None if int(args.num_workers) < 0 else int(args.num_workers)
+            loader_num_workers = _resolve_stage4_num_workers(args.device, int(args.num_workers))
             loader_kwargs = build_dataloader_kwargs(
                 args.device,
                 num_workers=loader_num_workers,
@@ -92,20 +93,58 @@ def run_graph_classification(args: argparse.Namespace) -> dict:
                     get_pe_k=get_pe_k,
                 )
                 gin = None
-                if GINBaseline is not None:
-                    try:
-                        gin = GINBaseline(train_ds_gin[0]["x"].size(1), args.hidden_dim, num_classes)
-                    except Exception:
-                        gin = None
+                try:
+                    gin_context = {
+                        "gin_in_dim": int(train_ds_gin[0]["x"].size(1)),
+                        "hidden_dim": int(args.hidden_dim),
+                        "num_classes": num_classes,
+                    }
+                    gin = instantiate_models_from_catalog(
+                        args.model_config,
+                        context=gin_context,
+                        names=["GIN"],
+                    )["GIN"]
+                except Exception:
+                    gin = None
 
                 pair_res = _train_graph_classification(
-                    pairwise, train_ds, val_ds, test_ds, args.epochs, args.batch_size, args.device, loader_kwargs=loader_kwargs, model_name="PairwiseGET"
+                    pairwise,
+                    train_ds,
+                    val_ds,
+                    test_ds,
+                    args.epochs,
+                    args.batch_size,
+                    args.device,
+                    loader_kwargs=loader_kwargs,
+                    model_name="PairwiseGET",
+                    use_amp=getattr(args, "use_amp", None),
+                    amp_dtype=getattr(args, "amp_dtype", None),
                 )
                 full_res = _train_graph_classification(
-                    fullget, train_ds, val_ds, test_ds, args.epochs, args.batch_size, args.device, loader_kwargs=loader_kwargs, model_name="FullGET"
+                    fullget,
+                    train_ds,
+                    val_ds,
+                    test_ds,
+                    args.epochs,
+                    args.batch_size,
+                    args.device,
+                    loader_kwargs=loader_kwargs,
+                    model_name="FullGET",
+                    use_amp=getattr(args, "use_amp", None),
+                    amp_dtype=getattr(args, "amp_dtype", None),
                 )
                 et_res = _train_graph_classification(
-                    et_faithful, train_ds, val_ds, test_ds, args.epochs, args.batch_size, args.device, loader_kwargs=loader_kwargs, model_name="ETFaithful"
+                    et_faithful,
+                    train_ds,
+                    val_ds,
+                    test_ds,
+                    args.epochs,
+                    args.batch_size,
+                    args.device,
+                    loader_kwargs=loader_kwargs,
+                    model_name="ETFaithful",
+                    use_amp=getattr(args, "use_amp", None),
+                    amp_dtype=getattr(args, "amp_dtype", None),
                 )
 
                 fold_run = {
@@ -126,7 +165,17 @@ def run_graph_classification(args: argparse.Namespace) -> dict:
                 }
                 if gin is not None:
                     gin_res = _train_graph_classification(
-                        gin, train_ds_gin, val_ds_gin, test_ds_gin, args.epochs, args.batch_size, args.device, loader_kwargs=loader_kwargs, model_name="GIN"
+                        gin,
+                        train_ds_gin,
+                        val_ds_gin,
+                        test_ds_gin,
+                        args.epochs,
+                        args.batch_size,
+                        args.device,
+                        loader_kwargs=loader_kwargs,
+                        model_name="GIN",
+                        use_amp=getattr(args, "use_amp", None),
+                        amp_dtype=getattr(args, "amp_dtype", None),
                     )
                     fold_run["gin_struct_acc"] = gin_res.metric
                     fold_run["histories"]["gin_struct"] = gin_res.history

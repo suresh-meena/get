@@ -13,8 +13,8 @@ from torch.nn.parameter import UninitializedParameter
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from experiments.shared.common import build_ego_graph_dataset, get_num_params
-from experiments.shared.model_config import instantiate_models_from_config
+from experiments.shared.common import build_ego_graph_dataset, get_num_params, _normalize_amp_dtype, _should_enable_amp
+from experiments.shared.model_config import instantiate_models_from_catalog
 from get import collate_get_batch, CachedGraphDataset
 from get.data import _graph_dataset_cache_fingerprint
 
@@ -182,6 +182,12 @@ def _normalized_name(name: str) -> str:
     return "".join(ch for ch in str(name).lower() if ch.isalnum())
 
 
+def _resolve_stage4_num_workers(device: str, requested: int) -> int:
+    if str(device).startswith("cuda"):
+        return max(0, int(requested))
+    return 0
+
+
 def _local_anomaly_path(dataset_name: str, data_root: str) -> Path | None:
     norm = _normalized_name(dataset_name)
     candidates = [
@@ -294,7 +300,7 @@ def _maybe_cache_ego_dataset(
     num_hops: int,
     limit: int | None,
     cache_dir: str,
-    num_workers: int = 0,
+    num_workers: int = 8,
     max_nodes: int | None = None,
 ) -> list[dict]:
     Path(cache_dir).mkdir(parents=True, exist_ok=True)
@@ -340,6 +346,23 @@ def _build_optimizer(model: torch.nn.Module, lr: float, wd: float) -> torch.opti
     return torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(wd))
 
 
+def _stage4_autocast_enabled(
+    model: torch.nn.Module,
+    device: str,
+    inference_mode: str | None = None,
+    use_amp: bool | None = None,
+) -> bool:
+    if inference_mode == "armijo":
+        return False
+    if use_amp is not None:
+        return bool(use_amp) and str(device).startswith("cuda")
+    return _should_enable_amp(model, device)
+
+
+def _stage4_amp_dtype(device: str, amp_dtype=None):
+    return _normalize_amp_dtype(amp_dtype, device)
+
+
 def _train_graph_classification(
     model: torch.nn.Module,
     train_ds: list[dict],
@@ -348,10 +371,12 @@ def _train_graph_classification(
     epochs: int,
     batch_size: int,
     device: str,
-    lr: float = 5e-4,
+    lr: float = 1e-4,
     weight_decay: float = 1e-4,
     loader_kwargs: dict | None = None,
     model_name: str | None = None,
+    use_amp: bool | None = None,
+    amp_dtype=None,
 ) -> FitResult:
     import time
 
@@ -360,6 +385,9 @@ def _train_graph_classification(
     opt = _build_optimizer(model, lr=lr, wd=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max", factor=0.5, patience=5)
     criterion = torch.nn.CrossEntropyLoss()
+    use_amp = _stage4_autocast_enabled(model, device, use_amp=use_amp)
+    autocast_dtype = _stage4_amp_dtype(device, amp_dtype)
+    scaler = torch.amp.GradScaler("cuda", enabled=bool(use_amp and str(device).startswith("cuda") and autocast_dtype == torch.float16))
     loader_kwargs = loader_kwargs or {}
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_get_batch, **loader_kwargs)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_get_batch, **loader_kwargs)
@@ -388,11 +416,19 @@ def _train_graph_classification(
         for batch in train_loader:
             batch = batch.to(device)
             opt.zero_grad()
-            logits, _ = model(batch, task_level="graph")
-            loss = criterion(logits, batch.y.view(-1).long())
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
+            with torch.autocast(device_type=torch.device(device).type, dtype=autocast_dtype, enabled=use_amp):
+                logits, _ = model(batch, task_level="graph")
+                loss = criterion(logits, batch.y.view(-1).long())
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
             train_losses.append(float(loss.detach().item()))
 
         train_loss = float(statistics.fmean(train_losses) if train_losses else 0.0)
@@ -411,7 +447,12 @@ def _train_graph_classification(
             with torch.no_grad():
                 for batch in loader:
                     batch = batch.to(device)
-                    logits, _ = model(batch, **forward_kwargs)
+                    with torch.autocast(
+                        device_type=torch.device(device).type,
+                        dtype=autocast_dtype,
+                        enabled=_stage4_autocast_enabled(model, device, forward_kwargs.get("inference_mode"), use_amp=use_amp),
+                    ):
+                        logits, _ = model(batch, **forward_kwargs)
                     y_pred_chunks.append(logits.argmax(dim=-1).detach())
                     y_true_chunks.append(batch.y.view(-1).long().detach())
             if not y_true_chunks:
@@ -465,7 +506,7 @@ def _train_graph_binary_with_val(
     epochs: int,
     batch_size: int,
     device: str,
-    lr: float = 5e-4,
+    lr: float = 1e-4,
     weight_decay: float = 1e-4,
     loader_kwargs: dict | None = None,
     use_weighted_bce: bool = True,
@@ -473,6 +514,8 @@ def _train_graph_binary_with_val(
     model_name: str | None = None,
     train_batch_sampler=None,
     eval_batch_sampler=None,
+    use_amp: bool | None = None,
+    amp_dtype=None,
 ) -> FitResult:
     import time
 
@@ -491,6 +534,9 @@ def _train_graph_binary_with_val(
             criterion = torch.nn.BCEWithLogitsLoss()
     else:
         criterion = torch.nn.BCEWithLogitsLoss()
+    use_amp = _stage4_autocast_enabled(model, device, use_amp=use_amp)
+    autocast_dtype = _stage4_amp_dtype(device, amp_dtype)
+    scaler = torch.amp.GradScaler("cuda", enabled=bool(use_amp and str(device).startswith("cuda") and autocast_dtype == torch.float16))
     loader_kwargs = loader_kwargs or {}
     if train_batch_sampler is not None:
         train_loader = DataLoader(train_ds, batch_sampler=train_batch_sampler, collate_fn=collate_get_batch, **loader_kwargs)
@@ -527,11 +573,19 @@ def _train_graph_binary_with_val(
         for batch in train_loader:
             batch = batch.to(device)
             opt.zero_grad()
-            logits, _ = model(batch, task_level="graph")
-            loss = criterion(logits.view(-1), batch.y.view(-1).float())
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
+            with torch.autocast(device_type=torch.device(device).type, dtype=autocast_dtype, enabled=use_amp):
+                logits, _ = model(batch, task_level="graph")
+                loss = criterion(logits.view(-1), batch.y.view(-1).float())
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
             losses.append(float(loss.detach().item()))
 
         def _collect(loader: DataLoader, capture_trace: bool = False) -> tuple[list[float], list[float], list[float]]:
@@ -553,7 +607,8 @@ def _train_graph_binary_with_val(
                 for b in loader:
                     if run_on_cpu:
                         b_cpu = b.to("cpu")
-                        logits, batch_energy_trace = cpu_model(b_cpu, **base_forward_kwargs)
+                        with torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=False):
+                            logits, batch_energy_trace = cpu_model(b_cpu, **base_forward_kwargs)
                         y_chunks.append(b_cpu.y.view(-1).float().detach())
                         p_chunks.append(torch.sigmoid(logits.view(-1)).detach())
                         if capture_trace and not captured_trace and batch_energy_trace is not None:
@@ -566,7 +621,12 @@ def _train_graph_binary_with_val(
                         continue
                     try:
                         b_dev = b.to(device)
-                        logits, batch_energy_trace = model(b_dev, **base_forward_kwargs)
+                        with torch.autocast(
+                            device_type=torch.device(device).type,
+                            dtype=autocast_dtype,
+                            enabled=_stage4_autocast_enabled(model, device, base_forward_kwargs.get("inference_mode"), use_amp=use_amp),
+                        ):
+                            logits, batch_energy_trace = model(b_dev, **base_forward_kwargs)
                         y_chunks.append(b_dev.y.view(-1).float().detach())
                         p_chunks.append(torch.sigmoid(logits.view(-1)).detach())
                         if capture_trace and not captured_trace and batch_energy_trace is not None:
@@ -590,7 +650,8 @@ def _train_graph_binary_with_val(
                                 p_chunks = [chunk.cpu() for chunk in p_chunks]
                         run_on_cpu = True
                         b_cpu = b.to("cpu")
-                        logits, batch_energy_trace = cpu_model(b_cpu, **base_forward_kwargs)
+                        with torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=False):
+                            logits, batch_energy_trace = cpu_model(b_cpu, **base_forward_kwargs)
                         y_chunks.append(b_cpu.y.view(-1).float().detach())
                         p_chunks.append(torch.sigmoid(logits.view(-1)).detach())
                         if capture_trace and not captured_trace and batch_energy_trace is not None:
@@ -662,7 +723,14 @@ def _recommend_anomaly_motif_cap(dataset: list[dict], requested: int, motif_budg
     return max(1, int(safe_cap))
 
 
-def _capture_energy_trace(model: torch.nn.Module, loader: DataLoader, device: str, task_level: str = "graph") -> list[float]:
+def _capture_energy_trace(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: str,
+    task_level: str = "graph",
+    use_amp: bool | None = None,
+    amp_dtype=None,
+) -> list[float]:
     try:
         batch = next(iter(loader))
     except StopIteration:
@@ -677,7 +745,12 @@ def _capture_energy_trace(model: torch.nn.Module, loader: DataLoader, device: st
         forward_kwargs["return_solver_stats"] = False
     try:
         with torch.no_grad():
-            outputs = model(batch.to(device), **forward_kwargs)
+            with torch.autocast(
+                device_type=torch.device(device).type,
+                dtype=_stage4_amp_dtype(device, amp_dtype),
+                enabled=_stage4_autocast_enabled(model, device, forward_kwargs.get("inference_mode"), use_amp=use_amp),
+            ):
+                outputs = model(batch.to(device), **forward_kwargs)
     except Exception:
         return []
     if not isinstance(outputs, tuple) or len(outputs) < 2:
@@ -745,6 +818,8 @@ def _build_graph_classification_models(
         "hidden_dim": int(args.hidden_dim),
         "pairwise_hidden_dim": int(args.hidden_dim * 1.73),
         "num_steps": int(args.num_steps),
+        "get_num_heads": int(args.get_num_heads),
+        "get_num_blocks": int(args.get_num_blocks),
         "lambda_3": float(args.lambda_3),
         "get_norm_style": str(args.get_norm_style),
         "get_pairwise_et_mask": bool(args.get_pairwise_et_mask),
@@ -758,9 +833,10 @@ def _build_graph_classification_models(
         "et_official_mode": bool(args.et_mask_mode == "official_dense"),
         "et_node_cap": args.et_node_cap,
     }
-    built = instantiate_models_from_config(
+    built = instantiate_models_from_catalog(
         args.model_config,
         context=context,
+        names=["PairwiseGET", "FullGET", "ETFaithful"],
     )
     return built["PairwiseGET"], built["FullGET"], built["ETFaithful"]
 
@@ -776,6 +852,8 @@ def _build_graph_anomaly_models(
         "hidden_dim": int(args.hidden_dim),
         "pairwise_hidden_dim": int(args.hidden_dim * 1.73),
         "num_steps": int(args.num_steps),
+        "get_num_heads": int(args.get_num_heads),
+        "get_num_blocks": int(args.get_num_blocks),
         "lambda_3": float(args.lambda_3),
         "get_norm_style": str(args.get_norm_style),
         "get_pairwise_et_mask": bool(args.get_pairwise_et_mask),
@@ -789,9 +867,10 @@ def _build_graph_anomaly_models(
         "et_official_mode": bool(args.et_mask_mode == "official_dense"),
         "et_node_cap": args.et_node_cap,
     }
-    built = instantiate_models_from_config(
+    built = instantiate_models_from_catalog(
         args.model_config,
         context=context,
+        names=["PairwiseGET", "FullGET", "ETFaithful"],
     )
     return built["PairwiseGET"], built["FullGET"], built["ETFaithful"]
 
