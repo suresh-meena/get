@@ -21,6 +21,55 @@ class GraphSample:
     t_tau: torch.Tensor
 
 
+import numba
+
+@numba.njit
+def _extract_motifs_jit(adj, n, max_motifs_per_anchor):
+    total_motifs = 0
+    for i in range(n):
+        n_neigh = 0
+        for j in range(n):
+            if adj[i, j]:
+                n_neigh += 1
+        num_pairs = (n_neigh * (n_neigh - 1)) // 2
+        total_motifs += min(num_pairs, max_motifs_per_anchor)
+        
+    c3 = np.empty(total_motifs, dtype=np.int64)
+    u3 = np.empty(total_motifs, dtype=np.int64)
+    v3 = np.empty(total_motifs, dtype=np.int64)
+    tau = np.empty(total_motifs, dtype=np.int64)
+    
+    ptr = 0
+    for i in range(n):
+        neigh = []
+        for j in range(n):
+            if adj[i, j]:
+                neigh.append(j)
+                
+        n_neigh = len(neigh)
+        if n_neigh < 2:
+            continue
+            
+        budget = 0
+        for j_idx in range(n_neigh):
+            for k_idx in range(j_idx + 1, n_neigh):
+                if budget >= max_motifs_per_anchor:
+                    break
+                
+                u = neigh[j_idx]
+                v = neigh[k_idx]
+                
+                c3[ptr] = i
+                u3[ptr] = u
+                v3[ptr] = v
+                tau[ptr] = 1 if adj[u, v] else 0
+                ptr += 1
+                budget += 1
+            if budget >= max_motifs_per_anchor:
+                break
+                
+    return c3, u3, v3, tau
+
 def _build_random_graph(
     rng: np.random.Generator,
     min_nodes: int,
@@ -45,41 +94,8 @@ def _build_random_graph(
     # Vectorized edge extraction
     c2, u2 = np.nonzero(adj)
 
-    c3_list = []
-    u3_list = []
-    v3_list = []
-    tau_list = []
-
-    # Vectorize wedge extraction per node
-    for i in range(n):
-        neigh = np.flatnonzero(adj[i])
-        n_neigh = len(neigh)
-        if n_neigh < 2:
-            continue
-            
-        # Create all pairs of neighbors
-        idx_j, idx_k = np.triu_indices(n_neigh, k=1)
-        
-        # Apply budget
-        if len(idx_j) > max_motifs_per_anchor:
-            idx_j = idx_j[:max_motifs_per_anchor]
-            idx_k = idx_k[:max_motifs_per_anchor]
-            
-        j_nodes = neigh[idx_j]
-        k_nodes = neigh[idx_k]
-        
-        c3_list.append(np.full(len(j_nodes), i, dtype=np.int64))
-        u3_list.append(j_nodes)
-        v3_list.append(k_nodes)
-        tau_list.append(adj[j_nodes, k_nodes].astype(np.int64))
-        
-    if c3_list:
-        c3 = np.concatenate(c3_list)
-        u3 = np.concatenate(u3_list)
-        v3 = np.concatenate(v3_list)
-        tau = np.concatenate(tau_list)
-    else:
-        c3 = u3 = v3 = tau = np.array([], dtype=np.int64)
+    # JIT compiled motif extraction
+    c3, u3, v3, tau = _extract_motifs_jit(adj, n, max_motifs_per_anchor)
 
     return GraphSample(
         x=torch.tensor(x, dtype=torch.float32),
