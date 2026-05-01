@@ -46,7 +46,7 @@ class GETLayer(nn.Module):
                  grad_clip_norm=1.0, beta_max=5.0, state_clip_norm=10.0, update_damping=1.0, learn_update_damping=False,
                  pairwise_symmetric=False, noise_std=0.0, use_pairwise=True, use_motif=True, use_memory=True,
                  norm_style="standard", pairwise_et_mask=False, pairwise_et_kernel_size=3,
-                 use_pna_scaling=False, avg_degree=1.0, edge_feat_dim=1):
+                 use_pna_scaling=False, avg_degree=1.0, edge_feat_dim=1, lambda_sum=0.0):
         super().__init__()
         self.d = d
         self.num_heads = int(num_heads)
@@ -80,6 +80,7 @@ class GETLayer(nn.Module):
         self.beta_2 = nn.Parameter(_inv_softplus(beta_2))
         self.beta_3 = nn.Parameter(_inv_softplus(beta_3))
         self.beta_m = nn.Parameter(_inv_softplus(beta_m))
+        self.lambda_sum = float(lambda_sum)
 
         # Always use EnergyLayerNorm to maintain theoretical guarantees and analytical pullback
         self.layernorm = EnergyLayerNorm(d, use_bias=True, eps=1e-5)
@@ -173,6 +174,7 @@ class GETLayer(nn.Module):
             'beta_2': self.beta_2, 'beta_3': self.beta_3, 'beta_m': self.beta_m,
             'beta_max': self.beta_max, 'pairwise_symmetric': self.pairwise_symmetric,
             'use_pairwise': self.use_pairwise, 'use_motif': self.use_motif, 'use_memory': self.use_memory,
+            'lambda_sum': self.lambda_sum,
             'T_tau': self.T_tau, 'W_Q2': self.W_Q2, 'W_K2': self.W_K2,
             'W_Q3': self.W_Q3, 'W_K3': self.W_K3, 'W_Qm': self.W_Qm, 'B_mem': self.B_mem,
         }
@@ -248,7 +250,7 @@ class GETLayer(nn.Module):
 
 
 class GETModel(nn.Module):
-    def __init__(self, in_dim, d=256, num_classes=1, num_steps=8, num_blocks=1, share_block_weights=False, tol=1e-4, compile=False, eta=0.05, eta_max=0.25, dropout=0.1, num_heads=4, head_dim=None, encoder_hidden_mult=2, readout_hidden_mult=2, pe_k=0, rwse_k=0, num_motif_types=4, use_cls_token=False, cls_self_loop=True, use_pna_scaling=False, avg_degree=1.0, **layer_kwargs):
+    def __init__(self, in_dim, d=256, num_classes=1, num_steps=8, num_blocks=1, share_block_weights=False, tol=1e-4, compile=False, eta=0.05, eta_max=0.25, dropout=0.1, num_heads=4, head_dim=None, encoder_hidden_mult=2, readout_hidden_mult=2, pe_k=0, rwse_k=0, num_motif_types=4, use_cls_token=False, cls_self_loop=True, use_pna_scaling=False, avg_degree=1.0, use_encoder_norm=True, **layer_kwargs):
         super().__init__()
         self.d = d
         self.num_steps = num_steps
@@ -268,7 +270,7 @@ class GETModel(nn.Module):
         if self.rwse_k > 0:
             self.rwse_proj = nn.Linear(rwse_k, d)
 
-        self.node_encoder = StableMLP(in_dim, d, hidden_dim=max(d, encoder_hidden_mult * d), dropout=dropout, final_norm=True)
+        self.node_encoder = StableMLP(in_dim, d, hidden_dim=max(d, encoder_hidden_mult * d), dropout=dropout, final_norm=use_encoder_norm)
         if self.share_block_weights:
             shared_layer = GETLayer(d, num_motif_types=num_motif_types, num_heads=num_heads, head_dim=head_dim, use_pna_scaling=use_pna_scaling, avg_degree=avg_degree, **layer_kwargs)
             self.get_layers = nn.ModuleList([shared_layer for _ in range(self.num_blocks)])
