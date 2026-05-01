@@ -56,6 +56,16 @@ def fused_motif_dot(
     """
     return (Q3_c * (K3_u * K3_v + T_tau)).sum(dim=(-1, -2))
 
+
+def fused_motif_dot_baseline(
+    Q3_c: torch.Tensor,
+    K3_u: torch.Tensor,
+    K3_v: torch.Tensor,
+    T_tau: torch.Tensor,
+) -> torch.Tensor:
+    """Baseline alias kept for API compatibility with older imports/tests."""
+    return fused_motif_dot(Q3_c=Q3_c, K3_u=K3_u, K3_v=K3_v, T_tau=T_tau)
+
 def positive_param(params: dict, name: str):
     val = params[name]
     if isinstance(val, (float, int)):
