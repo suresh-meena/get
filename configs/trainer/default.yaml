@@ -8,4 +8,4 @@ amp_dtype: fp16
 log_every_steps: 10
 patience: 5
 eval_batch_size: 64
-num_workers: 4
+num_workers: 8

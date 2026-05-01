@@ -69,45 +69,49 @@ def _build_loaders(args: argparse.Namespace):
     val_ds = SyntheticGraphDataset(num_graphs=args.num_val_graphs, seed=args.seed + 1, **common)
     test_ds = SyntheticGraphDataset(num_graphs=args.num_test_graphs, seed=args.seed + 2, **common)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_graph_samples)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
     eval_bs = args.eval_batch_size or args.batch_size
-    val_loader = DataLoader(val_ds, batch_size=eval_bs, shuffle=False, collate_fn=collate_graph_samples)
-    test_loader = DataLoader(test_ds, batch_size=eval_bs, shuffle=False, collate_fn=collate_graph_samples)
+    val_loader = DataLoader(val_ds, batch_size=eval_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
+    test_loader = DataLoader(test_ds, batch_size=eval_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
     return train_loader, val_loader, test_loader
 
 
 def _extract_motifs_from_adj(adj: torch.Tensor, max_motifs_per_anchor: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     n = adj.size(0)
-    c3: List[int] = []
-    u3: List[int] = []
-    v3: List[int] = []
-    tt: List[int] = []
+    c3_list = []
+    u3_list = []
+    v3_list = []
+    tt_list = []
+    
     for c in range(n):
         neigh = torch.nonzero(adj[c], as_tuple=False).flatten()
-        if neigh.numel() < 2:
+        n_neigh = neigh.numel()
+        if n_neigh < 2:
             continue
-        budget = 0
-        for i in range(neigh.numel()):
-            if budget >= max_motifs_per_anchor:
-                break
-            for j in range(i + 1, neigh.numel()):
-                if budget >= max_motifs_per_anchor:
-                    break
-                u = int(neigh[i].item())
-                v = int(neigh[j].item())
-                c3.append(c)
-                u3.append(u)
-                v3.append(v)
-                tt.append(1 if bool(adj[u, v].item()) else 0)
-                budget += 1
-    if len(c3) == 0:
+            
+        idx_j, idx_k = torch.triu_indices(n_neigh, n_neigh, offset=1)
+        
+        if idx_j.numel() > max_motifs_per_anchor:
+            idx_j = idx_j[:max_motifs_per_anchor]
+            idx_k = idx_k[:max_motifs_per_anchor]
+            
+        u = neigh[idx_j]
+        v = neigh[idx_k]
+        
+        c3_list.append(torch.full((u.numel(),), c, dtype=torch.long))
+        u3_list.append(u)
+        v3_list.append(v)
+        tt_list.append(adj[u, v].long())
+        
+    if not c3_list:
         empty = torch.empty(0, dtype=torch.long)
         return empty, empty, empty, empty
+        
     return (
-        torch.tensor(c3, dtype=torch.long),
-        torch.tensor(u3, dtype=torch.long),
-        torch.tensor(v3, dtype=torch.long),
-        torch.tensor(tt, dtype=torch.long),
+        torch.cat(c3_list),
+        torch.cat(u3_list),
+        torch.cat(v3_list),
+        torch.cat(tt_list),
     )
 
 
@@ -215,10 +219,10 @@ def _build_real_stage2_loaders(args: argparse.Namespace):
     val_ds = _ListGraphDataset(val_items)
     test_ds = _ListGraphDataset(test_items)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_graph_samples)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
     eval_bs = args.eval_batch_size or args.batch_size
-    val_loader = DataLoader(val_ds, batch_size=eval_bs, shuffle=False, collate_fn=collate_graph_samples)
-    test_loader = DataLoader(test_ds, batch_size=eval_bs, shuffle=False, collate_fn=collate_graph_samples)
+    val_loader = DataLoader(val_ds, batch_size=eval_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
+    test_loader = DataLoader(test_ds, batch_size=eval_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
     return train_loader, val_loader, test_loader
 
 
@@ -231,10 +235,10 @@ def _build_loaders_from_samples(
     train_ds = _ListGraphDataset(train_items)
     val_ds = _ListGraphDataset(val_items)
     test_ds = _ListGraphDataset(test_items)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_graph_samples)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
     eval_bs = args.eval_batch_size or args.batch_size
-    val_loader = DataLoader(val_ds, batch_size=eval_bs, shuffle=False, collate_fn=collate_graph_samples)
-    test_loader = DataLoader(test_ds, batch_size=eval_bs, shuffle=False, collate_fn=collate_graph_samples)
+    val_loader = DataLoader(val_ds, batch_size=eval_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
+    test_loader = DataLoader(test_ds, batch_size=eval_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
     return train_loader, val_loader, test_loader
 
 
@@ -350,6 +354,7 @@ def main() -> None:
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--eval_batch_size", type=int, default=16)
+    p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--max_grad_norm", type=float, default=1.0)

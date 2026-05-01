@@ -16,7 +16,7 @@ def _move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) 
     out: Dict[str, torch.Tensor] = {}
     for k, v in batch.items():
         if torch.is_tensor(v):
-            out[k] = v.to(device)
+            out[k] = v.to(device, non_blocking=True)
         else:
             out[k] = v
     return out
