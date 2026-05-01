@@ -35,42 +35,51 @@ def _build_random_graph(
     adj = adj | adj.T
     np.fill_diagonal(adj, False)
 
-    tri_count = 0
-    for i, j, k in combinations(range(n), 3):
-        if adj[i, j] and adj[i, k] and adj[j, k]:
-            tri_count += 1
-
+    # Vectorized triangle counting
+    tri_count = int(np.trace(np.linalg.matrix_power(adj.astype(float), 3)) // 6)
     y_val = float(tri_count > 0)
+    
     x = rng.standard_normal((n, in_dim)).astype(np.float32)
     x[:, 0] += 0.35 if y_val > 0.5 else -0.35
 
-    c2: List[int] = []
-    u2: List[int] = []
-    c3: List[int] = []
-    u3: List[int] = []
-    v3: List[int] = []
-    tau: List[int] = []
+    # Vectorized edge extraction
+    c2, u2 = np.nonzero(adj)
 
+    c3_list = []
+    u3_list = []
+    v3_list = []
+    tau_list = []
+
+    # Vectorize wedge extraction per node
     for i in range(n):
-        neigh = np.flatnonzero(adj[i]).tolist()
-        for j in neigh:
-            c2.append(i)
-            u2.append(int(j))
-
-        motif_budget = 0
-        for j_idx in range(len(neigh)):
-            for k_idx in range(j_idx + 1, len(neigh)):
-                if motif_budget >= max_motifs_per_anchor:
-                    break
-                j = int(neigh[j_idx])
-                k = int(neigh[k_idx])
-                c3.append(i)
-                u3.append(j)
-                v3.append(k)
-                tau.append(1 if adj[j, k] else 0)
-                motif_budget += 1
-            if motif_budget >= max_motifs_per_anchor:
-                break
+        neigh = np.flatnonzero(adj[i])
+        n_neigh = len(neigh)
+        if n_neigh < 2:
+            continue
+            
+        # Create all pairs of neighbors
+        idx_j, idx_k = np.triu_indices(n_neigh, k=1)
+        
+        # Apply budget
+        if len(idx_j) > max_motifs_per_anchor:
+            idx_j = idx_j[:max_motifs_per_anchor]
+            idx_k = idx_k[:max_motifs_per_anchor]
+            
+        j_nodes = neigh[idx_j]
+        k_nodes = neigh[idx_k]
+        
+        c3_list.append(np.full(len(j_nodes), i, dtype=np.int64))
+        u3_list.append(j_nodes)
+        v3_list.append(k_nodes)
+        tau_list.append(adj[j_nodes, k_nodes].astype(np.int64))
+        
+    if c3_list:
+        c3 = np.concatenate(c3_list)
+        u3 = np.concatenate(u3_list)
+        v3 = np.concatenate(v3_list)
+        tau = np.concatenate(tau_list)
+    else:
+        c3 = u3 = v3 = tau = np.array([], dtype=np.int64)
 
     return GraphSample(
         x=torch.tensor(x, dtype=torch.float32),
