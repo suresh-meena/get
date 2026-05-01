@@ -1,0 +1,9 @@
+name: "synthetic_graph"
+in_dim: 8
+num_train_graphs: 96
+num_val_graphs: 24
+num_test_graphs: 24
+min_nodes: 6
+max_nodes: 10
+edge_prob: 0.2
+max_motifs_per_anchor: 8

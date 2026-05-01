@@ -1,0 +1,9 @@
+defaults:
+  - _self_
+  - experiment: synthetic_graph
+  - model: fullget
+  - dataset: synthetic_graph
+  - trainer: default
+
+task: "binary_graph_classification"
+seed: 42

@@ -1,0 +1,4 @@
+name: "synthetic_graph"
+device: "auto"  # auto | cpu | cuda
+inference_mode_train: "fixed"
+inference_mode_eval: "armijo"

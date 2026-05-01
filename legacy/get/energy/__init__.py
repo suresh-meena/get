@@ -1,41 +1,43 @@
+"""GET energy functions: scalar energy branches and their gradients."""
+
 from .ops import (
-    segment_reduce_1d,
     segment_logsumexp,
+    segment_softmax,
+    segment_reduce_1d,
     scatter_add_nd,
     fused_motif_dot,
     positive_param,
     inverse_temperature,
-    compute_degree_scaler,
-    get_degree_from_incidence
 )
-
 from .quadratic import QuadraticEnergy, compute_quadratic_energy
 from .pairwise import PairwiseEnergy, compute_pairwise_energy
 from .motif import MotifEnergy, compute_motif_energy
 from .memory import MemoryEnergy, compute_memory_energy, compute_memory_entropy
-from .linear_agg import LinearAggregationEnergy, compute_linear_aggregation_energy
-from .core import GETEnergy, compute_energy_GET
+from .core import GETEnergy, GETEnergyWithGrad, compute_energy_GET, compute_energy_and_grad_GET
+
+# Backward-compatible alias
+_scatter_add_nd = scatter_add_nd
 
 __all__ = [
-    "segment_reduce_1d",
     "segment_logsumexp",
+    "segment_softmax",
+    "segment_reduce_1d",
     "scatter_add_nd",
+    "_scatter_add_nd",
     "fused_motif_dot",
     "positive_param",
     "inverse_temperature",
-    "compute_degree_scaler",
-    "get_degree_from_incidence",
     "QuadraticEnergy",
-    "compute_quadratic_energy",
     "PairwiseEnergy",
-    "compute_pairwise_energy",
     "MotifEnergy",
-    "compute_motif_energy",
     "MemoryEnergy",
+    "GETEnergy",
+    "GETEnergyWithGrad",
+    "compute_quadratic_energy",
+    "compute_pairwise_energy",
+    "compute_motif_energy",
     "compute_memory_energy",
     "compute_memory_entropy",
-    "LinearAggregationEnergy",
-    "compute_linear_aggregation_energy",
-    "GETEnergy",
-    "compute_energy_GET"
+    "compute_energy_GET",
+    "compute_energy_and_grad_GET",
 ]

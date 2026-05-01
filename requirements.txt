@@ -34,3 +34,8 @@ pydantic
 pygod==1.1.0
 ogb==1.3.6
 ruff
+
+# Refactoring additions
+hydra-core
+omegaconf
+torchmetrics

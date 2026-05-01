@@ -1,0 +1,23 @@
+name: "PairwiseGET"
+in_dim: 1  # To be overridden by dataset
+hidden_dim: 128
+num_classes: 1
+num_steps: 8
+num_heads: 4
+head_dim: 32
+lambda_2: 1.0
+lambda_3: 0.0
+lambda_m: 0.0
+beta_2: 1.0
+beta_3: 1.0
+beta_m: 1.0
+num_motif_types: 24
+R: 2
+K: 32
+dropout: 0.0
+update_damping: 0.05
+fixed_step_size: 0.08
+armijo_eta0: 0.2
+armijo_gamma: 0.5
+armijo_c: 1e-4
+armijo_max_backtracks: 20
