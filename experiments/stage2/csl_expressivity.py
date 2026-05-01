@@ -4,8 +4,9 @@ import networkx as nx
 import numpy as np
 from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
 
-from get import ETFaithful, FullGET, PairwiseGET, GINBaseline, GCNBaseline, GATBaseline, CachedGraphDataset
+from get import CachedGraphDataset
 from experiments.shared.common import set_seed, GETTrainer, save_results, get_num_params
+from experiments.shared.model_config import instantiate_models_from_catalog, load_training_defaults
 
 def generate_csl_dataset(graphs_per_class=15, seed=42):
     rng = np.random.default_rng(seed)
@@ -30,7 +31,9 @@ def main():
     parser.add_argument("--seeds", type=int, nargs="+", default=[42])
     parser.add_argument("--rwse_k", type=int, default=0, help="Keep 0 for the pure expressivity diagnostic; use >0 only for GET+RWSE.")
     parser.add_argument("--graphs_per_class", type=int, default=15)
+    parser.add_argument("--model_config", default="configs/models/catalog.yaml")
     args = parser.parse_args()
+    training_defaults = load_training_defaults(args.model_config)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     raw_dataset, labels = generate_csl_dataset(graphs_per_class=args.graphs_per_class, seed=0)
@@ -41,17 +44,10 @@ def main():
     else:
         dataset = raw_dataset
 
-    model_factories = [
-        ("PairwiseGET", lambda: PairwiseGET(1, 96, 10, rwse_k=args.rwse_k)),
-        ("FullGET", lambda: FullGET(1, 64, 10, R=2, lambda_3=0.5, rwse_k=args.rwse_k)),
-        ("ETFaithful", lambda: ETFaithful(1, 64, 10, num_steps=8, rwse_k=args.rwse_k, pe_k=0, mask_mode="sparse", et_official_mode=False)),
-        ("GIN", lambda: GINBaseline(1, 64, 10)),
-        ("GCN", lambda: GCNBaseline(1, 64, 10)),
-        ("GAT", lambda: GATBaseline(1, 64, 10))
-    ]
+    model_names = ["PairwiseGET", "FullGET", "ETFaithful", "GIN", "GCN", "GAT"]
 
     results = {}
-    for name, factory in model_factories:
+    for name in model_names:
         print(f"\n--- CV for {name} ---")
         seed_accs = []
         param_count = None
@@ -69,9 +65,42 @@ def main():
                 train_ds = [dataset[i] for i in train_ids]
                 val_ds = [dataset[i] for i in val_ids]
                 test_ds = [dataset[i] for i in test_idx]
-                model = factory()
+                model_context = {
+                    "in_dim": 1,
+                    "gin_in_dim": 1,
+                    "num_classes": 10,
+                    "hidden_dim": 64,
+                    "pairwise_hidden_dim": 96,
+                    "num_steps": 8,
+                    "get_num_heads": 4,
+                    "get_num_blocks": 6,
+                    "lambda_3": 0.5,
+                    "get_norm_style": "et",
+                    "get_pairwise_et_mask": False,
+                    "get_pe_k": 0,
+                    "rwse_k": args.rwse_k,
+                    "et_num_blocks": 8,
+                    "et_num_heads": 4,
+                    "et_head_dim_or_none": 64,
+                    "et_pe_k": 0,
+                    "et_mask_mode": "sparse",
+                    "et_official_mode": False,
+                    "et_node_cap": None,
+                }
+                model = instantiate_models_from_catalog(
+                    args.model_config,
+                    context=model_context,
+                    names=[name],
+                )[name]
                 param_count = param_count or get_num_params(model)
-                trainer = GETTrainer(model, task_type='multiclass', device=device, lr=1e-3)
+                trainer = GETTrainer(
+                    model,
+                    task_type='multiclass',
+                    device=device,
+                    lr=1e-3,
+                    use_amp=training_defaults.get("use_amp", None),
+                    amp_dtype=training_defaults.get("amp_dtype", None),
+                )
                 res = trainer.run(train_ds, val_ds, test_ds, args.epochs, 16)
                 fold_accs.append(res['metric'])
                 print(f"Seed {seed} Fold {fold+1} Acc: {res['metric']:.4f}")

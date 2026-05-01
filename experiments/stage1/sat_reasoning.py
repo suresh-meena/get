@@ -11,7 +11,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from get import ETFaithful, FullGET, PairwiseGET, collate_get_batch  # noqa: E402
-from experiments.shared.common import set_seed, build_dataloader_kwargs, get_num_params, save_results  # noqa: E402
+from experiments.shared.common import _normalize_amp_dtype, _should_enable_amp, set_seed, build_dataloader_kwargs, get_num_params, save_results  # noqa: E402
+from experiments.shared.model_config import load_training_defaults  # noqa: E402
 
 def generate_random_3cnf(num_vars=20, num_clauses=80, seed=42):
     rng = random.Random(seed)
@@ -208,11 +209,25 @@ def compute_metrics(logits, batch, xor=False):
 
     return global_satisfied_ratio, solved_count / num_graphs
 
-def train(model, train_loader, val_loader, test_loader, epochs, device, model_name=None, xor=False):
+def train(
+    model,
+    train_loader,
+    val_loader,
+    test_loader,
+    epochs,
+    device,
+    model_name=None,
+    xor=False,
+    use_amp=None,
+    amp_dtype=None,
+):
     import time
     model = model.to(device)
     model_name = model_name or model.__class__.__name__
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    use_amp = _should_enable_amp(model, device) if use_amp is None else bool(use_amp and str(device).startswith("cuda"))
+    autocast_dtype = _normalize_amp_dtype(amp_dtype, device)
+    scaler = torch.amp.GradScaler("cuda", enabled=bool(use_amp and str(device).startswith("cuda") and autocast_dtype == torch.float16))
     
     print("-" * 50)
     print(f"EXPERIMENT: {model_name} on {'3-XORSAT' if xor else 'Max-3-SAT'}")
@@ -238,19 +253,28 @@ def train(model, train_loader, val_loader, test_loader, epochs, device, model_na
         for batch in train_loader:
             batch = batch.to(device)
             opt.zero_grad()
-            logits, _ = model(batch, task_level="node")
-            loss = compute_loss(logits, batch, xor=xor)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
+            with torch.autocast(device_type=torch.device(device).type, dtype=autocast_dtype, enabled=use_amp):
+                logits, _ = model(batch, task_level="node")
+                loss = compute_loss(logits, batch, xor=xor)
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
             train_loss += loss.item()
         model.eval()
         val_loss = 0
         with torch.no_grad():
             for batch in val_loader:
                 batch = batch.to(device)
-                logits, _ = model(batch, task_level="node")
-                loss = compute_loss(logits, batch, xor=xor)
+                with torch.autocast(device_type=torch.device(device).type, dtype=autocast_dtype, enabled=use_amp):
+                    logits, _ = model(batch, task_level="node")
+                    loss = compute_loss(logits, batch, xor=xor)
                 val_loss += loss.item()
         val_loss /= max(1, len(val_loader))
         history["train_loss"].append(train_loss / max(1, len(train_loader)))
@@ -262,8 +286,9 @@ def train(model, train_loader, val_loader, test_loader, epochs, device, model_na
             with torch.no_grad():
                 for batch in test_loader:
                     batch = batch.to(device)
-                    logits, _ = model(batch, task_level="node")
-                    test_loss += compute_loss(logits, batch, xor=xor).item()
+                    with torch.autocast(device_type=torch.device(device).type, dtype=autocast_dtype, enabled=use_amp):
+                        logits, _ = model(batch, task_level="node")
+                        test_loss += compute_loss(logits, batch, xor=xor).item()
                     all_logits.append(logits.cpu())
                     all_batches.append(batch)
             test_loss /= max(1, len(test_loader))
@@ -281,7 +306,8 @@ def train(model, train_loader, val_loader, test_loader, epochs, device, model_na
         model.eval()
         sample_batch = next(iter(test_loader)).to(device)
         with torch.no_grad():
-            _, energy_trace_raw = model(sample_batch, task_level="node", inference_mode="armijo")
+            with torch.autocast(device_type=torch.device(device).type, dtype=autocast_dtype, enabled=False):
+                _, energy_trace_raw = model(sample_batch, task_level="node", inference_mode="armijo")
         energy_trace = [float(step.detach().float().mean().cpu().item()) for step in energy_trace_raw]
     except Exception:
         energy_trace = []
@@ -301,7 +327,9 @@ def main():
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--xor", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--model_config", default="configs/models/catalog.yaml")
     args = parser.parse_args()
+    training_defaults = load_training_defaults(args.model_config)
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dataset = generate_dataset(args.num_graphs, num_vars=20, num_clauses=80, xor=args.xor, seed=args.seed)
@@ -319,7 +347,18 @@ def main():
     }
     results = {}
     for name, model in models.items():
-        res = train(model, train_loader, val_loader, test_loader, args.epochs, device, model_name=name, xor=args.xor)
+        res = train(
+            model,
+            train_loader,
+            val_loader,
+            test_loader,
+            args.epochs,
+            device,
+            model_name=name,
+            xor=args.xor,
+            use_amp=training_defaults.get("use_amp", None),
+            amp_dtype=training_defaults.get("amp_dtype", None),
+        )
         results[name] = res
         print(f"{name} Test Loss: {res['test_loss']:.4f} | Satisfied Clause Ratio: {res['clause_ratio']:.4f} | Solved Accuracy: {res['solved_ratio']:.4f}")
 
