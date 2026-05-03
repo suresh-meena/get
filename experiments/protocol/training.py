@@ -143,9 +143,10 @@ def _collect_train_stats(loader, device, task_type: str):
     pos_weight = None
     if pos is not None:
         neg = total - pos
-        pos_weight = torch.ones_like(pos, device=device)
+        pos_weight = torch.ones_like(pos)
         valid = pos > 0
         pos_weight[valid] = neg[valid] / pos[valid]
+        pos_weight = pos_weight.to(device)
 
     avg_degree = (degree_sum / node_sum) if node_sum > 0 else None
     return pos_weight, avg_degree

@@ -103,8 +103,9 @@ def _build_random_graph(
     adj = adj | adj.T
     np.fill_diagonal(adj, False)
 
-    # Vectorized triangle counting
-    tri_count = int(np.trace(np.linalg.matrix_power(adj.astype(float), 3)) // 6)
+    # Triangle count via A^2 \circ A instead of a full A^3 product.
+    adj_f = adj.astype(np.float32)
+    tri_count = int((((adj_f @ adj_f) * adj_f).sum()) / 6.0)
     y_val = float(tri_count > 0)
     
     x = rng.standard_normal((n, in_dim)).astype(np.float32)

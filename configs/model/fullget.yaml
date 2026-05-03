@@ -3,7 +3,7 @@ energy_name: "get_full"
 in_dim: 1  # To be overridden by dataset
 hidden_dim: 128
 num_classes: 1
-num_steps: 8
+num_steps: 6
 num_heads: 4
 head_dim: 32
 lambda_2: 1.0

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import statistics
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -81,34 +82,81 @@ def _build_loaders(cfg: DictConfig, seed: int) -> Tuple[DataLoader, DataLoader, 
     return train_loader, val_loader, test_loader
 
 
-def _build_model(cfg: DictConfig) -> EnergyGraphClassifier:
+def _build_model(cfg: DictConfig) -> torch.nn.Module:
     m = cfg.model
-    exp = cfg.experiment
+    # Handle both flat and nested 'params' style configs
+    p = m.get("params", m)
+    factory = m.get("factory", "fullget").lower()
+
+    if factory == "etfaithful" or factory == "et":
+        from get.models import ETGraphClassifier
+        # Map 'd' to 'hidden_dim' if present (etfaithful style)
+        h_dim = p.get("d", p.get("hidden_dim", 128))
+        return ETGraphClassifier(
+            in_dim=int(cfg.dataset.in_dim),
+            hidden_dim=int(h_dim),
+            num_classes=int(p.num_classes),
+            num_heads=int(p.num_heads),
+            head_dim=int(p.head_dim),
+            num_steps=int(p.num_steps),
+            num_blocks=int(p.get("num_blocks", 1)),
+            alpha=float(p.get("fixed_step_size", 0.1)),
+            multiplier=float(p.get("multiplier", 4.0)),
+            chn_type=str(p.get("chn_type", "relu")),
+            use_bias_attn=bool(p.get("use_bias_attn", False)),
+            update_damping=float(p.get("update_damping", 0.0)),
+        )
+
+    if factory == "bwgnn":
+        from get.models.baselines import BWGNNBaseline
+        return BWGNNBaseline(
+            in_dim=int(cfg.dataset.in_dim),
+            hidden_dim=int(p.get("hidden_dim", 64)),
+            num_classes=int(p.num_classes),
+            d=int(p.get("bwgnn_order", 2))
+        )
+
+    if factory in {"graphtransformer", "gt"}:
+        from get.models.baselines import GraphTransformerBaseline
+        return GraphTransformerBaseline(
+            in_dim=int(cfg.dataset.in_dim),
+            hidden_dim=int(p.get("hidden_dim", 64)),
+            num_classes=int(p.num_classes),
+            num_heads=int(p.get("gt_num_heads", p.get("num_heads", 4))),
+            n_layers=int(p.get("gt_num_layers", p.get("num_steps", 6))),
+            dropout=float(p.get("gt_dropout", 0.0)),
+            ffn_ratio=int(p.get("gt_ffn_ratio", 2)),
+            layer_norm=bool(p.get("gt_layer_norm", True)),
+            residual=bool(p.get("gt_residual", True))
+        )
+
+
+    # Default to GET
     return EnergyGraphClassifier(
         in_dim=int(cfg.dataset.in_dim),
-        hidden_dim=int(m.hidden_dim),
-        num_classes=int(m.num_classes),
-        num_steps=int(m.num_steps),
-        num_heads=int(m.num_heads),
-        head_dim=int(m.head_dim),
-        R=int(m.R),
-        K=int(m.K),
-        num_motif_types=int(m.num_motif_types),
-        lambda_2=float(m.lambda_2),
-        lambda_3=float(m.lambda_3),
-        lambda_m=float(m.lambda_m),
-        beta_2=float(m.beta_2),
-        beta_3=float(m.beta_3),
-        beta_m=float(m.beta_m),
-        update_damping=float(m.update_damping),
-        fixed_step_size=float(m.get("fixed_step_size", 0.1)),
-        armijo_eta0=float(m.get("armijo_eta0", 0.2)),
-        armijo_gamma=float(m.get("armijo_gamma", 0.5)),
-        armijo_c=float(m.get("armijo_c", 1e-4)),
-        armijo_max_backtracks=int(m.get("armijo_max_backtracks", 20)),
-        inference_mode_train=str(exp.get("inference_mode_train", "fixed")),
-        inference_mode_eval=str(exp.get("inference_mode_eval", "armijo")),
-        energy_name=str(m.get("energy_name", "get_full")),
+        hidden_dim=int(p.hidden_dim),
+        num_classes=int(p.num_classes),
+        num_steps=int(p.num_steps),
+        num_heads=int(p.num_heads),
+        head_dim=int(p.head_dim),
+        R=int(p.R),
+        K=int(p.K),
+        num_motif_types=int(p.num_motif_types),
+        lambda_2=float(p.lambda_2),
+        lambda_3=float(p.lambda_3),
+        lambda_m=float(p.lambda_m),
+        beta_2=float(p.beta_2),
+        beta_3=float(p.beta_3),
+        beta_m=float(p.beta_m),
+        update_damping=float(p.update_damping),
+        fixed_step_size=float(p.get("fixed_step_size", 0.1)),
+        armijo_eta0=float(p.get("armijo_eta0", 0.2)),
+        armijo_gamma=float(p.get("armijo_gamma", 0.5)),
+        armijo_c=float(p.get("armijo_c", 1e-4)),
+        armijo_max_backtracks=int(p.get("armijo_max_backtracks", 20)),
+        inference_mode_train=str(cfg.experiment.get("inference_mode_train", "fixed")),
+        inference_mode_eval=str(cfg.experiment.get("inference_mode_eval", "armijo")),
+        energy_name=str(p.get("energy_name", "get_full")),
     )
 
 
@@ -139,13 +187,39 @@ def run_from_cfg(cfg: DictConfig) -> Dict:
         else:
             raise ValueError(f"Unsupported compile.scope '{compile_scope}'. Use 'eval_only' or 'all'.")
 
-    trainer = UnifiedTrainer(
-        model=model,
-        eval_model=eval_model,
-        device=device,
-        trainer_cfg=OmegaConf.to_container(cfg.trainer, resolve=True),
-    )
-    metrics = trainer.fit(train_loader, val_loader, test_loader)
+    num_runs = int(cfg.get("num_runs", 3))
+    all_run_metrics = []
+    base_seed = int(cfg.seed)
+
+    for run_idx in range(num_runs):
+        current_seed = base_seed + run_idx
+        seed_everything(current_seed)
+        print(f"\n>>> Starting Run {run_idx + 1}/{num_runs} (Seed: {current_seed})")
+
+        trainer = UnifiedTrainer(
+            model=model,
+            eval_model=eval_model,
+            device=device,
+            trainer_cfg=OmegaConf.to_container(cfg.trainer, resolve=True),
+        )
+        metrics = trainer.fit(train_loader, val_loader, test_loader)
+        metrics["run_idx"] = run_idx
+        metrics["seed"] = current_seed
+        all_run_metrics.append(metrics)
+
+    if num_runs > 1:
+        run_accs = [m["test"]["acc"] for m in all_run_metrics]
+        final_metrics = {
+            "num_runs": num_runs,
+            "all_runs": all_run_metrics,
+            "final_summary": {
+                "test_acc_mean": float(statistics.mean(run_accs)),
+                "test_acc_std": float(statistics.pstdev(run_accs) if len(run_accs) > 1 else 0.0),
+            }
+        }
+        metrics = final_metrics
+    else:
+        metrics = all_run_metrics[0]
 
     out_dir = Path("outputs") / "refactor"
     out_dir.mkdir(parents=True, exist_ok=True)

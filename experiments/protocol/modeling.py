@@ -76,6 +76,24 @@ def build_model(args, task_type: str, num_classes: int):
             use_energy_norm=use_energy_norm,
             agg_mode=agg_mode,
         )
+    if args.model_name in {"et", "etfaithful"}:
+        from get.models import ETGraphClassifier
+        return ETGraphClassifier(
+            in_dim=args.in_dim,
+            hidden_dim=args.hidden_dim,
+            num_classes=out_dim,
+            num_steps=args.num_steps,
+            num_heads=args.num_heads,
+            head_dim=args.head_dim,
+            num_blocks=getattr(args, "et_num_blocks", 1),
+            alpha=args.fixed_step_size,
+            multiplier=getattr(args, "et_multiplier", 4.0),
+            chn_type=getattr(args, "et_chn_type", "relu"),
+            use_bias_attn=getattr(args, "et_use_bias_attn", False),
+            update_damping=args.update_damping,
+            inference_mode_train=args.inference_mode_train,
+            inference_mode_eval=args.inference_mode_eval,
+        )
     if args.model_name == "quadratic_only":
         return EnergyGraphClassifier(
             in_dim=args.in_dim,
@@ -105,6 +123,27 @@ def build_model(args, task_type: str, num_classes: int):
             energy_name="quadratic_only",
             use_energy_norm=use_energy_norm,
             agg_mode=agg_mode,
+        )
+    if args.model_name == "bwgnn":
+        from get.models.baselines import BWGNNBaseline
+        return BWGNNBaseline(
+            in_dim=args.in_dim,
+            hidden_dim=args.hidden_dim,
+            num_classes=out_dim,
+            d=getattr(args, "bwgnn_order", 2)
+        )
+    if args.model_name in {"graphtransformer", "gt"}:
+        from get.models.baselines import GraphTransformerBaseline
+        return GraphTransformerBaseline(
+            in_dim=args.in_dim,
+            hidden_dim=args.hidden_dim,
+            num_classes=out_dim,
+            num_heads=getattr(args, "gt_num_heads", getattr(args, "num_heads", 4)),
+            n_layers=getattr(args, "gt_num_layers", getattr(args, "num_steps", 6)),
+            dropout=getattr(args, "gt_dropout", 0.0),
+            ffn_ratio=getattr(args, "gt_ffn_ratio", 2),
+            layer_norm=getattr(args, "gt_layer_norm", True),
+            residual=getattr(args, "gt_residual", True)
         )
     if args.model_name == "external_baseline":
         return ExternalGraphBaseline(in_dim=args.in_dim, hidden_dim=args.hidden_dim, out_dim=out_dim)

@@ -77,9 +77,54 @@ def _remap_multiclass_labels(samples: List[Dict[str, torch.Tensor]]) -> tuple[Li
     return remapped, len(labels)
 
 
+def _build_tudataset_loaders(args: argparse.Namespace):
+    from get.data import RealWorldGraphDataset
+    dataset = RealWorldGraphDataset(
+        name=args.dataset_name,
+        root=args.dataset_root,
+        in_dim=args.in_dim,
+        max_motifs_per_anchor=args.max_motifs_per_anchor,
+        task_type="auto"
+    )
+    all_samples = [dataset[i] for i in range(len(dataset))]
+    if args.max_graphs > 0:
+        all_samples = all_samples[:args.max_graphs]
+
+    num_classes = dataset.num_classes
+    task_type = dataset.task_type
+
+    # Default splitting logic if not doing CV
+    train_items, val_items, test_items = split_items(
+        all_samples, seed=args.seed, train_ratio=0.7, val_ratio=0.1, task_type=task_type
+    )
+
+    train_loader, val_loader, test_loader, split_stats = _build_loaders_from_samples(
+        train_items, val_items, test_items, args, task_type
+    )
+    return train_loader, val_loader, test_loader, split_stats, task_type, num_classes
+
+
+def _build_loaders_from_samples(train_items, val_items, test_items, args, task_type):
+    train_ds = _ListGraphDataset(train_items)
+    val_ds = _ListGraphDataset(val_items)
+    test_ds = _ListGraphDataset(test_items)
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
+    eval_bs = args.eval_batch_size or args.batch_size
+    val_loader = DataLoader(val_ds, batch_size=eval_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
+    test_loader = DataLoader(test_ds, batch_size=eval_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
+    
+    split_stats = summarize_splits({"train": train_items, "val": val_items, "test": test_items}, task_type=task_type)
+    return train_loader, val_loader, test_loader, split_stats
+
+
 def _build_loaders(args: argparse.Namespace):
     if args.dataset_name.lower() in {"csl", "brec"}:
         return _build_real_stage2_loaders(args)
+
+    real_datasets = {"proteins", "nci1", "nci109", "dd", "enzymes", "mutag", "mutagenicity", "frankenstein"}
+    if args.dataset_name.lower() in real_datasets:
+        return _build_tudataset_loaders(args)
 
     common = dict(
         min_nodes=args.min_nodes,
@@ -283,9 +328,48 @@ def _build_model(args: argparse.Namespace, task_type: str, num_classes: int) -> 
         from external.graph_baselines.torch_baselines import GINGraphBaseline
         return GINGraphBaseline(in_dim=args.in_dim, hidden_dim=args.hidden_dim, out_dim=out_dim)
 
+    if name in {"et", "etfaithful"}:
+        from get.models import ETGraphClassifier
+        return ETGraphClassifier(
+            in_dim=args.in_dim,
+            hidden_dim=args.hidden_dim,
+            num_classes=out_dim,
+            num_steps=args.num_steps,
+            num_heads=args.num_heads,
+            head_dim=args.head_dim,
+            num_blocks=getattr(args, "et_num_blocks", 1),
+            alpha=args.fixed_step_size,
+            multiplier=getattr(args, "et_multiplier", 4.0),
+            chn_type=getattr(args, "et_chn_type", "relu"),
+            use_bias_attn=getattr(args, "et_use_bias_attn", False),
+            update_damping=args.update_damping,
+            inference_mode_train=args.inference_mode_train,
+            inference_mode_eval=args.inference_mode_eval,
+        )
+    if name == "bwgnn":
+        from get.models.baselines import BWGNNBaseline
+        return BWGNNBaseline(
+            in_dim=args.in_dim,
+            hidden_dim=args.hidden_dim,
+            num_classes=out_dim,
+            d=getattr(args, "bwgnn_order", 2)
+        )
+    if name in {"graphtransformer", "gt"}:
+        from get.models.baselines import GraphTransformerBaseline
+        return GraphTransformerBaseline(
+            in_dim=args.in_dim,
+            hidden_dim=args.hidden_dim,
+            num_classes=out_dim,
+            num_heads=getattr(args, "gt_num_heads", getattr(args, "num_heads", 4)),
+            n_layers=getattr(args, "gt_num_layers", getattr(args, "num_steps", 6)),
+            dropout=getattr(args, "gt_dropout", 0.0),
+            ffn_ratio=getattr(args, "gt_ffn_ratio", 2),
+            layer_norm=getattr(args, "gt_layer_norm", True),
+            residual=getattr(args, "gt_residual", True)
+        )
     if name == "pairwiseget":
         energy_name = "pairwise_only"
-    elif name in {"quadratic_only", "et"}:
+    elif name == "quadratic_only":
         energy_name = "quadratic_only"
     elif name == "fullget":
         energy_name = "get_full"
@@ -329,12 +413,12 @@ def main() -> None:
         default="none",
         choices=["none", "csl", "brec", "graph_classification", "graph_anomaly"],
     )
-    p.add_argument("--dataset_name", type=str, default="synthetic", choices=["synthetic", "csl", "brec"])
+    p.add_argument("--dataset_name", type=str, default="synthetic")
     p.add_argument("--dataset_root", type=str, default="data")
     p.add_argument("--brec_file", type=str, default="")
     p.add_argument("--max_graphs", type=int, default=0)
     p.add_argument("--cv_folds", type=int, default=1)
-    p.add_argument("--model_name", type=str, default="fullget", choices=["fullget", "pairwiseget", "quadratic_only", "gcn", "gat", "gin", "external_baseline"])
+    p.add_argument("--model_name", type=str, default="fullget", choices=["fullget", "pairwiseget", "quadratic_only", "et", "etfaithful", "bwgnn", "graphtransformer", "gcn", "gat", "gin", "external_baseline"])
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--seed", type=int, default=123)
 
@@ -370,6 +454,12 @@ def main() -> None:
     p.add_argument("--armijo_eval_max_backtracks", type=int, default=5)
     p.add_argument("--inference_mode_train", type=str, default="fixed", choices=["fixed", "armijo"])
     p.add_argument("--inference_mode_eval", type=str, default="armijo", choices=["fixed", "armijo"])
+    
+    # ET-specific parameters
+    p.add_argument("--et_num_blocks", type=int, default=1)
+    p.add_argument("--et_multiplier", type=float, default=4.0)
+    p.add_argument("--et_chn_type", type=str, default="relu", choices=["relu", "gelu", "lse"])
+    p.add_argument("--et_use_bias_attn", action="store_true", default=False)
 
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--batch_size", type=int, default=16)
@@ -380,6 +470,17 @@ def main() -> None:
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--patience", type=int, default=3)
     
+    # BWGNN-specific parameters
+    p.add_argument("--bwgnn_order", type=int, default=2, help="Order for BWGNN polynomial filter")
+    
+    # GraphTransformer-specific parameters
+    p.add_argument("--gt_num_heads", type=int, default=4, help="Number of heads for Graph Transformer")
+    p.add_argument("--gt_num_layers", type=int, default=2, help="Number of layers for Graph Transformer")
+    p.add_argument("--gt_dropout", type=float, default=0.0, help="Dropout for Graph Transformer")
+    p.add_argument("--gt_ffn_ratio", type=int, default=2, help="FFN expansion ratio for Graph Transformer")
+    p.add_argument("--gt_layer_norm", action="store_true", default=True, help="Use layer norm in Graph Transformer")
+    p.add_argument("--gt_residual", action="store_true", default=True, help="Use residual in Graph Transformer")
+
     # AMP & Compile
     p.add_argument("--use_amp", action="store_true")
     p.add_argument("--amp_dtype", type=str, default="fp16", choices=["fp16", "bf16"])
@@ -391,6 +492,7 @@ def main() -> None:
     p.add_argument("--compile_scope", type=str, default="eval_only", choices=["eval_only", "all"])
 
     p.add_argument("--output", type=str, default="outputs/graph_tasks/last_metrics.json")
+    p.add_argument("--num_runs", type=int, default=3, help="Number of independent runs with different seeds")
     args = p.parse_args()
     args = _apply_task_preset(args)
 
@@ -404,65 +506,109 @@ def main() -> None:
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if args.cv_folds > 1:
-        if args.dataset_name.lower() != "csl":
-            raise ValueError("Cross-validation is currently supported for --dataset_name csl only.")
-        all_samples, num_classes = _load_csl_samples(args)
-        task_type = "multiclass"
-        if len(all_samples) < args.cv_folds:
-            raise ValueError(f"Not enough samples ({len(all_samples)}) for cv_folds={args.cv_folds}")
+    all_run_metrics = []
+    base_seed = args.seed
 
-        labels = np.array([int(sample["y"].view(-1)[0].item()) for sample in all_samples])
-        try:
-            splitter = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=args.seed)
-            fold_iter = splitter.split(np.arange(len(all_samples)), labels)
-        except ValueError:
-            splitter = KFold(n_splits=args.cv_folds, shuffle=True, random_state=args.seed)
-            fold_iter = splitter.split(np.arange(len(all_samples)))
-        fold_metrics: List[Dict[str, Dict[str, float]]] = []
-        for fold_idx, (trainval_idx, test_idx) in enumerate(fold_iter, start=1):
-            trainval_items = [all_samples[int(i)] for i in trainval_idx.tolist()]
-            test_items = [all_samples[int(i)] for i in test_idx.tolist()]
+    for run_idx in range(args.num_runs):
+        current_seed = base_seed + run_idx
+        seed_everything(current_seed)
+        print(f"\n>>> Starting Run {run_idx + 1}/{args.num_runs} (Seed: {current_seed})")
 
-            train_items, val_items, _ = split_items(trainval_items, seed=args.seed + fold_idx, train_ratio=0.85, val_ratio=0.15, task_type=task_type)
+        if args.cv_folds > 1:
+            real_datasets = {"proteins", "nci1", "nci109", "dd", "enzymes", "mutag", "mutagenicity", "frankenstein"}
+            if args.dataset_name.lower() == "csl":
+                all_samples, num_classes = _load_csl_samples(args)
+                task_type = "multiclass"
+            elif args.dataset_name.lower() in real_datasets:
+                from get.data import RealWorldGraphDataset
+                dataset = RealWorldGraphDataset(name=args.dataset_name, root=args.dataset_root, in_dim=args.in_dim, max_motifs_per_anchor=args.max_motifs_per_anchor, task_type="auto")
+                all_samples = [dataset[i] for i in range(len(dataset))]
+                num_classes = dataset.num_classes
+                task_type = dataset.task_type
+            else:
+                raise ValueError(f"Cross-validation is not supported for {args.dataset_name}.")
+            
+            if args.max_graphs > 0:
+                all_samples = all_samples[:args.max_graphs]
 
-            train_loader, val_loader, test_loader, fold_split_stats = _build_loaders_from_samples(
-                train_items=train_items, val_items=val_items, test_items=test_items, args=args, task_type=task_type
+            labels = np.array([int(sample["y"].view(-1)[0].item()) for sample in all_samples])
+            try:
+                splitter = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=current_seed)
+                fold_iter = splitter.split(np.arange(len(all_samples)), labels)
+            except ValueError:
+                splitter = KFold(n_splits=args.cv_folds, shuffle=True, random_state=current_seed)
+                fold_iter = splitter.split(np.arange(len(all_samples)))
+            
+            fold_metrics: List[Dict[str, Dict[str, float]]] = []
+            for fold_idx, (trainval_idx, test_idx) in enumerate(fold_iter, start=1):
+                trainval_items = [all_samples[int(i)] for i in trainval_idx.tolist()]
+                test_items = [all_samples[int(i)] for i in test_idx.tolist()]
+
+                train_items, val_items, _ = split_items(trainval_items, seed=current_seed + fold_idx, train_ratio=0.85, val_ratio=0.15, task_type=task_type)
+
+                train_loader, val_loader, test_loader, fold_split_stats = _build_loaders_from_samples(
+                    train_items=train_items, val_items=val_items, test_items=test_items, args=args, task_type=task_type
+                )
+                m = _run_single_fit(args=args, device=device, train_loader=train_loader, val_loader=val_loader, test_loader=test_loader, task_type=task_type, num_classes=num_classes)
+                m["fold"] = fold_idx
+                m["split_stats"] = fold_split_stats
+                fold_metrics.append(m)
+
+            test_accs = [float(m["test"]["acc"]) for m in fold_metrics]
+            test_losses = [float(m["test"]["loss"]) for m in fold_metrics]
+            metrics = {
+                "run_idx": run_idx,
+                "seed": current_seed,
+                "cv_folds": int(args.cv_folds),
+                "task_type": task_type,
+                "num_classes": int(num_classes),
+                "fold_metrics": fold_metrics,
+                "split_stats": summarize_splits({"all": all_samples}, task_type=task_type),
+                "summary": {
+                    "test_acc_mean": float(statistics.mean(test_accs)),
+                    "test_acc_std": float(statistics.pstdev(test_accs) if len(test_accs) > 1 else 0.0),
+                    "test_loss_mean": float(statistics.mean(test_losses)),
+                    "test_loss_std": float(statistics.pstdev(test_losses) if len(test_losses) > 1 else 0.0),
+                },
+            }
+        else:
+            train_loader, val_loader, test_loader, split_stats, task_type, num_classes = _build_loaders(args)
+            metrics = _run_single_fit(
+                args=args,
+                device=device,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                test_loader=test_loader,
+                task_type=task_type,
+                num_classes=num_classes,
             )
-            m = _run_single_fit(args=args, device=device, train_loader=train_loader, val_loader=val_loader, test_loader=test_loader, task_type=task_type, num_classes=num_classes)
-            m["fold"] = fold_idx
-            m["split_stats"] = fold_split_stats
-            fold_metrics.append(m)
+            metrics["run_idx"] = run_idx
+            metrics["seed"] = current_seed
+            metrics["task_type"] = task_type
+            metrics["num_classes"] = int(num_classes)
+            metrics["split_stats"] = split_stats
+        
+        all_run_metrics.append(metrics)
 
-        test_accs = [float(m["test"]["acc"]) for m in fold_metrics]
-        test_losses = [float(m["test"]["loss"]) for m in fold_metrics]
+    # Aggregate across runs
+    if args.num_runs > 1:
+        run_accs = []
+        for m in all_run_metrics:
+            if "summary" in m:
+                run_accs.append(m["summary"]["test_acc_mean"])
+            else:
+                run_accs.append(m["test"]["acc"])
+        
         metrics = {
-            "cv_folds": int(args.cv_folds),
-            "task_type": task_type,
-            "num_classes": int(num_classes),
-            "fold_metrics": fold_metrics,
-            "split_stats": summarize_splits({"all": all_samples}, task_type=task_type),
-            "summary": {
-                "test_acc_mean": float(statistics.mean(test_accs)),
-                "test_acc_std": float(statistics.pstdev(test_accs) if len(test_accs) > 1 else 0.0),
-                "test_loss_mean": float(statistics.mean(test_losses)),
-                "test_loss_std": float(statistics.pstdev(test_losses) if len(test_losses) > 1 else 0.0),
-            },
+            "num_runs": args.num_runs,
+            "all_runs": all_run_metrics,
+            "final_summary": {
+                "test_acc_mean": float(statistics.mean(run_accs)),
+                "test_acc_std": float(statistics.pstdev(run_accs) if len(run_accs) > 1 else 0.0),
+            }
         }
     else:
-        train_loader, val_loader, test_loader, split_stats, task_type, num_classes = _build_loaders(args)
-        metrics = _run_single_fit(
-            args=args,
-            device=device,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            test_loader=test_loader,
-            task_type=task_type,
-            num_classes=num_classes,
-        )
-        metrics["task_type"] = task_type
-        metrics["num_classes"] = int(num_classes)
-        metrics["split_stats"] = split_stats
+        metrics = all_run_metrics[0]
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)

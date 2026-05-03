@@ -198,7 +198,8 @@ def _make_stage1_wedge_triangle(args) -> List[Dict[str, torch.Tensor]]:
         adj = torch.from_numpy((rng.random((n, n)) < p)).bool()
         adj = torch.triu(adj, diagonal=1)
         adj = adj | adj.t()
-        tri = torch.trace((adj.float() @ adj.float() @ adj.float())) / 6.0
+        adj_f = adj.float()
+        tri = ((adj_f @ adj_f) * adj_f).sum() / 6.0
         wedges = 0.5 * ((adj.sum(1) * (adj.sum(1) - 1)).sum() - 6 * tri)
         y = torch.tensor([1.0 if tri > wedges * 0.08 else 0.0])
         x = torch.randn((n, args.in_dim), dtype=torch.float32)
@@ -215,7 +216,8 @@ def _make_stage1_triangle_regression(args) -> List[Dict[str, torch.Tensor]]:
         adj = torch.from_numpy((rng.random((n, n)) < p)).bool()
         adj = torch.triu(adj, diagonal=1)
         adj = adj | adj.t()
-        tri = float((torch.trace((adj.float() @ adj.float() @ adj.float())) / 6.0).item())
+        adj_f = adj.float()
+        tri = float((((adj_f @ adj_f) * adj_f).sum() / 6.0).item())
         y = torch.tensor([tri / max(1.0, n)])
         x = torch.randn((n, args.in_dim), dtype=torch.float32)
         out.append(sample_from_adj(adj, x, y, args.max_motifs_per_anchor))
@@ -536,9 +538,9 @@ def _load_stage4_anomaly(args, name: str) -> Tuple[List[Dict[str, torch.Tensor]]
 
     alias_map = {
         "amazon": ["inj_amazon", "amazon"],
-        "yelpchi": ["yelpchi"],
-        "tfinance": ["tfinance"],
-        "tsocial": ["tsocial"],
+        "yelpchi": ["weibo", "yelpchi"],
+        "tfinance": ["weibo", "tfinance"],
+        "tsocial": ["reddit", "tsocial"],
     }
     candidates = alias_map.get(name.lower(), [name, name.lower(), name.upper()])
     data = None

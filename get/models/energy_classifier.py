@@ -168,11 +168,20 @@ class EnergyGraphClassifier(nn.Module):
     def _normalize_state(self, x_state: torch.Tensor) -> torch.Tensor:
         return self.energy_norm(x_state) if self.use_energy_norm else x_state
 
-    def _energy_value(self, x_state: torch.Tensor, batch_data: Dict[str, torch.Tensor], scaler: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def _energy_value(
+        self,
+        x_state: torch.Tensor,
+        batch_data: Dict[str, torch.Tensor],
+        scaler: Optional[torch.Tensor] = None,
+        params: Optional[Dict[str, torch.Tensor | float | int | bool]] = None,
+        num_graphs: Optional[int] = None,
+    ) -> torch.Tensor:
         g = self._normalize_state(x_state)
-        params = self._build_params(dtype=g.dtype, device=g.device)
+        if params is None:
+            params = self._build_params(dtype=g.dtype, device=g.device)
         projections = self._build_projections(g)
-        num_graphs = int(batch_data["num_graphs"].item())
+        if num_graphs is None:
+            num_graphs = int(batch_data["num_graphs"].item())
 
         e_vec = self.energy(
             g,
@@ -197,11 +206,15 @@ class EnergyGraphClassifier(nn.Module):
         batch_data: Dict[str, torch.Tensor],
         scaler: Optional[torch.Tensor] = None,
         create_graph: bool = False,
+        params: Optional[Dict[str, torch.Tensor | float | int | bool]] = None,
+        num_graphs: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         g = self._normalize_state(x_state)
-        params = self._build_params(dtype=g.dtype, device=g.device)
+        if params is None:
+            params = self._build_params(dtype=g.dtype, device=g.device)
         projections = self._build_projections(g)
-        num_graphs = int(batch_data["num_graphs"].item())
+        if num_graphs is None:
+            num_graphs = int(batch_data["num_graphs"].item())
 
         e_vec = self.energy(
             g,
@@ -236,6 +249,8 @@ class EnergyGraphClassifier(nn.Module):
     ) -> torch.Tensor | Tuple[torch.Tensor, list[float], Dict[str, list[float]]]:
         x0 = self.encoder(batch_data["x"])
         mode = inference_mode or (self.inference_mode_train if self.training else self.inference_mode_eval)
+        num_graphs = int(batch_data["num_graphs"].item())
+        params_cache = self._build_params(dtype=x0.dtype, device=x0.device)
 
         scaler = None
         if self.agg_mode == "softmax" and batch_data["c_2"].numel() > 0:
@@ -245,10 +260,17 @@ class EnergyGraphClassifier(nn.Module):
             scaler = compute_degree_scaler(degs, avg_deg, mode="pna")
 
         def energy_fn(x: torch.Tensor) -> torch.Tensor:
-            return self._energy_value(x, batch_data, scaler=scaler)
+            return self._energy_value(x, batch_data, scaler=scaler, params=params_cache, num_graphs=num_graphs)
 
         def energy_and_grad_fn(x: torch.Tensor, create_graph: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
-            return self._energy_value_and_grad(x, batch_data, scaler=scaler, create_graph=create_graph)
+            return self._energy_value_and_grad(
+                x,
+                batch_data,
+                scaler=scaler,
+                create_graph=create_graph,
+                params=params_cache,
+                num_graphs=num_graphs,
+            )
 
         if mode == "fixed":
             x_final, energy_trace, solver_stats = self.fixed_solver.run(
@@ -265,7 +287,6 @@ class EnergyGraphClassifier(nn.Module):
         else:
             raise ValueError(f"Unsupported inference mode: {mode}")
 
-        num_graphs = int(batch_data["num_graphs"].item())
         pooled = self._pool_graph_mean(x_final, batch_data["batch"], num_graphs)
         logits = self.readout(pooled)
         if self.num_classes == 1:

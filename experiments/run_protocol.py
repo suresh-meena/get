@@ -25,7 +25,7 @@ from experiments.protocol.training import fit_once, make_loaders
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Full protocol runner (Stage 1-4)")
     p.add_argument("--task", type=str, required=True, choices=sorted(TASK_SPECS.keys()))
-    p.add_argument("--model_name", type=str, default="fullget", choices=["fullget", "pairwiseget", "quadratic_only", "external_baseline", "gin", "gcn", "gat"])
+    p.add_argument("--model_name", type=str, default="fullget", choices=["fullget", "pairwiseget", "quadratic_only", "et", "etfaithful", "external_baseline", "gin", "gcn", "gat"])
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--dataset_root", type=str, default="data")
     p.add_argument("--brec_file", type=str, default="")
@@ -62,6 +62,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--armijo_eval_max_backtracks", type=int, default=5)
     p.add_argument("--inference_mode_train", type=str, default="fixed", choices=["fixed", "armijo"])
     p.add_argument("--inference_mode_eval", type=str, default="armijo", choices=["fixed", "armijo"])
+    
+    # ET-specific parameters
+    p.add_argument("--et_num_blocks", type=int, default=1)
+    p.add_argument("--et_multiplier", type=float, default=4.0)
+    p.add_argument("--et_chn_type", type=str, default="relu", choices=["relu", "gelu", "lse"])
+    p.add_argument("--et_use_bias_attn", action="store_true", default=False)
     
     # New flags for GET optimization
     p.add_argument("--use_energy_norm", action="store_true", default=True)

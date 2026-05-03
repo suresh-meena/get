@@ -24,8 +24,8 @@ class FixedStepSolver:
         create_graph: bool = False,
     ) -> Tuple[torch.Tensor, List[float], Dict[str, List[float]]]:
         x = x0
-        energy_trace: List[float] = []
-        grad_norms: List[float] = []
+        energy_trace_tensors: List[torch.Tensor] = []
+        grad_norm_tensors: List[torch.Tensor] = []
         damping = min(max(float(self.update_damping), 0.0), 1.0)
         step_scale = 1.0 - damping
 
@@ -36,18 +36,17 @@ class FixedStepSolver:
                 grad, = torch.autograd.grad(e, x, create_graph=create_graph)
             else:
                 e, grad = energy_and_grad_fn(x, create_graph)
-            grad_norm = torch.linalg.vector_norm(grad).detach().item()
+            grad_norm_tensors.append(torch.linalg.vector_norm(grad).detach())
             x = x - (self.step_size * step_scale) * grad
-            energy_trace.append(e.detach().item())
-            grad_norms.append(grad_norm)
+            energy_trace_tensors.append(e.detach())
 
         stats = {
             "mode": "fixed",
             "update_damping": self.update_damping,
             "step_sizes": [self.step_size * step_scale for _ in range(self.num_steps)],
-            "grad_norms": grad_norms,
+            "grad_norms": [float(v.item()) for v in grad_norm_tensors],
         }
-        return x, energy_trace, stats
+        return x, [float(v.item()) for v in energy_trace_tensors], stats
 
 
 @dataclass
@@ -67,11 +66,11 @@ class ArmijoSolver:
         max_backtracks: int | None = None,
     ) -> Tuple[torch.Tensor, List[float], Dict[str, List[float]]]:
         x = x0.detach()
-        energy_trace: List[float] = []
+        energy_trace_tensors: List[torch.Tensor] = []
         step_sizes: List[float] = []
         backtracks: List[float] = []
         accepted: List[float] = []
-        grad_norms: List[float] = []
+        grad_norm_tensors: List[torch.Tensor] = []
         damping = min(max(float(self.update_damping), 0.0), 1.0)
         step_scale = 1.0 - damping
         backtrack_limit = self.max_backtracks if max_backtracks is None else max(0, int(max_backtracks))
@@ -84,7 +83,7 @@ class ArmijoSolver:
             else:
                 e, grad = energy_and_grad_fn(x, False)
             grad_norm_sq = (grad * grad).sum().detach()
-            grad_norms.append(torch.sqrt(grad_norm_sq).item())
+            grad_norm_tensors.append(torch.sqrt(grad_norm_sq).detach())
 
             eta = self.eta0
             found = False
@@ -109,7 +108,7 @@ class ArmijoSolver:
                 backtracks.append(float(backtrack_limit))
 
             x = chosen
-            energy_trace.append(e_current.item())
+            energy_trace_tensors.append(e_current.detach())
             step_sizes.append((eta * step_scale) if found else 0.0)
             accepted.append(1.0 if found else 0.0)
 
@@ -121,6 +120,6 @@ class ArmijoSolver:
             "step_sizes": step_sizes,
             "backtracks": backtracks,
             "accepted": accepted,
-            "grad_norms": grad_norms,
+            "grad_norms": [float(v.item()) for v in grad_norm_tensors],
         }
-        return x, energy_trace, stats
+        return x, [float(v.item()) for v in energy_trace_tensors], stats

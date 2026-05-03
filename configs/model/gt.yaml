@@ -1,0 +1,12 @@
+name: "GraphTransformer"
+factory: "gt"
+hidden_dim: 64
+num_classes: 2
+gt_num_heads: 2
+gt_num_layers: 1
+gt_dropout: 0.3
+gt_ffn_ratio: 4
+gt_layer_norm: true
+gt_residual: false
+lr: 1e-3
+weight_decay: 1e-4
