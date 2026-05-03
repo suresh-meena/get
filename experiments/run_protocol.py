@@ -61,6 +61,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--armijo_max_backtracks", type=int, default=20)
     p.add_argument("--inference_mode_train", type=str, default="armijo", choices=["fixed", "armijo"])
     p.add_argument("--inference_mode_eval", type=str, default="armijo", choices=["fixed", "armijo"])
+    
+    # New flags for GET optimization
+    p.add_argument("--use_energy_norm", action="store_true", default=True)
+    p.add_argument("--no_energy_norm", action="store_false", dest="use_energy_norm")
+    p.add_argument("--agg_mode", type=str, default="softmax", choices=["softmax", "sum"])
 
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--batch_size", type=int, default=16)
@@ -128,4 +133,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

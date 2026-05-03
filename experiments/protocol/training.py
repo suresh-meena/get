@@ -71,6 +71,14 @@ def run_epoch(model, loader, device, task_type: str, optimizer=None):
         metrics["acc"] = float((yt == yp).mean()) if yt.size > 0 else 0.0
     else:
         metrics["mae"] = float(mae.compute().item())
+    
+    mode = "Train" if train else "Val"
+    msg = f"[{mode}] Loss: {metrics['loss']:.4f}"
+    if "acc" in metrics: msg += f" Acc: {metrics['acc']:.4f}"
+    if "auc" in metrics: msg += f" AUC: {metrics['auc']:.4f}"
+    if "mae" in metrics: msg += f" MAE: {metrics['mae']:.4f}"
+    print(msg)
+    
     return metrics
 
 
@@ -80,9 +88,10 @@ def fit_once(args, task_type: str, num_classes: int, tr, va, te, device):
     best = 1e18
     best_state = None
     final_train = final_val = None
-    for _ in range(args.epochs):
+    for epoch in range(args.epochs):
         final_train = run_epoch(model, tr, device, task_type=task_type, optimizer=optim)
         final_val = run_epoch(model, va, device, task_type=task_type, optimizer=None)
+        print(f"Epoch {epoch+1}/{args.epochs} - Val Loss: {final_val['loss']:.4f}")
         if final_val["loss"] < best:
             best = final_val["loss"]
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -98,4 +107,3 @@ def make_loaders(items, args):
     va = DataLoader(ListGraphDataset(va_i), batch_size=args.eval_batch_size, shuffle=False, collate_fn=collate_graph_samples)
     te = DataLoader(ListGraphDataset(te_i), batch_size=args.eval_batch_size, shuffle=False, collate_fn=collate_graph_samples)
     return tr, va, te
-

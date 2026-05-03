@@ -11,6 +11,11 @@ from get.models import EnergyGraphClassifier
 
 def build_model(args, task_type: str, num_classes: int):
     out_dim = 1 if task_type in {"binary", "regression"} else num_classes
+    
+    # Extract optional flags if present in args, otherwise use defaults
+    use_energy_norm = getattr(args, "use_energy_norm", True)
+    agg_mode = getattr(args, "agg_mode", "softmax")
+
     if args.model_name == "fullget":
         return EnergyGraphClassifier(
             in_dim=args.in_dim,
@@ -37,6 +42,8 @@ def build_model(args, task_type: str, num_classes: int):
             inference_mode_train=args.inference_mode_train,
             inference_mode_eval=args.inference_mode_eval,
             energy_name="get_full",
+            use_energy_norm=use_energy_norm,
+            agg_mode=agg_mode,
         )
     if args.model_name == "pairwiseget":
         return EnergyGraphClassifier(
@@ -64,6 +71,8 @@ def build_model(args, task_type: str, num_classes: int):
             inference_mode_train=args.inference_mode_train,
             inference_mode_eval=args.inference_mode_eval,
             energy_name="pairwise_only",
+            use_energy_norm=use_energy_norm,
+            agg_mode=agg_mode,
         )
     if args.model_name == "et":
         return EnergyGraphClassifier(
@@ -91,6 +100,8 @@ def build_model(args, task_type: str, num_classes: int):
             inference_mode_train=args.inference_mode_train,
             inference_mode_eval=args.inference_mode_eval,
             energy_name="quadratic_only",
+            use_energy_norm=use_energy_norm,
+            agg_mode=agg_mode,
         )
     if args.model_name == "external_baseline":
         return ExternalGraphBaseline(in_dim=args.in_dim, hidden_dim=args.hidden_dim, out_dim=out_dim)
@@ -101,4 +112,3 @@ def build_model(args, task_type: str, num_classes: int):
     if args.model_name == "gat":
         return GATGraphBaseline(in_dim=args.in_dim, hidden_dim=args.hidden_dim, out_dim=out_dim)
     raise ValueError(args.model_name)
-

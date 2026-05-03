@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from get.energy import build_energy
+from get.energy.ops import get_degree_from_incidence, compute_degree_scaler
 from get.solvers import ArmijoSolver, FixedStepSolver
 
 
@@ -42,6 +43,8 @@ class EnergyGraphClassifier(nn.Module):
         inference_mode_train: str = "fixed",
         inference_mode_eval: str = "armijo",
         energy_name: str = "get_full",
+        use_energy_norm: bool = True,
+        agg_mode: str = "softmax",
     ) -> None:
         super().__init__()
         if hidden_dim != num_heads * head_dim:
@@ -67,6 +70,8 @@ class EnergyGraphClassifier(nn.Module):
         self.inference_mode_train = inference_mode_train
         self.inference_mode_eval = inference_mode_eval
         self.energy_name = str(energy_name).strip().lower()
+        self.use_energy_norm = use_energy_norm
+        self.agg_mode = agg_mode
         # Training unroll uses create_graph=True, i.e. higher-order autodiff.
         self.requires_double_backward = True
 
@@ -122,6 +127,7 @@ class EnergyGraphClassifier(nn.Module):
             "pairwise_symmetric": False,
             "lambda_sum": 0.0,
             "T_tau": self.t_tau.to(device=device, dtype=dtype),
+            "agg_mode": self.agg_mode,
         }
 
     def _build_projections(self, g: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -142,10 +148,19 @@ class EnergyGraphClassifier(nn.Module):
         }
 
     def _energy_sum(self, x_state: torch.Tensor, batch_data: Dict[str, torch.Tensor]) -> torch.Tensor:
-        g = self.state_norm(x_state)
+        g = self.state_norm(x_state) if self.use_energy_norm else x_state
         params = self._build_params(dtype=g.dtype, device=g.device)
         projections = self._build_projections(g)
         num_graphs = int(batch_data["num_graphs"].item())
+        
+        # Compute degree scaler if using LogSumExp
+        scaler = None
+        if self.agg_mode == "softmax" and batch_data["c_2"].numel() > 0:
+            num_nodes = x_state.size(0)
+            degs = get_degree_from_incidence(batch_data["c_2"], num_nodes)
+            avg_deg = degs.mean().item()
+            scaler = compute_degree_scaler(degs, avg_deg, mode="pna")
+
         e_vec = self.energy(
             x_state,
             g,
@@ -159,6 +174,7 @@ class EnergyGraphClassifier(nn.Module):
             num_graphs,
             params,
             projections,
+            degree_scaler=scaler,
         )
         return e_vec.sum()
 
