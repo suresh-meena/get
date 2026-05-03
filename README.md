@@ -23,11 +23,18 @@ The codebase currently has two tracks:
 
 ### Installation
 
+# Environment Repro
+
+Use `requirements.txt`.
+
+## Create
+
 ```bash
-# Create the environment (or use existing env `get`)
-conda env create -f ENVIRONMENT.md
+conda create -n get python=3.12
 conda activate get
-```
+python -m pip install -U pip
+python -m pip install -r requirements.txt
+
 
 ### Running Lightweight Tests
 
