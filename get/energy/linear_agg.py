@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 import torch
 import torch.nn as nn
 from .ops import scatter_add_nd
@@ -15,5 +17,10 @@ class LinearAggregationEnergy(nn.Module):
         energy = -0.5 * scatter_add_nd(X.new_zeros(num_graphs), batch[c_2], scores, dim=0)
         return energy
 
+@lru_cache(maxsize=1)
+def _cached_linear_aggregation_energy() -> LinearAggregationEnergy:
+    return LinearAggregationEnergy()
+
+
 def compute_linear_aggregation_energy(X, c_2, u_2, batch, num_graphs):
-    return LinearAggregationEnergy()(X, c_2, u_2, batch, num_graphs)
+    return _cached_linear_aggregation_energy()(X, c_2, u_2, batch, num_graphs)

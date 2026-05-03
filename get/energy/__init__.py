@@ -13,7 +13,7 @@ from .ops import (
 from .quadratic import QuadraticEnergy, compute_quadratic_energy
 from .pairwise import PairwiseEnergy, compute_pairwise_energy
 from .motif import MotifEnergy, compute_motif_energy
-from .memory import MemoryEnergy, compute_memory_energy, compute_memory_entropy
+from .memory import MemoryEnergy, compute_memory_energy
 from .linear_agg import LinearAggregationEnergy, compute_linear_aggregation_energy
 from .core import GETEnergy, compute_energy_GET
 from .factory import ENERGY_SPECS, build_energy
@@ -36,7 +36,6 @@ __all__ = [
     "compute_motif_energy",
     "MemoryEnergy",
     "compute_memory_energy",
-    "compute_memory_entropy",
     "LinearAggregationEnergy",
     "compute_linear_aggregation_energy",
     "GETEnergy",

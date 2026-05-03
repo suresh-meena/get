@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 import torch.nn as nn
 from .quadratic import QuadraticEnergy
 from .pairwise import PairwiseEnergy
@@ -42,5 +44,10 @@ class GETEnergy(nn.Module):
             
         return E_quad - E_att2 - E_att3 - E_mem - E_sum
 
+@lru_cache(maxsize=1)
+def _cached_get_energy() -> GETEnergy:
+    return GETEnergy()
+
+
 def compute_energy_GET(X, G, c_2, u_2, c_3, u_3, v_3, t_tau, batch, num_graphs, params, projections, degree_scaler=None):
-    return GETEnergy()(X, G, c_2, u_2, c_3, u_3, v_3, t_tau, batch, num_graphs, params, projections, degree_scaler=degree_scaler)
+    return _cached_get_energy()(X, G, c_2, u_2, c_3, u_3, v_3, t_tau, batch, num_graphs, params, projections, degree_scaler=degree_scaler)

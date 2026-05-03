@@ -67,6 +67,14 @@ def test_quadratic_energy_gradcheck(dummy_data):
         
     assert gradcheck(func, (X,), eps=1e-6, atol=1e-4)
 
+
+def test_quadratic_energy_is_graph_size_normalized():
+    X = torch.tensor([[1.0], [2.0], [3.0]], dtype=torch.float32)
+    batch = torch.tensor([0, 0, 1], dtype=torch.long)
+    out = compute_quadratic_energy(X, batch, num_graphs=2)
+    expected = torch.tensor([1.25, 4.5], dtype=torch.float32)
+    assert torch.allclose(out, expected)
+
 def test_pairwise_energy_gradcheck(dummy_data):
     X, batch, num_graphs, c_2, u_2, _, _, _, _, params, projections, num_nodes = dummy_data
     

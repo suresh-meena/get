@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 import torch
 import torch.nn as nn
 from .ops import positive_param, inverse_temperature, segment_logsumexp, scatter_add_nd
@@ -37,10 +39,20 @@ class PairwiseEnergy(nn.Module):
             return lambda_2 * graph_agg
         else:
             lse_2 = segment_logsumexp(beta_2 * ell_2, c_2, num_nodes, dim=0)
+            if c_2.numel() > 0:
+                counts = torch.bincount(c_2, minlength=num_nodes)
+                empty = counts.eq(0)
+                if empty.any():
+                    lse_2 = lse_2.masked_fill(empty.view(-1, *([1] * (lse_2.dim() - 1))), 0.0)
             if degree_scaler is not None:
                 lse_2 = lse_2 * degree_scaler.unsqueeze(-1)
             graph_lse = scatter_add_nd(ell_2.new_zeros((num_graphs, ell_2.shape[-1])), batch, lse_2, dim=0)
             return (lambda_2 / beta_2) * graph_lse
 
+@lru_cache(maxsize=1)
+def _cached_pairwise_energy() -> PairwiseEnergy:
+    return PairwiseEnergy()
+
+
 def compute_pairwise_energy(G, c_2, u_2, batch, num_graphs, params, projections, num_nodes, degree_scaler=None):
-    return PairwiseEnergy()(G, c_2, u_2, batch, num_graphs, params, projections, num_nodes, degree_scaler=degree_scaler)
+    return _cached_pairwise_energy()(G, c_2, u_2, batch, num_graphs, params, projections, num_nodes, degree_scaler=degree_scaler)

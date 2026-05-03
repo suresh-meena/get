@@ -8,9 +8,10 @@ from pathlib import Path
 from typing import Dict
 from typing import Iterable, List, Optional, Tuple
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, StratifiedKFold
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -21,6 +22,7 @@ from get.data import SyntheticGraphDataset, collate_graph_samples
 from get.models import EnergyGraphClassifier
 from get.trainers import UnifiedTrainer
 from get.utils.seed import seed_everything
+from experiments.protocol.data import split_items, summarize_splits
 
 
 def _apply_task_preset(args: argparse.Namespace) -> argparse.Namespace:
@@ -54,6 +56,27 @@ def _apply_task_preset(args: argparse.Namespace) -> argparse.Namespace:
     raise ValueError(f"Unknown task_preset: {args.task_preset}")
 
 
+def _dataset_task_type(dataset_name: str) -> str:
+    return "multiclass" if dataset_name.lower() == "csl" else "binary"
+
+
+def _remap_multiclass_labels(samples: List[Dict[str, torch.Tensor]]) -> tuple[List[Dict[str, torch.Tensor]], int]:
+    labels = sorted({int(sample["y"].view(-1)[0].item()) for sample in samples})
+    if not labels:
+        return samples, 1
+    if labels == list(range(len(labels))):
+        return samples, len(labels)
+
+    mapping = {label: idx for idx, label in enumerate(labels)}
+    remapped: List[Dict[str, torch.Tensor]] = []
+    for sample in samples:
+        sample_copy = dict(sample)
+        label = int(sample_copy["y"].view(-1)[0].item())
+        sample_copy["y"] = torch.tensor([float(mapping[label])], dtype=torch.float32)
+        remapped.append(sample_copy)
+    return remapped, len(labels)
+
+
 def _build_loaders(args: argparse.Namespace):
     if args.dataset_name.lower() in {"csl", "brec"}:
         return _build_real_stage2_loaders(args)
@@ -73,49 +96,12 @@ def _build_loaders(args: argparse.Namespace):
     eval_bs = args.eval_batch_size or args.batch_size
     val_loader = DataLoader(val_ds, batch_size=eval_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
     test_loader = DataLoader(test_ds, batch_size=eval_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
-    return train_loader, val_loader, test_loader
+    split_stats = summarize_splits({"train": list(train_ds), "val": list(val_ds), "test": list(test_ds)}, task_type="binary")
+    return train_loader, val_loader, test_loader, split_stats, "binary", 1
 
 
-def _extract_motifs_from_adj(adj: torch.Tensor, max_motifs_per_anchor: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    n = adj.size(0)
-    c3_list = []
-    u3_list = []
-    v3_list = []
-    tt_list = []
-    
-    for c in range(n):
-        neigh = torch.nonzero(adj[c], as_tuple=False).flatten()
-        n_neigh = neigh.numel()
-        if n_neigh < 2:
-            continue
-            
-        idx_j, idx_k = torch.triu_indices(n_neigh, n_neigh, offset=1)
-        
-        if idx_j.numel() > max_motifs_per_anchor:
-            idx_j = idx_j[:max_motifs_per_anchor]
-            idx_k = idx_k[:max_motifs_per_anchor]
-            
-        u = neigh[idx_j]
-        v = neigh[idx_k]
-        
-        c3_list.append(torch.full((u.numel(),), c, dtype=torch.long))
-        u3_list.append(u)
-        v3_list.append(v)
-        tt_list.append(adj[u, v].long())
-        
-    if not c3_list:
-        empty = torch.empty(0, dtype=torch.long)
-        return empty, empty, empty, empty
-        
-    return (
-        torch.cat(c3_list),
-        torch.cat(u3_list),
-        torch.cat(v3_list),
-        torch.cat(tt_list),
-    )
-
-
-def _pyg_data_to_sample(data, in_dim: int, max_motifs_per_anchor: int) -> Dict[str, torch.Tensor]:
+def _pyg_data_to_sample(data, in_dim: int, max_motifs_per_anchor: int, task_type: str = "binary") -> Dict[str, torch.Tensor]:
+    from get.data.synthetic import sample_from_adj
     n = int(data.num_nodes)
     edge_index = data.edge_index.long()
     x = data.x
@@ -133,19 +119,17 @@ def _pyg_data_to_sample(data, in_dim: int, max_motifs_per_anchor: int) -> Dict[s
         adj[edge_index[0], edge_index[1]] = True
     adj.fill_diagonal_(False)
 
-    c2 = edge_index[0].contiguous() if edge_index.numel() > 0 else torch.empty(0, dtype=torch.long)
-    u2 = edge_index[1].contiguous() if edge_index.numel() > 0 else torch.empty(0, dtype=torch.long)
-    c3, u3, v3, tt = _extract_motifs_from_adj(adj=adj, max_motifs_per_anchor=max_motifs_per_anchor)
-
     y = data.y
     if y is None:
         y = torch.tensor(0.0)
     y = y.view(-1).float()
     y = y[0] if y.numel() > 0 else torch.tensor(0.0)
-    # Binary simplification for unified BCE trainer.
-    y_bin = torch.tensor(1.0 if float(y.item()) > 0 else 0.0, dtype=torch.float32)
+    if task_type == "multiclass":
+        yy = torch.tensor([float(int(y.item()))], dtype=torch.float32)
+    else:
+        yy = torch.tensor([1.0 if float(y.item()) > 0 else 0.0], dtype=torch.float32)
 
-    return {"x": x, "y": y_bin, "c_2": c2, "u_2": u2, "c_3": c3, "u_3": u3, "v_3": v3, "t_tau": tt}
+    return sample_from_adj(adj, x, yy, max_motifs_per_anchor)
 
 
 class _ListGraphDataset(torch.utils.data.Dataset):
@@ -159,21 +143,7 @@ class _ListGraphDataset(torch.utils.data.Dataset):
         return self.samples[idx]
 
 
-def _split_list(items: List[Dict[str, torch.Tensor]], train_ratio: float, val_ratio: float):
-    n = len(items)
-    n_train = max(1, int(n * train_ratio))
-    n_val = max(1, int(n * val_ratio))
-    if n_train + n_val >= n:
-        n_val = max(1, n - n_train - 1)
-    train = items[:n_train]
-    val = items[n_train : n_train + n_val]
-    test = items[n_train + n_val :]
-    if len(test) == 0:
-        test = val[-1:]
-    return train, val, test
-
-
-def _load_csl_samples(args: argparse.Namespace) -> List[Dict[str, torch.Tensor]]:
+def _load_csl_samples(args: argparse.Namespace) -> tuple[List[Dict[str, torch.Tensor]], int]:
     from torch_geometric.datasets import GNNBenchmarkDataset
 
     root = Path(args.dataset_root).expanduser() / "pyg"
@@ -183,10 +153,11 @@ def _load_csl_samples(args: argparse.Namespace) -> List[Dict[str, torch.Tensor]]
     items = list(ds) + list(dsv) + list(dst)
     if args.max_graphs > 0:
         items = items[: args.max_graphs]
-    return [_pyg_data_to_sample(d, in_dim=args.in_dim, max_motifs_per_anchor=args.max_motifs_per_anchor) for d in items]
+    samples = [_pyg_data_to_sample(d, in_dim=args.in_dim, max_motifs_per_anchor=args.max_motifs_per_anchor, task_type="multiclass") for d in items]
+    return _remap_multiclass_labels(samples)
 
 
-def _load_brec_samples(args: argparse.Namespace) -> List[Dict[str, torch.Tensor]]:
+def _load_brec_samples(args: argparse.Namespace) -> tuple[List[Dict[str, torch.Tensor]], int]:
     # Expected local format: a torch-saved list of torch_geometric Data objects.
     if not args.brec_file:
         raise ValueError("--brec_file is required when --dataset_name brec")
@@ -198,22 +169,21 @@ def _load_brec_samples(args: argparse.Namespace) -> List[Dict[str, torch.Tensor]
         raise ValueError("BREC file must contain a list of torch_geometric Data objects")
     if args.max_graphs > 0:
         data_list = data_list[: args.max_graphs]
-    return [_pyg_data_to_sample(d, in_dim=args.in_dim, max_motifs_per_anchor=args.max_motifs_per_anchor) for d in data_list]
+    return [_pyg_data_to_sample(d, in_dim=args.in_dim, max_motifs_per_anchor=args.max_motifs_per_anchor, task_type="binary") for d in data_list], 1
 
 
 def _build_real_stage2_loaders(args: argparse.Namespace):
     name = args.dataset_name.lower()
     if name == "csl":
-        samples = _load_csl_samples(args)
+        samples, num_classes = _load_csl_samples(args)
+        task_type = "multiclass"
     elif name == "brec":
-        samples = _load_brec_samples(args)
+        samples, num_classes = _load_brec_samples(args)
+        task_type = "binary"
     else:
         raise ValueError(f"Unsupported real Stage-2 dataset: {args.dataset_name}")
 
-    rng = torch.Generator().manual_seed(args.seed)
-    perm = torch.randperm(len(samples), generator=rng).tolist()
-    samples = [samples[i] for i in perm]
-    train_items, val_items, test_items = _split_list(samples, train_ratio=0.70, val_ratio=0.15)
+    train_items, val_items, test_items = split_items(samples, seed=args.seed, train_ratio=0.70, val_ratio=0.15, task_type=task_type)
 
     train_ds = _ListGraphDataset(train_items)
     val_ds = _ListGraphDataset(val_items)
@@ -223,7 +193,8 @@ def _build_real_stage2_loaders(args: argparse.Namespace):
     eval_bs = args.eval_batch_size or args.batch_size
     val_loader = DataLoader(val_ds, batch_size=eval_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
     test_loader = DataLoader(test_ds, batch_size=eval_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
-    return train_loader, val_loader, test_loader
+    split_stats = summarize_splits({"train": train_items, "val": val_items, "test": test_items}, task_type=task_type)
+    return train_loader, val_loader, test_loader, split_stats, task_type, num_classes
 
 
 def _build_loaders_from_samples(
@@ -231,6 +202,7 @@ def _build_loaders_from_samples(
     val_items: List[Dict[str, torch.Tensor]],
     test_items: List[Dict[str, torch.Tensor]],
     args: argparse.Namespace,
+    task_type: str,
 ):
     train_ds = _ListGraphDataset(train_items)
     val_ds = _ListGraphDataset(val_items)
@@ -239,7 +211,8 @@ def _build_loaders_from_samples(
     eval_bs = args.eval_batch_size or args.batch_size
     val_loader = DataLoader(val_ds, batch_size=eval_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
     test_loader = DataLoader(test_ds, batch_size=eval_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
-    return train_loader, val_loader, test_loader
+    split_stats = summarize_splits({"train": train_items, "val": val_items, "test": test_items}, task_type=task_type)
+    return train_loader, val_loader, test_loader, split_stats
 
 
 def _run_single_fit(
@@ -248,8 +221,38 @@ def _run_single_fit(
     train_loader: DataLoader,
     val_loader: DataLoader,
     test_loader: DataLoader,
+    task_type: str,
+    num_classes: int,
 ) -> Dict[str, Dict[str, float]]:
-    model = _build_model(args)
+    from get.utils.compile import maybe_compile_model
+    model = _build_model(args, task_type=task_type, num_classes=num_classes)
+    
+    compile_cfg = {
+        "enabled": getattr(args, "compile", False),
+        "backend": getattr(args, "compile_backend", "inductor"),
+        "dynamic": getattr(args, "compile_dynamic", True),
+        "mode": getattr(args, "compile_mode", "default") if getattr(args, "compile_mode", "default") != "default" else None,
+        "allow_double_backward": getattr(args, "compile_allow_double_backward", False),
+    }
+    compile_scope = str(getattr(args, "compile_scope", "eval_only")).lower()
+    if compile_cfg["enabled"]:
+        if compile_scope == "all":
+            if getattr(model, "requires_double_backward", False):
+                raise ValueError(
+                    "compile_scope='all' is unsupported for GET training because torch.compile "
+                    "does not currently support double backward. Use compile_scope='eval_only'."
+                )
+            model = maybe_compile_model(model, compile_cfg)
+            eval_model = model
+        elif compile_scope == "eval_only":
+            eval_compile_cfg = dict(compile_cfg)
+            eval_compile_cfg["allow_double_backward"] = True
+            eval_model = maybe_compile_model(model, eval_compile_cfg)
+        else:
+            raise ValueError(f"Unsupported compile_scope '{compile_scope}'. Use 'eval_only' or 'all'.")
+    else:
+        eval_model = model
+    
     trainer_cfg: Dict[str, object] = {
         "epochs": args.epochs,
         "lr": args.lr,
@@ -258,28 +261,31 @@ def _run_single_fit(
         "patience": args.patience,
         "use_amp": bool(args.use_amp),
         "amp_dtype": args.amp_dtype,
+        "task_type": task_type,
+        "num_classes": num_classes,
     }
-    trainer = UnifiedTrainer(model=model, device=device, trainer_cfg=trainer_cfg)
+    trainer = UnifiedTrainer(model=model, eval_model=eval_model, device=device, trainer_cfg=trainer_cfg)
     return trainer.fit(train_loader, val_loader, test_loader)
 
 
-def _build_model(args: argparse.Namespace) -> torch.nn.Module:
+def _build_model(args: argparse.Namespace, task_type: str, num_classes: int) -> torch.nn.Module:
     name = args.model_name.lower()
+    out_dim = num_classes if task_type == "multiclass" else 1
     if name == "external_baseline":
-        return ExternalGraphBaseline(in_dim=args.in_dim, hidden_dim=args.hidden_dim)
+        return ExternalGraphBaseline(in_dim=args.in_dim, hidden_dim=args.hidden_dim, out_dim=out_dim)
     if name == "gcn":
         from external.graph_baselines.torch_baselines import GCNGraphBaseline
-        return GCNGraphBaseline(in_dim=args.in_dim, hidden_dim=args.hidden_dim)
+        return GCNGraphBaseline(in_dim=args.in_dim, hidden_dim=args.hidden_dim, out_dim=out_dim)
     if name == "gat":
         from external.graph_baselines.torch_baselines import GATGraphBaseline
-        return GATGraphBaseline(in_dim=args.in_dim, hidden_dim=args.hidden_dim)
+        return GATGraphBaseline(in_dim=args.in_dim, hidden_dim=args.hidden_dim, out_dim=out_dim)
     if name == "gin":
         from external.graph_baselines.torch_baselines import GINGraphBaseline
-        return GINGraphBaseline(in_dim=args.in_dim, hidden_dim=args.hidden_dim)
+        return GINGraphBaseline(in_dim=args.in_dim, hidden_dim=args.hidden_dim, out_dim=out_dim)
 
     if name == "pairwiseget":
         energy_name = "pairwise_only"
-    elif name == "et":
+    elif name in {"quadratic_only", "et"}:
         energy_name = "quadratic_only"
     elif name == "fullget":
         energy_name = "get_full"
@@ -289,7 +295,7 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
     return EnergyGraphClassifier(
         in_dim=args.in_dim,
         hidden_dim=args.hidden_dim,
-        num_classes=1,
+        num_classes=out_dim,
         num_steps=args.num_steps,
         num_heads=args.num_heads,
         head_dim=args.head_dim,
@@ -308,6 +314,7 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
         armijo_gamma=args.armijo_gamma,
         armijo_c=args.armijo_c,
         armijo_max_backtracks=args.armijo_max_backtracks,
+        armijo_eval_max_backtracks=args.armijo_eval_max_backtracks,
         inference_mode_train=args.inference_mode_train,
         inference_mode_eval=args.inference_mode_eval,
         energy_name=energy_name,
@@ -327,7 +334,7 @@ def main() -> None:
     p.add_argument("--brec_file", type=str, default="")
     p.add_argument("--max_graphs", type=int, default=0)
     p.add_argument("--cv_folds", type=int, default=1)
-    p.add_argument("--model_name", type=str, default="fullget", choices=["fullget", "pairwiseget", "et", "gcn", "gat", "gin", "external_baseline"])
+    p.add_argument("--model_name", type=str, default="fullget", choices=["fullget", "pairwiseget", "quadratic_only", "gcn", "gat", "gin", "external_baseline"])
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--seed", type=int, default=123)
 
@@ -360,19 +367,28 @@ def main() -> None:
     p.add_argument("--armijo_gamma", type=float, default=0.5)
     p.add_argument("--armijo_c", type=float, default=1e-4)
     p.add_argument("--armijo_max_backtracks", type=int, default=20)
-    p.add_argument("--inference_mode_train", type=str, default="armijo", choices=["fixed", "armijo"])
+    p.add_argument("--armijo_eval_max_backtracks", type=int, default=5)
+    p.add_argument("--inference_mode_train", type=str, default="fixed", choices=["fixed", "armijo"])
     p.add_argument("--inference_mode_eval", type=str, default="armijo", choices=["fixed", "armijo"])
 
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--eval_batch_size", type=int, default=16)
-    p.add_argument("--num_workers", type=int, default=8)
+    p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--patience", type=int, default=3)
+    
+    # AMP & Compile
     p.add_argument("--use_amp", action="store_true")
     p.add_argument("--amp_dtype", type=str, default="fp16", choices=["fp16", "bf16"])
+    p.add_argument("--compile", action="store_true")
+    p.add_argument("--compile_backend", type=str, default="inductor")
+    p.add_argument("--compile_dynamic", action="store_true", default=True)
+    p.add_argument("--compile_mode", type=str, default="default")
+    p.add_argument("--compile_allow_double_backward", action="store_true")
+    p.add_argument("--compile_scope", type=str, default="eval_only", choices=["eval_only", "all"])
 
     p.add_argument("--output", type=str, default="outputs/graph_tasks/last_metrics.json")
     args = p.parse_args()
@@ -391,36 +407,41 @@ def main() -> None:
     if args.cv_folds > 1:
         if args.dataset_name.lower() != "csl":
             raise ValueError("Cross-validation is currently supported for --dataset_name csl only.")
-        all_samples = _load_csl_samples(args)
+        all_samples, num_classes = _load_csl_samples(args)
+        task_type = "multiclass"
         if len(all_samples) < args.cv_folds:
             raise ValueError(f"Not enough samples ({len(all_samples)}) for cv_folds={args.cv_folds}")
 
-        kf = KFold(n_splits=args.cv_folds, shuffle=True, random_state=args.seed)
+        labels = np.array([int(sample["y"].view(-1)[0].item()) for sample in all_samples])
+        try:
+            splitter = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=args.seed)
+            fold_iter = splitter.split(np.arange(len(all_samples)), labels)
+        except ValueError:
+            splitter = KFold(n_splits=args.cv_folds, shuffle=True, random_state=args.seed)
+            fold_iter = splitter.split(np.arange(len(all_samples)))
         fold_metrics: List[Dict[str, Dict[str, float]]] = []
-        idx_all = list(range(len(all_samples)))
-        for fold_idx, (trainval_idx, test_idx) in enumerate(kf.split(idx_all), start=1):
+        for fold_idx, (trainval_idx, test_idx) in enumerate(fold_iter, start=1):
             trainval_items = [all_samples[int(i)] for i in trainval_idx.tolist()]
             test_items = [all_samples[int(i)] for i in test_idx.tolist()]
 
-            n_tv = len(trainval_items)
-            n_val = max(1, int(0.15 * n_tv))
-            val_items = trainval_items[:n_val]
-            train_items = trainval_items[n_val:]
-            if len(train_items) == 0:
-                train_items = val_items
+            train_items, val_items, _ = split_items(trainval_items, seed=args.seed + fold_idx, train_ratio=0.85, val_ratio=0.15, task_type=task_type)
 
-            train_loader, val_loader, test_loader = _build_loaders_from_samples(
-                train_items=train_items, val_items=val_items, test_items=test_items, args=args
+            train_loader, val_loader, test_loader, fold_split_stats = _build_loaders_from_samples(
+                train_items=train_items, val_items=val_items, test_items=test_items, args=args, task_type=task_type
             )
-            m = _run_single_fit(args=args, device=device, train_loader=train_loader, val_loader=val_loader, test_loader=test_loader)
+            m = _run_single_fit(args=args, device=device, train_loader=train_loader, val_loader=val_loader, test_loader=test_loader, task_type=task_type, num_classes=num_classes)
             m["fold"] = fold_idx
+            m["split_stats"] = fold_split_stats
             fold_metrics.append(m)
 
         test_accs = [float(m["test"]["acc"]) for m in fold_metrics]
         test_losses = [float(m["test"]["loss"]) for m in fold_metrics]
         metrics = {
             "cv_folds": int(args.cv_folds),
+            "task_type": task_type,
+            "num_classes": int(num_classes),
             "fold_metrics": fold_metrics,
+            "split_stats": summarize_splits({"all": all_samples}, task_type=task_type),
             "summary": {
                 "test_acc_mean": float(statistics.mean(test_accs)),
                 "test_acc_std": float(statistics.pstdev(test_accs) if len(test_accs) > 1 else 0.0),
@@ -429,8 +450,19 @@ def main() -> None:
             },
         }
     else:
-        train_loader, val_loader, test_loader = _build_loaders(args)
-        metrics = _run_single_fit(args=args, device=device, train_loader=train_loader, val_loader=val_loader, test_loader=test_loader)
+        train_loader, val_loader, test_loader, split_stats, task_type, num_classes = _build_loaders(args)
+        metrics = _run_single_fit(
+            args=args,
+            device=device,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            test_loader=test_loader,
+            task_type=task_type,
+            num_classes=num_classes,
+        )
+        metrics["task_type"] = task_type
+        metrics["num_classes"] = int(num_classes)
+        metrics["split_stats"] = split_stats
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)

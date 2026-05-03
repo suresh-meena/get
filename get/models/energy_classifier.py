@@ -8,6 +8,7 @@ import torch.nn as nn
 from get.energy import build_energy
 from get.energy.ops import get_degree_from_incidence, compute_degree_scaler
 from get.solvers import ArmijoSolver, FixedStepSolver
+from .energy_norm import EnergyLayerNorm
 
 
 class EnergyGraphClassifier(nn.Module):
@@ -40,6 +41,7 @@ class EnergyGraphClassifier(nn.Module):
         armijo_gamma: float = 0.5,
         armijo_c: float = 1e-4,
         armijo_max_backtracks: int = 20,
+        armijo_eval_max_backtracks: int = 5,
         inference_mode_train: str = "fixed",
         inference_mode_eval: str = "armijo",
         energy_name: str = "get_full",
@@ -72,6 +74,8 @@ class EnergyGraphClassifier(nn.Module):
         self.energy_name = str(energy_name).strip().lower()
         self.use_energy_norm = use_energy_norm
         self.agg_mode = agg_mode
+        self.armijo_eval_max_backtracks = max(1, int(armijo_eval_max_backtracks))
+        self._global_avg_degree: float | None = None
         # Training unroll uses create_graph=True, i.e. higher-order autodiff.
         self.requires_double_backward = True
 
@@ -80,7 +84,8 @@ class EnergyGraphClassifier(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
-        self.state_norm = nn.LayerNorm(hidden_dim)
+        # ET-style forward normalization before the energy block.
+        self.energy_norm = EnergyLayerNorm(hidden_dim, use_bias=True)
 
         self.q2 = nn.Linear(hidden_dim, hidden_dim)
         self.k2 = nn.Linear(hidden_dim, hidden_dim)
@@ -93,13 +98,18 @@ class EnergyGraphClassifier(nn.Module):
         self.readout = nn.Linear(hidden_dim, num_classes)
 
         self.energy = build_energy(self.energy_name)
-        self.fixed_solver = FixedStepSolver(num_steps=num_steps, step_size=fixed_step_size)
+        self.fixed_solver = FixedStepSolver(
+            num_steps=num_steps,
+            step_size=fixed_step_size,
+            update_damping=self.update_damping,
+        )
         self.armijo_solver = ArmijoSolver(
             num_steps=num_steps,
             eta0=armijo_eta0,
             gamma=armijo_gamma,
             c=armijo_c,
             max_backtracks=armijo_max_backtracks,
+            update_damping=self.update_damping,
         )
 
     def _enabled_branches(self) -> tuple[bool, bool, bool]:
@@ -147,22 +157,25 @@ class EnergyGraphClassifier(nn.Module):
             "Km": self.km,
         }
 
-    def _energy_sum(self, x_state: torch.Tensor, batch_data: Dict[str, torch.Tensor]) -> torch.Tensor:
-        g = self.state_norm(x_state) if self.use_energy_norm else x_state
+    def set_global_avg_degree(self, avg_degree: float | torch.Tensor | None) -> None:
+        if avg_degree is None:
+            self._global_avg_degree = None
+            return
+        if torch.is_tensor(avg_degree):
+            avg_degree = float(avg_degree.detach().item())
+        self._global_avg_degree = float(avg_degree)
+
+    def _normalize_state(self, x_state: torch.Tensor) -> torch.Tensor:
+        return self.energy_norm(x_state) if self.use_energy_norm else x_state
+
+    def _energy_value(self, x_state: torch.Tensor, batch_data: Dict[str, torch.Tensor], scaler: Optional[torch.Tensor] = None) -> torch.Tensor:
+        g = self._normalize_state(x_state)
         params = self._build_params(dtype=g.dtype, device=g.device)
         projections = self._build_projections(g)
         num_graphs = int(batch_data["num_graphs"].item())
-        
-        # Compute degree scaler if using LogSumExp
-        scaler = None
-        if self.agg_mode == "softmax" and batch_data["c_2"].numel() > 0:
-            num_nodes = x_state.size(0)
-            degs = get_degree_from_incidence(batch_data["c_2"], num_nodes)
-            avg_deg = degs.mean().item()
-            scaler = compute_degree_scaler(degs, avg_deg, mode="pna")
 
         e_vec = self.energy(
-            x_state,
+            g,
             g,
             batch_data["c_2"],
             batch_data["u_2"],
@@ -177,6 +190,37 @@ class EnergyGraphClassifier(nn.Module):
             degree_scaler=scaler,
         )
         return e_vec.sum()
+
+    def _energy_value_and_grad(
+        self,
+        x_state: torch.Tensor,
+        batch_data: Dict[str, torch.Tensor],
+        scaler: Optional[torch.Tensor] = None,
+        create_graph: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        g = self._normalize_state(x_state)
+        params = self._build_params(dtype=g.dtype, device=g.device)
+        projections = self._build_projections(g)
+        num_graphs = int(batch_data["num_graphs"].item())
+
+        e_vec = self.energy(
+            g,
+            g,
+            batch_data["c_2"],
+            batch_data["u_2"],
+            batch_data["c_3"],
+            batch_data["u_3"],
+            batch_data["v_3"],
+            batch_data["t_tau"],
+            batch_data["batch"],
+            num_graphs,
+            params,
+            projections,
+            degree_scaler=scaler,
+        )
+        energy = e_vec.sum()
+        grad, = torch.autograd.grad(energy, g, create_graph=create_graph)
+        return energy, grad
 
     def _pool_graph_mean(self, x_state: torch.Tensor, batch_idx: torch.Tensor, num_graphs: int) -> torch.Tensor:
         out = x_state.new_zeros((num_graphs, x_state.size(-1)))
@@ -193,21 +237,36 @@ class EnergyGraphClassifier(nn.Module):
         x0 = self.encoder(batch_data["x"])
         mode = inference_mode or (self.inference_mode_train if self.training else self.inference_mode_eval)
 
-        def closure(x: torch.Tensor) -> torch.Tensor:
-            return self._energy_sum(x, batch_data)
+        scaler = None
+        if self.agg_mode == "softmax" and batch_data["c_2"].numel() > 0:
+            num_nodes = x0.size(0)
+            degs = get_degree_from_incidence(batch_data["c_2"], num_nodes)
+            avg_deg = self._global_avg_degree if self._global_avg_degree is not None else degs.mean()
+            scaler = compute_degree_scaler(degs, avg_deg, mode="pna")
+
+        def energy_fn(x: torch.Tensor) -> torch.Tensor:
+            return self._energy_value(x, batch_data, scaler=scaler)
+
+        def energy_and_grad_fn(x: torch.Tensor, create_graph: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+            return self._energy_value_and_grad(x, batch_data, scaler=scaler, create_graph=create_graph)
 
         if mode == "fixed":
             x_final, energy_trace, solver_stats = self.fixed_solver.run(
-                x0, closure, create_graph=self.training
+                x0, energy_fn, energy_and_grad_fn, create_graph=self.training
             )
         elif mode == "armijo":
-            x_final, energy_trace, solver_stats = self.armijo_solver.run(x0, closure)
+            max_backtracks = self.armijo_solver.max_backtracks if self.training else min(self.armijo_solver.max_backtracks, self.armijo_eval_max_backtracks)
+            x_final, energy_trace, solver_stats = self.armijo_solver.run(
+                x0,
+                energy_fn,
+                energy_and_grad_fn,
+                max_backtracks=max_backtracks,
+            )
         else:
             raise ValueError(f"Unsupported inference mode: {mode}")
 
-        z = self.state_norm(x_final)
         num_graphs = int(batch_data["num_graphs"].item())
-        pooled = self._pool_graph_mean(z, batch_data["batch"], num_graphs)
+        pooled = self._pool_graph_mean(x_final, batch_data["batch"], num_graphs)
         logits = self.readout(pooled)
         if self.num_classes == 1:
             logits = logits.squeeze(-1)

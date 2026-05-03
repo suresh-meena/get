@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import random
+from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import networkx as nx
 import numpy as np
 import torch
+from sklearn.model_selection import StratifiedShuffleSplit
 from torch.utils.data import Dataset
 
 
@@ -21,47 +23,57 @@ class ListGraphDataset(Dataset):
         return self.samples[idx]
 
 
-def extract_motifs_from_adj(adj: torch.Tensor, max_motifs_per_anchor: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    n = adj.size(0)
-    c3, u3, v3, tt = [], [], [], []
-    for c in range(n):
-        neigh = torch.nonzero(adj[c], as_tuple=False).flatten()
-        if neigh.numel() < 2:
-            continue
-        budget = 0
-        for i in range(neigh.numel()):
-            if budget >= max_motifs_per_anchor:
-                break
-            for j in range(i + 1, neigh.numel()):
-                if budget >= max_motifs_per_anchor:
-                    break
-                u, v = int(neigh[i]), int(neigh[j])
-                c3.append(c)
-                u3.append(u)
-                v3.append(v)
-                tt.append(1 if bool(adj[u, v]) else 0)
-                budget += 1
-    if not c3:
-        empty = torch.empty(0, dtype=torch.long)
-        return empty, empty, empty, empty
-    return torch.tensor(c3), torch.tensor(u3), torch.tensor(v3), torch.tensor(tt)
+from get.data.synthetic import sample_from_adj
 
 
-def sample_from_adj(adj: torch.Tensor, x: torch.Tensor, y: torch.Tensor, max_motifs_per_anchor: int) -> Dict[str, torch.Tensor]:
-    edge_index = torch.nonzero(adj, as_tuple=False).t().contiguous()
-    c2 = edge_index[0] if edge_index.numel() > 0 else torch.empty(0, dtype=torch.long)
-    u2 = edge_index[1] if edge_index.numel() > 0 else torch.empty(0, dtype=torch.long)
-    c3, u3, v3, tt = extract_motifs_from_adj(adj, max_motifs_per_anchor=max_motifs_per_anchor)
-    return {
-        "x": x.float(),
-        "y": y.float().view(1),
-        "c_2": c2.long(),
-        "u_2": u2.long(),
-        "c_3": c3.long(),
-        "u_3": u3.long(),
-        "v_3": v3.long(),
-        "t_tau": tt.long(),
-    }
+def _limit_split(items: List[Dict[str, torch.Tensor]], max_graphs: int) -> List[Dict[str, torch.Tensor]]:
+    if max_graphs > 0:
+        return items[:max_graphs]
+    return items
+
+
+def _infer_output_dim(splits: Dict[str, List[Dict[str, torch.Tensor]]]) -> int:
+    for items in splits.values():
+        if items:
+            return int(items[0]["y"].numel())
+    return 1
+
+
+def _scalar_labels(items: List[Dict[str, torch.Tensor]]) -> List[int] | None:
+    labels: List[int] = []
+    for sample in items:
+        y = sample["y"].reshape(-1)
+        if y.numel() == 0:
+            return None
+        labels.append(int(round(float(y[0].item()))))
+    return labels
+
+
+def summarize_split_items(items: List[Dict[str, torch.Tensor]], task_type: str | None = None) -> Dict[str, object]:
+    summary: Dict[str, object] = {"num_graphs": len(items)}
+    if not items:
+        summary["single_class"] = True
+        return summary
+
+    labels = _scalar_labels(items) if task_type in {"binary", "multiclass"} else None
+    if labels is None:
+        summary["target_dim"] = int(items[0]["y"].numel())
+        return summary
+
+    counts = Counter(labels)
+    summary["class_counts"] = {str(k): int(v) for k, v in sorted(counts.items(), key=lambda kv: kv[0])}
+    summary["single_class"] = len(counts) <= 1
+    if set(counts.keys()).issubset({0, 1}):
+        pos = int(counts.get(1, 0))
+        neg = int(counts.get(0, 0))
+        summary["positive"] = pos
+        summary["negative"] = neg
+        summary["positive_rate"] = float(pos / len(items)) if items else 0.0
+    return summary
+
+
+def summarize_splits(splits: Dict[str, List[Dict[str, torch.Tensor]]], task_type: str | None = None) -> Dict[str, Dict[str, object]]:
+    return {split_name: summarize_split_items(split_items, task_type=task_type) for split_name, split_items in splits.items()}
 
 
 def graph_to_sample(data, in_dim: int, max_motifs_per_anchor: int, y_mode: str = "binary") -> Dict[str, torch.Tensor]:
@@ -93,28 +105,88 @@ def graph_to_sample(data, in_dim: int, max_motifs_per_anchor: int, y_mode: str =
         yy = torch.tensor([float(int(y[0].item()))])
     elif y_mode == "regression":
         yy = torch.tensor([float(y[0].item())])
+    elif y_mode in {"multilabel", "vector"}:
+        yy = y.float().view(-1)
     else:
         raise ValueError(y_mode)
 
     return sample_from_adj(adj=adj, x=x, y=yy, max_motifs_per_anchor=max_motifs_per_anchor)
 
 
-def split_items(items: List[Dict[str, torch.Tensor]], seed: int, train_ratio: float = 0.7, val_ratio: float = 0.15):
+def _random_split_items(items: List[Dict[str, torch.Tensor]], seed: int, train_ratio: float, val_ratio: float):
+    n = len(items)
+    if n == 0:
+        return [], [], []
+
     rng = random.Random(seed)
-    idx = list(range(len(items)))
+    idx = list(range(n))
     rng.shuffle(idx)
     items = [items[i] for i in idx]
-    n = len(items)
-    ntr = max(1, int(n * train_ratio))
-    nval = max(1, int(n * val_ratio))
-    if ntr + nval >= n:
-        nval = max(1, n - ntr - 1)
+
+    if n == 1:
+        return items[:1], [], []
+    if n == 2:
+        return items[:1], items[1:], []
+
+    ntr = max(1, int(round(n * train_ratio)))
+    ntr = min(ntr, n - 2)
+    nval = max(1, int(round(n * val_ratio)))
+    if train_ratio + val_ratio >= 1.0:
+        nval = n - ntr
+    else:
+        nval = min(nval, n - ntr - 1)
+
     tr = items[:ntr]
     va = items[ntr:ntr + nval]
     te = items[ntr + nval:]
-    if not te:
-        te = va[-1:]
+
+    if not te and train_ratio + val_ratio < 1.0 and len(items) > 2:
+        te = [va.pop()] if va else [tr.pop()]
+    if not va and len(items) > 1:
+        va = [tr.pop()]
     return tr, va, te
+
+
+def _stratified_split_items(items: List[Dict[str, torch.Tensor]], seed: int, train_ratio: float, val_ratio: float):
+    labels = _scalar_labels(items)
+    if labels is None or len(set(labels)) <= 1 or len(items) < 3:
+        return _random_split_items(items, seed, train_ratio, val_ratio)
+
+    idx = np.arange(len(items))
+    try:
+        outer = StratifiedShuffleSplit(n_splits=1, test_size=max(1e-9, 1.0 - train_ratio), random_state=seed)
+        train_idx, temp_idx = next(outer.split(idx, labels))
+        train_items = [items[int(i)] for i in train_idx.tolist()]
+
+        if train_ratio + val_ratio >= 1.0:
+            val_items = [items[int(i)] for i in temp_idx.tolist()]
+            test_items: List[Dict[str, torch.Tensor]] = []
+        else:
+            temp_labels = [labels[int(i)] for i in temp_idx.tolist()]
+            val_fraction = val_ratio / max(1e-12, 1.0 - train_ratio)
+            inner = StratifiedShuffleSplit(
+                n_splits=1,
+                test_size=max(1e-9, 1.0 - val_fraction),
+                random_state=seed + 1,
+            )
+            val_rel_idx, test_rel_idx = next(inner.split(np.arange(len(temp_idx)), temp_labels))
+            val_items = [items[int(temp_idx[i])] for i in val_rel_idx.tolist()]
+            test_items = [items[int(temp_idx[i])] for i in test_rel_idx.tolist()]
+        return train_items, val_items, test_items
+    except ValueError:
+        return _random_split_items(items, seed, train_ratio, val_ratio)
+
+
+def split_items(
+    items: List[Dict[str, torch.Tensor]],
+    seed: int,
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+    task_type: str | None = None,
+):
+    if task_type in {"binary", "multiclass"}:
+        return _stratified_split_items(items, seed, train_ratio, val_ratio)
+    return _random_split_items(items, seed, train_ratio, val_ratio)
 
 
 def _make_stage1_wedge_triangle(args) -> List[Dict[str, torch.Tensor]]:
@@ -190,21 +262,59 @@ def _is_sat_bruteforce(clauses: List[Tuple[int, int, int]], signs: List[Tuple[in
     return False
 
 
+def _make_stage1_max3sat_formula(
+    rng: np.random.Generator,
+    n_vars: int,
+    n_clauses: int,
+    satisfiable: bool,
+) -> Tuple[List[Tuple[int, int, int]], List[Tuple[int, int, int]]]:
+    if satisfiable:
+        while True:
+            clauses: List[Tuple[int, int, int]] = []
+            signs: List[Tuple[int, int, int]] = []
+            for _ in range(n_clauses):
+                vars3 = rng.choice(n_vars, size=3, replace=False)
+                s3 = rng.choice([-1, 1], size=3, replace=True)
+                clauses.append((int(vars3[0]), int(vars3[1]), int(vars3[2])))
+                signs.append((int(s3[0]), int(s3[1]), int(s3[2])))
+            if _is_sat_bruteforce(clauses, signs, n_vars=n_vars):
+                return clauses, signs
+
+    core_vars = rng.choice(n_vars, size=3, replace=False)
+    clauses = []
+    signs = []
+    for pattern in range(8):
+        signs.append(tuple(1 if (pattern >> bit) & 1 else -1 for bit in range(3)))
+        clauses.append((int(core_vars[0]), int(core_vars[1]), int(core_vars[2])))
+    for _ in range(n_clauses - 8):
+        vars3 = rng.choice(n_vars, size=3, replace=False)
+        s3 = rng.choice([-1, 1], size=3, replace=True)
+        clauses.append((int(vars3[0]), int(vars3[1]), int(vars3[2])))
+        signs.append((int(s3[0]), int(s3[1]), int(s3[2])))
+    return clauses, signs
+
+
 def _make_stage1_max3sat(args) -> List[Dict[str, torch.Tensor]]:
     out = []
     rng = np.random.default_rng(args.seed)
     m = args.max_graphs if args.max_graphs > 0 else 128
+    target_pos = m // 2
+    target_neg = m - target_pos
+    pos_count = 0
+    neg_count = 0
     n_vars = 10
     n_clauses = 18
-    for _ in range(m):
-        clauses = []
-        signs = []
-        for _c in range(n_clauses):
-            vars3 = rng.choice(n_vars, size=3, replace=False)
-            s3 = rng.choice([-1, 1], size=3, replace=True)
-            clauses.append((int(vars3[0]), int(vars3[1]), int(vars3[2])))
-            signs.append((int(s3[0]), int(s3[1]), int(s3[2])))
-        sat = _is_sat_bruteforce(clauses, signs, n_vars=n_vars)
+    while len(out) < m:
+        want_sat = pos_count < target_pos
+        want_unsat = neg_count < target_neg
+        if want_sat:
+            clauses, signs = _make_stage1_max3sat_formula(rng, n_vars, n_clauses, satisfiable=True)
+            sat = True
+        elif want_unsat:
+            clauses, signs = _make_stage1_max3sat_formula(rng, n_vars, n_clauses, satisfiable=False)
+            sat = False
+        else:
+            break
         n = n_vars + n_clauses
         adj = torch.zeros((n, n), dtype=torch.bool)
         for cidx, vars3 in enumerate(clauses):
@@ -219,6 +329,12 @@ def _make_stage1_max3sat(args) -> List[Dict[str, torch.Tensor]]:
             x[n_vars + cidx, 2] = float(s3[2])
         y = torch.tensor([1.0 if sat else 0.0])
         out.append(sample_from_adj(adj, x, y, args.max_motifs_per_anchor))
+        if sat:
+            pos_count += 1
+        else:
+            neg_count += 1
+    perm = rng.permutation(len(out))
+    out = [out[i] for i in perm.tolist()]
     return out
 
 
@@ -239,9 +355,13 @@ def _make_stage1_xorsat(args) -> List[Dict[str, torch.Tensor]]:
     out = []
     rng = np.random.default_rng(args.seed + 17)
     m = args.max_graphs if args.max_graphs > 0 else 128
+    target_pos = m // 2
+    target_neg = m - target_pos
+    pos_count = 0
+    neg_count = 0
     n_vars = 12
-    n_clauses = 22
-    for _ in range(m):
+    n_clauses = 11
+    while len(out) < m:
         clauses = []
         rhs = []
         for _c in range(n_clauses):
@@ -249,6 +369,11 @@ def _make_stage1_xorsat(args) -> List[Dict[str, torch.Tensor]]:
             clauses.append((int(vars3[0]), int(vars3[1]), int(vars3[2])))
             rhs.append(int(rng.integers(0, 2)))
         sat = _is_xorsat_bruteforce(clauses, rhs, n_vars=n_vars)
+        if sat and pos_count >= target_pos:
+            continue
+        if not sat and neg_count >= target_neg:
+            continue
+
         n = n_vars + n_clauses
         adj = torch.zeros((n, n), dtype=torch.bool)
         for cidx, vars3 in enumerate(clauses):
@@ -261,6 +386,10 @@ def _make_stage1_xorsat(args) -> List[Dict[str, torch.Tensor]]:
             x[n_vars + cidx, 0] = float(r)
         y = torch.tensor([1.0 if sat else 0.0])
         out.append(sample_from_adj(adj, x, y, args.max_motifs_per_anchor))
+        if sat:
+            pos_count += 1
+        else:
+            neg_count += 1
     return out
 
 
@@ -317,19 +446,17 @@ def _load_stage2_csl(args) -> Tuple[List[Dict[str, torch.Tensor]], int]:
     from torch_geometric.datasets import GNNBenchmarkDataset
 
     root = Path(args.dataset_root).expanduser() / "pyg"
-    parts = [
-        GNNBenchmarkDataset(root=str(root), name="CSL", split="train"),
-        GNNBenchmarkDataset(root=str(root), name="CSL", split="val"),
-        GNNBenchmarkDataset(root=str(root), name="CSL", split="test"),
-    ]
-    items = []
-    for p in parts:
-        items.extend(list(p))
-    if args.max_graphs > 0:
-        items = items[: args.max_graphs]
-    samples = [graph_to_sample(d, args.in_dim, args.max_motifs_per_anchor, y_mode="multiclass") for d in items]
-    nclass = int(max(int(s["y"].item()) for s in samples) + 1)
-    return samples, nclass
+    parts = {
+        "train": GNNBenchmarkDataset(root=str(root), name="CSL", split="train"),
+        "val": GNNBenchmarkDataset(root=str(root), name="CSL", split="val"),
+        "test": GNNBenchmarkDataset(root=str(root), name="CSL", split="test"),
+    }
+    splits: Dict[str, List[Dict[str, torch.Tensor]]] = {}
+    for split, dataset in parts.items():
+        items = _limit_split(list(dataset), args.max_graphs)
+        splits[split] = [graph_to_sample(d, args.in_dim, args.max_motifs_per_anchor, y_mode="multiclass") for d in items]
+    nclass = int(max(int(s["y"].item()) for split in splits.values() for s in split) + 1)
+    return splits, nclass
 
 
 def _load_stage2_brec(args) -> Tuple[List[Dict[str, torch.Tensor]], int]:
@@ -346,14 +473,12 @@ def _load_stage3_zinc(args) -> Tuple[List[Dict[str, torch.Tensor]], int]:
     from torch_geometric.datasets import ZINC
 
     root = Path(args.dataset_root).expanduser() / "pyg"
-    parts = [ZINC(root=str(root), subset=True, split=s) for s in ["train", "val", "test"]]
-    items = []
-    for p in parts:
-        items.extend(list(p))
-    if args.max_graphs > 0:
-        items = items[: args.max_graphs]
-    samples = [graph_to_sample(d, args.in_dim, args.max_motifs_per_anchor, y_mode="regression") for d in items]
-    return samples, 1
+    parts = {s: ZINC(root=str(root), subset=True, split=s) for s in ["train", "val", "test"]}
+    splits: Dict[str, List[Dict[str, torch.Tensor]]] = {}
+    for split, dataset in parts.items():
+        items = _limit_split(list(dataset), args.max_graphs)
+        splits[split] = [graph_to_sample(d, args.in_dim, args.max_motifs_per_anchor, y_mode="regression") for d in items]
+    return splits, 1
 
 
 def _load_stage3_molhiv(args) -> Tuple[List[Dict[str, torch.Tensor]], int]:
@@ -361,47 +486,35 @@ def _load_stage3_molhiv(args) -> Tuple[List[Dict[str, torch.Tensor]], int]:
 
     ds = PygGraphPropPredDataset(name="ogbg-molhiv", root=str(Path(args.dataset_root).expanduser() / "ogb"))
     idx = ds.get_idx_split()
-    order = torch.cat([idx["train"], idx["valid"], idx["test"]], dim=0).tolist()
-    if args.max_graphs > 0:
-        order = order[: args.max_graphs]
-    samples = [graph_to_sample(ds[i], args.in_dim, args.max_motifs_per_anchor, y_mode="binary") for i in order]
-    return samples, 2
+    splits: Dict[str, List[Dict[str, torch.Tensor]]] = {}
+    for split_name, split_idx in {"train": idx["train"], "val": idx["valid"], "test": idx["test"]}.items():
+        order = split_idx.tolist()
+        order = order[: args.max_graphs] if args.max_graphs > 0 else order
+        splits[split_name] = [graph_to_sample(ds[i], args.in_dim, args.max_motifs_per_anchor, y_mode="binary") for i in order]
+    return splits, 2
 
 
 def _load_stage3_peptides(args) -> Tuple[List[Dict[str, torch.Tensor]], int]:
     from torch_geometric.datasets import LRGBDataset
 
     root = Path(args.dataset_root).expanduser() / "pyg"
-    parts = [LRGBDataset(root=str(root), name="Peptides-struct", split=s) for s in ["train", "val", "test"]]
-    items = []
-    for p in parts:
-        items.extend(list(p))
-    if args.max_graphs > 0:
-        items = items[: args.max_graphs]
-    samples = []
-    for d in items:
-        if d.y is not None and d.y.numel() > 1:
-            d.y = d.y.view(-1)[:1]
-        samples.append(graph_to_sample(d, args.in_dim, args.max_motifs_per_anchor, y_mode="regression"))
-    return samples, 1
+    parts = {s: LRGBDataset(root=str(root), name="Peptides-struct", split=s) for s in ["train", "val", "test"]}
+    splits: Dict[str, List[Dict[str, torch.Tensor]]] = {}
+    for split, dataset in parts.items():
+        items = _limit_split(list(dataset), args.max_graphs)
+        splits[split] = [graph_to_sample(d, args.in_dim, args.max_motifs_per_anchor, y_mode="vector") for d in items]
+    return splits, _infer_output_dim(splits)
 
 
-def _load_stage3_peptides_func(args) -> Tuple[List[Dict[str, torch.Tensor]], int]:
+def _load_stage3_peptides_func(args) -> Tuple[Dict[str, List[Dict[str, torch.Tensor]]], int]:
     from torch_geometric.datasets import LRGBDataset
 
     root = Path(args.dataset_root).expanduser() / "pyg"
-    parts = [LRGBDataset(root=str(root), name="Peptides-func", split=s) for s in ["train", "val", "test"]]
-    items = []
-    for p in parts:
-        items.extend(list(p))
-    if args.max_graphs > 0:
-        items = items[: args.max_graphs]
-    samples = []
-    for d in items:
-        if d.y is not None and d.y.numel() > 1:
-            d.y = d.y.view(-1)[:1]
-        samples.append(graph_to_sample(d, args.in_dim, args.max_motifs_per_anchor, y_mode="binary"))
-    return samples, 2
+    out = {}
+    for s in ["train", "val", "test"]:
+        part = _limit_split(list(LRGBDataset(root=str(root), name="Peptides-func", split=s)), args.max_graphs)
+        out[s] = [graph_to_sample(d, args.in_dim, args.max_motifs_per_anchor, y_mode="multilabel") for d in part]
+    return out, _infer_output_dim(out)
 
 
 def _load_stage4_tu(args) -> Tuple[List[Dict[str, torch.Tensor]], int]:
@@ -422,10 +535,10 @@ def _load_stage4_anomaly(args, name: str) -> Tuple[List[Dict[str, torch.Tensor]]
     from torch_geometric.utils import k_hop_subgraph
 
     alias_map = {
-        "amazon": ["inj_amazon", "amazon", "gen_10000"],
-        "yelpchi": ["reddit", "weibo", "gen_10000"],
-        "tfinance": ["weibo", "gen_10000"],
-        "tsocial": ["reddit", "gen_10000"],
+        "amazon": ["inj_amazon", "amazon"],
+        "yelpchi": ["yelpchi"],
+        "tfinance": ["tfinance"],
+        "tsocial": ["tsocial"],
     }
     candidates = alias_map.get(name.lower(), [name, name.lower(), name.upper()])
     data = None
@@ -456,40 +569,59 @@ def _load_stage4_anomaly(args, name: str) -> Tuple[List[Dict[str, torch.Tensor]]
     return samples, 2
 
 
-def build_dataset(task: str, args) -> Tuple[List[Dict[str, torch.Tensor]], int]:
-    if task == "stage1_wedge_triangle":
-        return _make_stage1_wedge_triangle(args), 2
-    if task == "stage1_triangle_regression":
-        return _make_stage1_triangle_regression(args), 1
-    if task == "stage1_cycle_parity":
-        return _make_stage1_cycle_parity(args), 2
-    if task == "stage1_max3sat":
-        return _make_stage1_max3sat(args), 2
-    if task == "stage1_xorsat":
-        return _make_stage1_xorsat(args), 2
-    if task == "stage1_srg_discrimination":
-        return _make_stage1_srg_discrimination(args), 2
-    if task == "stage2_csl":
-        return _load_stage2_csl(args)
-    if task == "stage2_brec":
-        return _load_stage2_brec(args)
-    if task == "stage3_zinc":
-        return _load_stage3_zinc(args)
-    if task == "stage3_molhiv":
-        return _load_stage3_molhiv(args)
-    if task == "stage3_peptides":
-        return _load_stage3_peptides(args)
-    if task == "stage3_peptides_func":
-        return _load_stage3_peptides_func(args)
-    if task == "stage4_tu_classification":
-        return _load_stage4_tu(args)
-    if task == "stage4_yelpchi_anomaly":
-        return _load_stage4_anomaly(args, "yelpchi")
-    if task == "stage4_amazon_anomaly":
-        return _load_stage4_anomaly(args, "amazon")
-    if task == "stage4_tfinance_anomaly":
-        return _load_stage4_anomaly(args, "tfinance")
-    if task == "stage4_tsocial_anomaly":
-        return _load_stage4_anomaly(args, "tsocial")
-    raise ValueError(task)
+def build_dataset(task: str, args) -> Tuple[Union[List[Dict[str, torch.Tensor]], Dict[str, List[Dict[str, torch.Tensor]]]], int]:
+    import hashlib
+    import pickle
+    
+    cache_version = "v2"
+    key_str = f"{cache_version}_{task}_{args.seed}_{args.max_graphs}_{args.in_dim}_{args.max_motifs_per_anchor}_{getattr(args, 'ego_hops', 1)}"
+    key = hashlib.md5(key_str.encode()).hexdigest()
+    cache_dir = Path(args.dataset_root).expanduser() / "protocol_cache"
+    cache_path = cache_dir / f"{key}.pkl"
+    
+    if cache_path.exists():
+        print(f"Loading cached dataset from {cache_path}")
+        with open(cache_path, "rb") as f:
+            return pickle.load(f)
 
+    if task == "stage1_wedge_triangle":
+        res = _make_stage1_wedge_triangle(args), 2
+    elif task == "stage1_triangle_regression":
+        res = _make_stage1_triangle_regression(args), 1
+    elif task == "stage1_cycle_parity":
+        res = _make_stage1_cycle_parity(args), 2
+    elif task == "stage1_max3sat":
+        res = _make_stage1_max3sat(args), 2
+    elif task == "stage1_xorsat":
+        res = _make_stage1_xorsat(args), 2
+    elif task == "stage1_srg_discrimination":
+        res = _make_stage1_srg_discrimination(args), 2
+    elif task == "stage2_csl":
+        res = _load_stage2_csl(args)
+    elif task == "stage2_brec":
+        res = _load_stage2_brec(args)
+    elif task == "stage3_zinc":
+        res = _load_stage3_zinc(args)
+    elif task == "stage3_molhiv":
+        res = _load_stage3_molhiv(args)
+    elif task == "stage3_peptides_struct_probe":
+        res = _load_stage3_peptides(args)
+    elif task == "stage3_peptides_func_probe":
+        res = _load_stage3_peptides_func(args)
+    elif task == "stage4_tu_classification":
+        res = _load_stage4_tu(args)
+    elif task == "stage4_yelpchi_anomaly":
+        res = _load_stage4_anomaly(args, "yelpchi")
+    elif task == "stage4_amazon_anomaly":
+        res = _load_stage4_anomaly(args, "amazon")
+    elif task == "stage4_tfinance_anomaly":
+        res = _load_stage4_anomaly(args, "tfinance")
+    elif task == "stage4_tsocial_anomaly":
+        res = _load_stage4_anomaly(args, "tsocial")
+    else:
+        raise ValueError(f"Unknown task: {task}")
+        
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    with open(cache_path, "wb") as f:
+        pickle.dump(res, f)
+    return res

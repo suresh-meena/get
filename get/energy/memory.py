@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 import torch
 import torch.nn as nn
 from .ops import positive_param, inverse_temperature, scatter_add_nd
@@ -26,16 +28,10 @@ class MemoryEnergy(nn.Module):
         
         return (lambda_m / beta_m) * scatter_add_nd(lse_m.new_zeros((num_graphs, lse_m.shape[-1])), batch, lse_m, dim=0)
 
-def compute_memory_energy(G, batch, num_graphs, params, projections):
-    return MemoryEnergy()(G, batch, num_graphs, params, projections)
+@lru_cache(maxsize=1)
+def _cached_memory_energy() -> MemoryEnergy:
+    return MemoryEnergy()
 
-def compute_memory_entropy(G, params, projections, eps=1e-12):
-    if not params.get('use_memory', True) or params.get('K', 0) <= 0:
-        return torch.zeros(G.shape[:-2], dtype=G.dtype, device=G.device)
-    Qm, Km = projections['Qm'], projections['Km']
-    d = params['d']
-    Lm = torch.einsum("nhd, hkd -> nhk", Qm, Km) / (d ** 0.5)
-    beta_m = inverse_temperature(params, 'beta_m', beta_max=params.get('beta_max', None))
-    probs = torch.softmax(beta_m * Lm, dim=-1)
-    entropy = -(probs * torch.log(probs.clamp_min(eps))).sum(dim=-1)
-    return entropy.mean(dim=-1)
+
+def compute_memory_energy(G, batch, num_graphs, params, projections):
+    return _cached_memory_energy()(G, batch, num_graphs, params, projections)

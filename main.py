@@ -124,6 +124,11 @@ def run_from_cfg(cfg: DictConfig) -> Dict:
     eval_model = model
     if bool(compile_cfg.get("enabled", False)):
         if compile_scope == "all":
+            if getattr(model, "requires_double_backward", False):
+                raise ValueError(
+                    "compile.scope='all' is unsupported for GET training because torch.compile "
+                    "does not currently support double backward. Use compile.scope='eval_only'."
+                )
             model = maybe_compile_model(model, compile_cfg)
             eval_model = model
         elif compile_scope == "eval_only":

@@ -55,3 +55,34 @@ def test_protocol_runner_stage1_xorsat_smoke(tmp_path: Path) -> None:
     ]
     subprocess.run(cmd, check=True)
     assert out.exists()
+
+
+def test_protocol_runner_stage1_compile_eval_only_smoke(tmp_path: Path) -> None:
+    out = tmp_path / "stage1_compile.json"
+    cmd = [
+        sys.executable,
+        "experiments/run_protocol.py",
+        "--task",
+        "stage1_wedge_triangle",
+        "--model_name",
+        "pairwiseget",
+        "--device",
+        "cpu",
+        "--epochs",
+        "1",
+        "--max_graphs",
+        "16",
+        "--batch_size",
+        "8",
+        "--eval_batch_size",
+        "8",
+        "--compile",
+        "--compile_scope",
+        "eval_only",
+        "--inference_mode_eval",
+        "fixed",
+        "--output",
+        str(out),
+    ]
+    subprocess.run(cmd, check=True)
+    assert out.exists()

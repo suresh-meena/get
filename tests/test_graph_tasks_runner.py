@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -31,6 +32,73 @@ def test_graph_tasks_runner_external_baseline_smoke(tmp_path: Path) -> None:
         "8",
         "--eval_batch_size",
         "8",
+        "--output",
+        str(out),
+    ]
+    _run_cmd(cmd)
+    assert out.exists()
+
+
+def test_graph_tasks_runner_quadratic_only_smoke(tmp_path: Path) -> None:
+    out = tmp_path / "metrics_quadratic.json"
+    cmd = [
+        sys.executable,
+        "experiments/run_graph_tasks.py",
+        "--model_name",
+        "quadratic_only",
+        "--device",
+        "cpu",
+        "--epochs",
+        "1",
+        "--num_train_graphs",
+        "8",
+        "--num_val_graphs",
+        "4",
+        "--num_test_graphs",
+        "4",
+        "--batch_size",
+        "4",
+        "--eval_batch_size",
+        "4",
+        "--num_steps",
+        "2",
+        "--inference_mode_eval",
+        "fixed",
+        "--output",
+        str(out),
+    ]
+    _run_cmd(cmd)
+    assert out.exists()
+
+
+def test_graph_tasks_runner_compile_eval_only_smoke(tmp_path: Path) -> None:
+    out = tmp_path / "metrics_compile.json"
+    cmd = [
+        sys.executable,
+        "experiments/run_graph_tasks.py",
+        "--task_preset",
+        "graph_classification",
+        "--model_name",
+        "pairwiseget",
+        "--device",
+        "cpu",
+        "--epochs",
+        "1",
+        "--num_train_graphs",
+        "8",
+        "--num_val_graphs",
+        "4",
+        "--num_test_graphs",
+        "4",
+        "--batch_size",
+        "4",
+        "--eval_batch_size",
+        "4",
+        "--compile",
+        "--compile_scope",
+        "eval_only",
+        "--inference_mode_eval",
+        "fixed",
         "--output",
         str(out),
     ]
@@ -126,3 +194,6 @@ def test_graph_tasks_runner_csl_cv_smoke(tmp_path: Path) -> None:
     ]
     _run_cmd(cmd)
     assert out.exists()
+    data = json.loads(out.read_text())
+    assert data["task_type"] == "multiclass"
+    assert int(data["num_classes"]) > 1

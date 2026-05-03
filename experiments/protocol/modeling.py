@@ -10,7 +10,7 @@ from get.models import EnergyGraphClassifier
 
 
 def build_model(args, task_type: str, num_classes: int):
-    out_dim = 1 if task_type in {"binary", "regression"} else num_classes
+    out_dim = 1 if task_type == "binary" else num_classes
     
     # Extract optional flags if present in args, otherwise use defaults
     use_energy_norm = getattr(args, "use_energy_norm", True)
@@ -39,6 +39,7 @@ def build_model(args, task_type: str, num_classes: int):
             armijo_gamma=args.armijo_gamma,
             armijo_c=args.armijo_c,
             armijo_max_backtracks=args.armijo_max_backtracks,
+            armijo_eval_max_backtracks=getattr(args, "armijo_eval_max_backtracks", 5),
             inference_mode_train=args.inference_mode_train,
             inference_mode_eval=args.inference_mode_eval,
             energy_name="get_full",
@@ -68,13 +69,14 @@ def build_model(args, task_type: str, num_classes: int):
             armijo_gamma=args.armijo_gamma,
             armijo_c=args.armijo_c,
             armijo_max_backtracks=args.armijo_max_backtracks,
+            armijo_eval_max_backtracks=getattr(args, "armijo_eval_max_backtracks", 5),
             inference_mode_train=args.inference_mode_train,
             inference_mode_eval=args.inference_mode_eval,
             energy_name="pairwise_only",
             use_energy_norm=use_energy_norm,
             agg_mode=agg_mode,
         )
-    if args.model_name == "et":
+    if args.model_name == "quadratic_only":
         return EnergyGraphClassifier(
             in_dim=args.in_dim,
             hidden_dim=args.hidden_dim,
@@ -97,6 +99,7 @@ def build_model(args, task_type: str, num_classes: int):
             armijo_gamma=args.armijo_gamma,
             armijo_c=args.armijo_c,
             armijo_max_backtracks=args.armijo_max_backtracks,
+            armijo_eval_max_backtracks=getattr(args, "armijo_eval_max_backtracks", 5),
             inference_mode_train=args.inference_mode_train,
             inference_mode_eval=args.inference_mode_eval,
             energy_name="quadratic_only",

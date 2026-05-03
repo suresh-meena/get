@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 import torch
 import torch.nn as nn
 from .ops import (
@@ -42,10 +44,20 @@ class MotifEnergy(nn.Module):
             return lambda_3 * graph_agg
         else:
             lse_3 = segment_logsumexp(beta_3 * ell_3, c_3, num_nodes, dim=0)
+            if c_3.numel() > 0:
+                counts = torch.bincount(c_3, minlength=num_nodes)
+                empty = counts.eq(0)
+                if empty.any():
+                    lse_3 = lse_3.masked_fill(empty.view(-1, *([1] * (lse_3.dim() - 1))), 0.0)
             if degree_scaler is not None:
                 lse_3 = lse_3 * degree_scaler.unsqueeze(-1)
             graph_lse = scatter_add_nd(ell_3.new_zeros((num_graphs, ell_3.shape[-1])), batch, lse_3, dim=0)
             return (lambda_3 / beta_3) * graph_lse
 
+@lru_cache(maxsize=1)
+def _cached_motif_energy() -> MotifEnergy:
+    return MotifEnergy()
+
+
 def compute_motif_energy(G, c_3, u_3, v_3, t_tau, batch, num_graphs, params, projections, num_nodes, degree_scaler=None):
-    return MotifEnergy()(G, c_3, u_3, v_3, t_tau, batch, num_graphs, params, projections, num_nodes, degree_scaler=degree_scaler)
+    return _cached_motif_energy()(G, c_3, u_3, v_3, t_tau, batch, num_graphs, params, projections, num_nodes, degree_scaler=degree_scaler)

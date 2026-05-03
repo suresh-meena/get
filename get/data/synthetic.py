@@ -70,6 +70,25 @@ def _extract_motifs_jit(adj, n, max_motifs_per_anchor):
                 
     return c3, u3, v3, tau
 
+def sample_from_adj(adj: torch.Tensor, x: torch.Tensor, y: torch.Tensor, max_motifs_per_anchor: int) -> Dict[str, torch.Tensor]:
+    n = adj.size(0)
+    adj_np = adj.cpu().numpy()
+    c2, u2 = np.nonzero(adj_np)
+    c3, u3, v3, tau = _extract_motifs_jit(adj_np, n, max_motifs_per_anchor)
+    y = y.float().reshape(-1)
+    if y.numel() == 0:
+        y = torch.zeros(1, dtype=torch.float32)
+    return {
+        "x": x.float(),
+        "y": y,
+        "c_2": torch.tensor(c2, dtype=torch.long),
+        "u_2": torch.tensor(u2, dtype=torch.long),
+        "c_3": torch.tensor(c3, dtype=torch.long),
+        "u_3": torch.tensor(u3, dtype=torch.long),
+        "v_3": torch.tensor(v3, dtype=torch.long),
+        "t_tau": torch.tensor(tau, dtype=torch.long),
+    }
+
 def _build_random_graph(
     rng: np.random.Generator,
     min_nodes: int,
@@ -153,23 +172,40 @@ class SyntheticGraphDataset(Dataset):
 
 
 def collate_graph_samples(samples: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    x_all: List[torch.Tensor] = []
-    y_all: List[torch.Tensor] = []
-    c2_all: List[torch.Tensor] = []
-    u2_all: List[torch.Tensor] = []
-    c3_all: List[torch.Tensor] = []
-    u3_all: List[torch.Tensor] = []
-    v3_all: List[torch.Tensor] = []
-    tt_all: List[torch.Tensor] = []
-    batch_idx: List[torch.Tensor] = []
+    if not samples:
+        raise ValueError("collate_graph_samples requires at least one sample")
 
+    first_x = samples[0]["x"]
+    first_y = samples[0]["y"].reshape(-1)
+    total_nodes = 0
+    total_c2 = 0
+    total_c3 = 0
+    for sample in samples:
+        total_nodes += int(sample["x"].size(0))
+        total_c2 += int(sample["c_2"].numel())
+        total_c3 += int(sample["c_3"].numel())
+
+    x_out = first_x.new_empty((total_nodes, first_x.size(-1)))
+    y_out = first_y.new_empty((len(samples), first_y.numel()))
+    batch_out = torch.empty(total_nodes, dtype=torch.long)
+    c2_out = torch.empty(total_c2, dtype=torch.long) if total_c2 > 0 else torch.empty(0, dtype=torch.long)
+    u2_out = torch.empty(total_c2, dtype=torch.long) if total_c2 > 0 else torch.empty(0, dtype=torch.long)
+    c3_out = torch.empty(total_c3, dtype=torch.long) if total_c3 > 0 else torch.empty(0, dtype=torch.long)
+    u3_out = torch.empty(total_c3, dtype=torch.long) if total_c3 > 0 else torch.empty(0, dtype=torch.long)
+    v3_out = torch.empty(total_c3, dtype=torch.long) if total_c3 > 0 else torch.empty(0, dtype=torch.long)
+    tt_out = torch.empty(total_c3, dtype=torch.long) if total_c3 > 0 else torch.empty(0, dtype=torch.long)
+
+    node_ptr = 0
+    c2_ptr = 0
+    c3_ptr = 0
     node_offset = 0
     for gidx, sample in enumerate(samples):
         x = sample["x"]
         n = x.size(0)
-        x_all.append(x)
-        y_all.append(sample["y"].view(1))
-        batch_idx.append(torch.full((n,), gidx, dtype=torch.long))
+        next_node_ptr = node_ptr + n
+        x_out[node_ptr:next_node_ptr] = x
+        y_out[gidx] = sample["y"].reshape(-1)
+        batch_out[node_ptr:next_node_ptr] = gidx
 
         c2 = sample["c_2"]
         u2 = sample["u_2"]
@@ -179,30 +215,30 @@ def collate_graph_samples(samples: List[Dict[str, torch.Tensor]]) -> Dict[str, t
         tt = sample["t_tau"]
 
         if c2.numel() > 0:
-            c2_all.append(c2 + node_offset)
-            u2_all.append(u2 + node_offset)
+            c2_len = int(c2.numel())
+            c2_out[c2_ptr:c2_ptr + c2_len] = c2 + node_offset
+            u2_out[c2_ptr:c2_ptr + c2_len] = u2 + node_offset
+            c2_ptr += c2_len
         if c3.numel() > 0:
-            c3_all.append(c3 + node_offset)
-            u3_all.append(u3 + node_offset)
-            v3_all.append(v3 + node_offset)
-            tt_all.append(tt)
+            c3_len = int(c3.numel())
+            c3_out[c3_ptr:c3_ptr + c3_len] = c3 + node_offset
+            u3_out[c3_ptr:c3_ptr + c3_len] = u3 + node_offset
+            v3_out[c3_ptr:c3_ptr + c3_len] = v3 + node_offset
+            tt_out[c3_ptr:c3_ptr + c3_len] = tt
+            c3_ptr += c3_len
 
         node_offset += n
-
-    def _cat_or_empty(parts: List[torch.Tensor], dtype: torch.dtype) -> torch.Tensor:
-        if not parts:
-            return torch.empty(0, dtype=dtype)
-        return torch.cat(parts, dim=0)
+        node_ptr = next_node_ptr
 
     return {
-        "x": torch.cat(x_all, dim=0),
-        "y": torch.cat(y_all, dim=0),
-        "batch": torch.cat(batch_idx, dim=0),
+        "x": x_out,
+        "y": y_out,
+        "batch": batch_out,
         "num_graphs": torch.tensor(len(samples), dtype=torch.long),
-        "c_2": _cat_or_empty(c2_all, torch.long),
-        "u_2": _cat_or_empty(u2_all, torch.long),
-        "c_3": _cat_or_empty(c3_all, torch.long),
-        "u_3": _cat_or_empty(u3_all, torch.long),
-        "v_3": _cat_or_empty(v3_all, torch.long),
-        "t_tau": _cat_or_empty(tt_all, torch.long),
+        "c_2": c2_out,
+        "u_2": u2_out,
+        "c_3": c3_out,
+        "u_3": u3_out,
+        "v_3": v3_out,
+        "t_tau": tt_out,
     }
