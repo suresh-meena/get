@@ -17,11 +17,29 @@ class PairwiseEnergy(nn.Module):
             return G.new_zeros((*G.shape[:-2], num_graphs))
 
         Q2, K2 = projections['Q2'], projections['K2']
-        scale = d ** 0.5
+        d_actual = Q2.size(2)
+        scale = d_actual ** 0.5
         
-        ell_2 = (Q2[c_2] * K2[u_2]).sum(dim=-1) / scale
+        # Optimized vectorized dot-product
+        def _compute_ell_2_vectorized(q, k, src, dst):
+            # [E, H, d] * [E, H, d] summed over d -> [E, H]
+            return (q[src] * k[dst]).sum(dim=-1)
+            
+        from torch.utils.checkpoint import checkpoint
+        if Q2.requires_grad or K2.requires_grad:
+            # We use checkpoint to avoid materializing the large [E, H, d] intermediate tensor in the backward pass
+            ell_2 = checkpoint(_compute_ell_2_vectorized, Q2, K2, c_2, u_2, use_reentrant=False)
+        else:
+            ell_2 = _compute_ell_2_vectorized(Q2, K2, c_2, u_2)
+            
+        ell_2 = ell_2 / scale
+
         if params.get("pairwise_symmetric", False):
-            ell_2 = ell_2 + (Q2[u_2] * K2[c_2]).sum(dim=-1) / scale
+            if Q2.requires_grad or K2.requires_grad:
+                ell_sym = checkpoint(_compute_ell_2_vectorized, Q2, K2, u_2, c_2, use_reentrant=False)
+            else:
+                ell_sym = _compute_ell_2_vectorized(Q2, K2, u_2, c_2)
+            ell_2 = ell_2 + (ell_sym / scale)
 
         a_2 = projections.get('a_2')
         if a_2 is not None:

@@ -1,6 +1,5 @@
 from functools import lru_cache
 
-import torch
 import torch.nn as nn
 from .ops import scatter_add_nd
 

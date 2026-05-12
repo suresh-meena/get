@@ -5,84 +5,56 @@ import sys
 from pathlib import Path
 
 
-def test_protocol_runner_stage1_smoke(tmp_path: Path) -> None:
-    out = tmp_path / "stage1.json"
+def test_main_runner_stage1_smoke(tmp_path: Path) -> None:
+    # Test using main.py with Hydra overrides
     cmd = [
         sys.executable,
-        "experiments/run_protocol.py",
-        "--task",
-        "stage1_wedge_triangle",
-        "--model_name",
-        "pairwiseget",
-        "--device",
-        "cpu",
-        "--epochs",
-        "1",
-        "--max_graphs",
-        "16",
-        "--batch_size",
-        "8",
-        "--eval_batch_size",
-        "8",
-        "--output",
-        str(out),
+        "main.py",
+        "dataset.name=stage1_wedge_triangle",
+        "model=pairwiseget",
+        "experiment.device=cpu",
+        "trainer.epochs=1",
+        "+dataset.max_graphs=16",
+        "trainer.batch_size=8",
+        "trainer.eval_batch_size=8",
+        f"+output_dir={tmp_path}",
     ]
     subprocess.run(cmd, check=True)
-    assert out.exists()
+    assert (tmp_path / "metrics_stage1_wedge_triangle.json").exists()
 
 
-def test_protocol_runner_stage1_xorsat_smoke(tmp_path: Path) -> None:
-    out = tmp_path / "stage1_xorsat.json"
+def test_main_runner_stage1_xorsat_smoke(tmp_path: Path) -> None:
     cmd = [
         sys.executable,
-        "experiments/run_protocol.py",
-        "--task",
-        "stage1_xorsat",
-        "--model_name",
-        "pairwiseget",
-        "--device",
-        "cpu",
-        "--epochs",
-        "1",
-        "--max_graphs",
-        "16",
-        "--batch_size",
-        "8",
-        "--eval_batch_size",
-        "8",
-        "--output",
-        str(out),
+        "main.py",
+        "dataset.name=stage1_xorsat",
+        "model=pairwiseget",
+        "experiment.device=cpu",
+        "trainer.epochs=1",
+        "+dataset.max_graphs=16",
+        "trainer.batch_size=8",
+        "trainer.eval_batch_size=8",
+        f"+output_dir={tmp_path}",
     ]
     subprocess.run(cmd, check=True)
-    assert out.exists()
+    assert (tmp_path / "metrics_stage1_xorsat.json").exists()
 
 
-def test_protocol_runner_stage1_compile_eval_only_smoke(tmp_path: Path) -> None:
-    out = tmp_path / "stage1_compile.json"
+def test_main_runner_stage1_compile_eval_only_smoke(tmp_path: Path) -> None:
     cmd = [
         sys.executable,
-        "experiments/run_protocol.py",
-        "--task",
-        "stage1_wedge_triangle",
-        "--model_name",
-        "pairwiseget",
-        "--device",
-        "cpu",
-        "--epochs",
-        "1",
-        "--max_graphs",
-        "16",
-        "--batch_size",
-        "8",
-        "--eval_batch_size",
-        "8",
-        "--compile",
-        "--compile_scope",
-        "eval_only",
-        "--inference_mode_eval",
-        "fixed",
-        "--output",
-        str(out),
+        "main.py",
+        "dataset.name=stage1_wedge_triangle",
+        "model=pairwiseget",
+        "experiment.device=cpu",
+        "trainer.epochs=1",
+        "+dataset.max_graphs=16",
+        "trainer.batch_size=8",
+        "trainer.eval_batch_size=8",
+        "experiment.compile.enabled=True",
+        "experiment.compile.scope=eval_only",
+        "experiment.inference_mode_eval=fixed",
+        f"+output_dir={tmp_path}",
     ]
     subprocess.run(cmd, check=True)
-    assert out.exists()
+    assert (tmp_path / "metrics_stage1_wedge_triangle.json").exists()

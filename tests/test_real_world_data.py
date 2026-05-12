@@ -18,21 +18,13 @@ class _FakeData:
 
 def _install_fake_tu(monkeypatch, samples: list[_FakeData], num_classes: int):
     class _FakeTUDataset(list):
-        def __init__(self, root=None, name=None):
-            del root, name
+        def __init__(self, root=None, name=None, use_node_attr=True):
+            del root, name, use_node_attr
             super().__init__(samples)
             self.num_classes = num_classes
 
-    datasets = types.ModuleType("torch_geometric.datasets")
-    datasets.TUDataset = _FakeTUDataset
-    datasets.GNNBenchmarkDataset = _FakeTUDataset
-
-    tg_root = types.ModuleType("torch_geometric")
-    tg_root.__path__ = []  # type: ignore[attr-defined]
-    tg_root.datasets = datasets
-
-    monkeypatch.setitem(sys.modules, "torch_geometric", tg_root)
-    monkeypatch.setitem(sys.modules, "torch_geometric.datasets", datasets)
+    monkeypatch.setattr("get.data.real_world.TUDataset", _FakeTUDataset)
+    monkeypatch.setattr("get.data.real_world.GNNBenchmarkDataset", _FakeTUDataset)
 
 
 def test_real_world_dataset_auto_preserves_multiclass_labels(monkeypatch):
@@ -42,7 +34,7 @@ def test_real_world_dataset_auto_preserves_multiclass_labels(monkeypatch):
         num_classes=3,
     )
 
-    ds = RealWorldGraphDataset(name="ENZYMES", root="data", in_dim=2, max_motifs_per_anchor=2, task_type="auto")
+    ds = RealWorldGraphDataset(name="ENZYMES", root="data", in_dim=2, max_motifs_per_anchor=2, task_type="auto", cache_enabled=False)
     sample = ds[2]
 
     assert ds.task_type == "multiclass"
@@ -56,8 +48,30 @@ def test_real_world_dataset_auto_preserves_binary_labels(monkeypatch):
         num_classes=2,
     )
 
-    ds = RealWorldGraphDataset(name="MUTAG", root="data", in_dim=2, max_motifs_per_anchor=2, task_type="auto")
+    ds = RealWorldGraphDataset(name="MUTAG", root="data", in_dim=2, max_motifs_per_anchor=2, task_type="auto", cache_enabled=False)
     sample = ds[1]
 
     assert ds.task_type == "binary"
     assert torch.equal(sample["y"], torch.tensor([1.0]))
+
+
+def test_real_world_dataset_cache_roundtrip(tmp_path, monkeypatch):
+    calls = {"count": 0}
+
+    class _CachingTUDataset(list):
+        def __init__(self, root=None, name=None, use_node_attr=True):
+            del root, name, use_node_attr
+            calls["count"] += 1
+            super().__init__([_FakeData(torch.tensor([0])), _FakeData(torch.tensor([1]))])
+            self.num_classes = 2
+
+    monkeypatch.setattr("get.data.real_world.TUDataset", _CachingTUDataset)
+    monkeypatch.setattr("get.data.real_world.GNNBenchmarkDataset", _CachingTUDataset)
+
+    root = tmp_path / "real"
+    ds1 = RealWorldGraphDataset(name="MUTAG", root=str(root), in_dim=2, max_motifs_per_anchor=2, task_type="auto", cache_enabled=True)
+    ds2 = RealWorldGraphDataset(name="MUTAG", root=str(root), in_dim=2, max_motifs_per_anchor=2, task_type="auto", cache_enabled=True)
+
+    assert calls["count"] == 1
+    assert len(ds1) == len(ds2) == 2
+    assert torch.equal(ds1[0]["y"], ds2[0]["y"])

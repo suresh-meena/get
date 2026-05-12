@@ -1,10 +1,10 @@
 name: "PairwiseGET"
 energy_name: "pairwise_only"
 in_dim: 1  # To be overridden by dataset
-hidden_dim: 128
+hidden_dim: 192
 num_classes: 1
-num_steps: 6
-num_heads: 4
+num_steps: 8
+num_heads: 6
 head_dim: 32
 lambda_2: 1.0
 lambda_3: 0.0
@@ -13,8 +13,8 @@ beta_2: 1.0
 beta_3: 1.0
 beta_m: 1.0
 num_motif_types: 24
-R: 2
-K: 32
+R: 3
+K: 48
 dropout: 0.0
 update_damping: 0.05
 fixed_step_size: 0.08

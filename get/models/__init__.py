@@ -2,6 +2,6 @@
 
 from .energy_classifier import EnergyGraphClassifier
 from .et_classifier import ETGraphClassifier
+from .factory import build_model
 
-__all__ = ["EnergyGraphClassifier", "ETGraphClassifier"]
-
+__all__ = ["EnergyGraphClassifier", "ETGraphClassifier", "build_model"]

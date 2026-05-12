@@ -1,0 +1,5 @@
+name: "stage3_zinc"
+in_dim: 32
+max_motifs_per_anchor: 8
+task_type: "regression"
+dataset_root: "data"

@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import combinations
-from typing import Dict, List
+from pathlib import Path
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+import numba
+from torch_geometric.data import Batch, Data
+
+from get.energy.ops import positional_embeddings_from_edge_index
+import scipy.sparse as sp
 
 
 @dataclass
@@ -19,9 +24,115 @@ class GraphSample:
     u_3: torch.Tensor
     v_3: torch.Tensor
     t_tau: torch.Tensor
+    pos: Optional[torch.Tensor] = None
 
 
-import numba
+class GraphSampleData(Data):
+    def __inc__(self, key, value, *args, **kwargs):
+        if key in {"c_2", "u_2", "c_3", "u_3", "v_3"}:
+            return int(self.num_nodes)
+        return super().__inc__(key, value, *args, **kwargs)
+
+
+@numba.njit(parallel=True)
+def _extract_motifs_csr_jit(indptr, indices, max_motifs_per_anchor):
+    n = len(indptr) - 1
+    # First pass: count motifs per anchor to pre-allocate
+    counts = np.zeros(n, dtype=np.int64)
+    for i in numba.prange(n):
+        start = indptr[i]
+        end = indptr[i+1]
+        n_neigh = end - start
+        num_pairs = (n_neigh * (n_neigh - 1)) // 2
+        counts[i] = min(num_pairs, max_motifs_per_anchor)
+        
+    offsets = np.zeros(n + 1, dtype=np.int64)
+    for i in range(n):
+        offsets[i+1] = offsets[i] + counts[i]
+        
+    total_motifs = offsets[n]
+    c3 = np.empty(total_motifs, dtype=np.int64)
+    u3 = np.empty(total_motifs, dtype=np.int64)
+    v3 = np.empty(total_motifs, dtype=np.int64)
+    tau = np.empty(total_motifs, dtype=np.int64)
+    
+    for i in numba.prange(n):
+        start = indptr[i]
+        end = indptr[i+1]
+        n_neigh = end - start
+        if n_neigh < 2:
+            continue
+            
+        ptr = offsets[i]
+        budget = 0
+        for j_idx in range(start, end):
+            if budget >= max_motifs_per_anchor:
+                break
+            for k_idx in range(j_idx + 1, end):
+                if budget >= max_motifs_per_anchor:
+                    break
+                
+                u = indices[j_idx]
+                v = indices[k_idx]
+                
+                # Binary search for edge (u, v)
+                u_start = indptr[u]
+                u_end = indptr[u+1]
+                connected = False
+                low = u_start
+                high = u_end - 1
+                while low <= high:
+                    mid = (low + high) // 2
+                    if indices[mid] == v:
+                        connected = True
+                        break
+                    elif indices[mid] < v:
+                        low = mid + 1
+                    else:
+                        high = mid - 1
+
+                c3[ptr] = i
+                u3[ptr] = u
+                v3[ptr] = v
+                tau[ptr] = 1 if connected else 0
+                ptr += 1
+                budget += 1
+                
+    return c3, u3, v3, tau
+
+
+def sample_from_edge_index(
+    edge_index: torch.Tensor,
+    num_nodes: int,
+    x: torch.Tensor, 
+    y: torch.Tensor, 
+    max_motifs_per_anchor: int,
+    pos_k: int = 0,
+) -> Dict[str, torch.Tensor]:
+    edge_index_np = edge_index.cpu().numpy()
+    vals = np.ones(edge_index_np.shape[1], dtype=bool)
+    adj_csr = sp.csr_matrix((vals, (edge_index_np[0], edge_index_np[1])), shape=(num_nodes, num_nodes))
+    c3, u3, v3, tau = _extract_motifs_csr_jit(adj_csr.indptr, adj_csr.indices, max_motifs_per_anchor)
+    y = y.float().reshape(-1)
+    if y.numel() == 0:
+        y = torch.zeros(1, dtype=torch.float32)
+        
+    sample = GraphSampleData(
+        x=x.float(),
+        y=y,
+        c_2=edge_index[0].clone(),
+        u_2=edge_index[1].clone(),
+        c_3=torch.tensor(c3, dtype=torch.long),
+        u_3=torch.tensor(u3, dtype=torch.long),
+        v_3=torch.tensor(v3, dtype=torch.long),
+        t_tau=torch.tensor(tau, dtype=torch.long),
+    )
+    
+    if pos_k > 0:
+        sample.pos = positional_embeddings_from_edge_index(edge_index, num_nodes, k=pos_k)
+        
+    return sample
+
 
 @numba.njit
 def _extract_motifs_jit(adj, n, max_motifs_per_anchor):
@@ -70,7 +181,14 @@ def _extract_motifs_jit(adj, n, max_motifs_per_anchor):
                 
     return c3, u3, v3, tau
 
-def sample_from_adj(adj: torch.Tensor, x: torch.Tensor, y: torch.Tensor, max_motifs_per_anchor: int) -> Dict[str, torch.Tensor]:
+
+def sample_from_adj(
+    adj: torch.Tensor, 
+    x: torch.Tensor, 
+    y: torch.Tensor, 
+    max_motifs_per_anchor: int,
+    pos_k: int = 0,
+) -> Dict[str, torch.Tensor]:
     n = adj.size(0)
     adj_np = adj.cpu().numpy()
     c2, u2 = np.nonzero(adj_np)
@@ -78,47 +196,10 @@ def sample_from_adj(adj: torch.Tensor, x: torch.Tensor, y: torch.Tensor, max_mot
     y = y.float().reshape(-1)
     if y.numel() == 0:
         y = torch.zeros(1, dtype=torch.float32)
-    return {
-        "x": x.float(),
-        "y": y,
-        "c_2": torch.tensor(c2, dtype=torch.long),
-        "u_2": torch.tensor(u2, dtype=torch.long),
-        "c_3": torch.tensor(c3, dtype=torch.long),
-        "u_3": torch.tensor(u3, dtype=torch.long),
-        "v_3": torch.tensor(v3, dtype=torch.long),
-        "t_tau": torch.tensor(tau, dtype=torch.long),
-    }
-
-def _build_random_graph(
-    rng: np.random.Generator,
-    min_nodes: int,
-    max_nodes: int,
-    edge_prob: float,
-    in_dim: int,
-    max_motifs_per_anchor: int,
-) -> GraphSample:
-    n = int(rng.integers(min_nodes, max_nodes + 1))
-    adj = rng.random((n, n)) < edge_prob
-    adj = np.triu(adj, k=1)
-    adj = adj | adj.T
-    np.fill_diagonal(adj, False)
-
-    # Triangle count via A^2 \circ A instead of a full A^3 product.
-    adj_f = adj.astype(np.float32)
-    tri_count = int((((adj_f @ adj_f) * adj_f).sum()) / 6.0)
-    y_val = float(tri_count > 0)
-    
-    x = rng.standard_normal((n, in_dim)).astype(np.float32)
-
-    # Vectorized edge extraction
-    c2, u2 = np.nonzero(adj)
-
-    # JIT compiled motif extraction
-    c3, u3, v3, tau = _extract_motifs_jit(adj, n, max_motifs_per_anchor)
-
-    return GraphSample(
-        x=torch.tensor(x, dtype=torch.float32),
-        y=torch.tensor(y_val, dtype=torch.float32),
+        
+    sample = GraphSampleData(
+        x=x.float(),
+        y=y,
         c_2=torch.tensor(c2, dtype=torch.long),
         u_2=torch.tensor(u2, dtype=torch.long),
         c_3=torch.tensor(c3, dtype=torch.long),
@@ -126,6 +207,35 @@ def _build_random_graph(
         v_3=torch.tensor(v3, dtype=torch.long),
         t_tau=torch.tensor(tau, dtype=torch.long),
     )
+    
+    if pos_k > 0:
+        edge_index = torch.stack([sample["c_2"], sample["u_2"]], dim=0)
+        sample.pos = positional_embeddings_from_edge_index(edge_index, n, k=pos_k)
+        
+    return sample
+
+
+def collate_graph_samples(samples: List[Dict[str, torch.Tensor]]) -> Batch:
+    """
+    PyG Batch-based graph collator.
+
+    Converts the incoming samples to `Data` objects when needed and lets PyG
+    handle batching / index shifting for the custom motif tensors.
+    """
+    if not samples:
+        raise ValueError("collate_graph_samples requires at least one sample")
+    data_list: List[GraphSampleData] = []
+    for sample in samples:
+        if isinstance(sample, GraphSampleData):
+            data_list.append(sample)
+        elif isinstance(sample, Data):
+            data_list.append(GraphSampleData(**sample.to_dict()))
+        else:
+            data_list.append(GraphSampleData(**sample))
+
+    batch = Batch.from_data_list(data_list)
+    batch.num_graphs = torch.tensor(len(data_list), dtype=torch.long, device=batch.x.device)
+    return batch
 
 
 class SyntheticGraphDataset(Dataset):
@@ -140,106 +250,54 @@ class SyntheticGraphDataset(Dataset):
         in_dim: int,
         max_motifs_per_anchor: int,
         seed: int,
+        pos_k: int = 0,
+        cache_root: str = "data/synthetic_cache",
     ) -> None:
-        self._items: List[GraphSample] = []
+        self._len = num_graphs
+        self.cache_dir = Path(cache_root).expanduser() / f"n_graphs_{num_graphs}_n_{min_nodes}_{max_nodes}_p_{edge_prob}_d_{in_dim}_m_{max_motifs_per_anchor}_s_{seed}_k_{pos_k}"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Check if already generated
+        if (self.cache_dir / "done.txt").exists():
+            return
+
+        from tqdm import tqdm
         rng = np.random.default_rng(seed)
-        for _ in range(num_graphs):
-            self._items.append(
-                _build_random_graph(
-                    rng=rng,
-                    min_nodes=min_nodes,
-                    max_nodes=max_nodes,
-                    edge_prob=edge_prob,
-                    in_dim=in_dim,
-                    max_motifs_per_anchor=max_motifs_per_anchor,
-                )
-            )
+        pbar = tqdm(total=num_graphs, desc="Generating Synthetic Graphs", unit="graph")
+        for i in range(num_graphs):
+            n = int(rng.integers(min_nodes, max_nodes + 1))
+            adj = rng.random((n, n)) < edge_prob
+            adj = np.triu(adj, k=1)
+            adj = adj | adj.T
+            np.fill_diagonal(adj, False)
+            adj_t = torch.from_numpy(adj)
+            
+            # Triangle count
+            edge_index = torch.stack(torch.where(adj_t), dim=0)
+            import torch_geometric.utils as pyg_utils
+            
+            if hasattr(pyg_utils, 'triangle_count'):
+                tri_count = pyg_utils.triangle_count(edge_index).sum().item() // 3
+            else:
+                adj_f = adj.astype(np.float32)
+                tri_count = int((((adj_f @ adj_f) * adj_f).sum()) / 6.0)
+                
+            y_val = torch.tensor([1.0 if tri_count > 0 else 0.0])
+            x = torch.from_numpy(rng.standard_normal((n, in_dim)).astype(np.float32))
+            
+            sample = sample_from_adj(adj_t, x, y_val, max_motifs_per_anchor, pos_k=pos_k)
+            torch.save(sample, self.cache_dir / f"sample_{i}.pt")
+            pbar.update(1)
+        pbar.close()
+            
+        (self.cache_dir / "done.txt").write_text("done")
 
     def __len__(self) -> int:
-        return len(self._items)
+        return self._len
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        g = self._items[idx]
-        return {
-            "x": g.x,
-            "y": g.y,
-            "c_2": g.c_2,
-            "u_2": g.u_2,
-            "c_3": g.c_3,
-            "u_3": g.u_3,
-            "v_3": g.v_3,
-            "t_tau": g.t_tau,
-        }
+        return torch.load(self.cache_dir / f"sample_{idx}.pt", map_location="cpu", weights_only=False)
 
-
-def collate_graph_samples(samples: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    if not samples:
-        raise ValueError("collate_graph_samples requires at least one sample")
-
-    first_x = samples[0]["x"]
-    first_y = samples[0]["y"].reshape(-1)
-    total_nodes = 0
-    total_c2 = 0
-    total_c3 = 0
-    for sample in samples:
-        total_nodes += int(sample["x"].size(0))
-        total_c2 += int(sample["c_2"].numel())
-        total_c3 += int(sample["c_3"].numel())
-
-    x_out = first_x.new_empty((total_nodes, first_x.size(-1)))
-    y_out = first_y.new_empty((len(samples), first_y.numel()))
-    batch_out = torch.empty(total_nodes, dtype=torch.long)
-    c2_out = torch.empty(total_c2, dtype=torch.long) if total_c2 > 0 else torch.empty(0, dtype=torch.long)
-    u2_out = torch.empty(total_c2, dtype=torch.long) if total_c2 > 0 else torch.empty(0, dtype=torch.long)
-    c3_out = torch.empty(total_c3, dtype=torch.long) if total_c3 > 0 else torch.empty(0, dtype=torch.long)
-    u3_out = torch.empty(total_c3, dtype=torch.long) if total_c3 > 0 else torch.empty(0, dtype=torch.long)
-    v3_out = torch.empty(total_c3, dtype=torch.long) if total_c3 > 0 else torch.empty(0, dtype=torch.long)
-    tt_out = torch.empty(total_c3, dtype=torch.long) if total_c3 > 0 else torch.empty(0, dtype=torch.long)
-
-    node_ptr = 0
-    c2_ptr = 0
-    c3_ptr = 0
-    node_offset = 0
-    for gidx, sample in enumerate(samples):
-        x = sample["x"]
-        n = x.size(0)
-        next_node_ptr = node_ptr + n
-        x_out[node_ptr:next_node_ptr] = x
-        y_out[gidx] = sample["y"].reshape(-1)
-        batch_out[node_ptr:next_node_ptr] = gidx
-
-        c2 = sample["c_2"]
-        u2 = sample["u_2"]
-        c3 = sample["c_3"]
-        u3 = sample["u_3"]
-        v3 = sample["v_3"]
-        tt = sample["t_tau"]
-
-        if c2.numel() > 0:
-            c2_len = int(c2.numel())
-            c2_out[c2_ptr:c2_ptr + c2_len] = c2 + node_offset
-            u2_out[c2_ptr:c2_ptr + c2_len] = u2 + node_offset
-            c2_ptr += c2_len
-        if c3.numel() > 0:
-            c3_len = int(c3.numel())
-            c3_out[c3_ptr:c3_ptr + c3_len] = c3 + node_offset
-            u3_out[c3_ptr:c3_ptr + c3_len] = u3 + node_offset
-            v3_out[c3_ptr:c3_ptr + c3_len] = v3 + node_offset
-            tt_out[c3_ptr:c3_ptr + c3_len] = tt
-            c3_ptr += c3_len
-
-        node_offset += n
-        node_ptr = next_node_ptr
-
-    return {
-        "x": x_out,
-        "y": y_out,
-        "batch": batch_out,
-        "num_graphs": torch.tensor(len(samples), dtype=torch.long),
-        "c_2": c2_out,
-        "u_2": u2_out,
-        "c_3": c3_out,
-        "u_3": u3_out,
-        "v_3": v3_out,
-        "t_tau": tt_out,
-    }
+    @property
+    def items(self) -> List[Dict[str, torch.Tensor]]:
+        return [self[i] for i in range(self._len)]

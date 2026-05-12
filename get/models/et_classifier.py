@@ -1,39 +1,7 @@
 """
-ETGraphClassifier — faithful PyTorch port of the JAX Energy Transformer graph model.
+ETGraphClassifier — native PyTorch ET graph model.
 
 Reference: external/energy-transformer-graph/src/model/{core,et}.py
-
-Architecture
-------------
-The full ET energy at each step is:
-
-    E(g, adj) = E_att(g, adj) + E_hnn(g)
-
-where:
-    g            = EnergyLayerNorm(x)              [N, D]
-    E_att(g,adj) = (-1/β) * Σ_i Σ_h lse_h(β * A_adj[i])
-    E_hnn(g)     = -0.5 * ||ReLU(W g)||²   (summed over nodes and hidden units)
-
-The update rule at each step t is:
-    x ← x - α * ∇_g E(g, adj)   where g = ELN(x)
-
-Because g = ELN(x) is differentiable w.r.t. x, we use torch.autograd.grad to get
-∇_x E (chain rule through ELN) and apply the update to x directly.
-
-For graph classification the final x is mean-pooled per graph, then projected to logits.
-
-Batch format
-------------
-Same batch dict as EnergyGraphClassifier:
-    x          [total_nodes, in_dim]
-    batch      [total_nodes]           node → graph index
-    num_graphs scalar
-    c_2, u_2   edge incidence (used to build adjacency mask)
-
-Interface
----------
-Same __init__ signature conventions as EnergyGraphClassifier where parameters are shared.
-New parameters: alpha (step size), multiplier (HNN hidden expansion), chn_type ('relu'|'gelu'|'lse').
 """
 from __future__ import annotations
 
@@ -44,23 +12,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from get.energy.ops import segment_logsumexp
 from .energy_norm import EnergyLayerNorm
+from .et_utils import build_et_batch_context
 
-
-# ---------------------------------------------------------------------------
-# Energy sub-modules
-# ---------------------------------------------------------------------------
 
 class _AttentionEnergy(nn.Module):
-    """
-    Graph-masked attention energy block.
-
-    E_att = (-1/β) * Σ_i Σ_h logsumexp_{j ∈ N(i)} ( β * (Q_i · K_j) / sqrt(d) )
-
-    Q, K projections share a learnable per-head inverse-temperature β (scalar per head).
-    The adjacency mask is derived from the batch's edge index so that logsumexp only
-    runs over actual neighbours, matching the JAX `A1 * adj` masking logic.
-    """
+    """Graph-masked attention energy block."""
 
     def __init__(self, hidden_dim: int, num_heads: int, head_dim: int, use_bias: bool = False) -> None:
         super().__init__()
@@ -69,11 +27,8 @@ class _AttentionEnergy(nn.Module):
         self.hidden_dim = hidden_dim
         self.use_bias = use_bias
 
-        # [H, d, D] — weight matrices, matching JAX Wq/Wk shape
         self.Wq = nn.Parameter(torch.empty(num_heads, head_dim, hidden_dim))
         self.Wk = nn.Parameter(torch.empty(num_heads, head_dim, hidden_dim))
-        
-        # Head-mixing weight Hw: [H, H]
         self.Hw = nn.Parameter(torch.empty(num_heads, num_heads))
         
         if use_bias:
@@ -83,7 +38,6 @@ class _AttentionEnergy(nn.Module):
             self.register_parameter("Bq", None)
             self.register_parameter("Bk", None)
 
-        # Per-head inverse temperature, initialised to 1/sqrt(d) like the JAX default
         init_beta = 1.0 / math.sqrt(head_dim)
         self.betas = nn.Parameter(torch.full((num_heads,), init_beta))
 
@@ -96,15 +50,15 @@ class _AttentionEnergy(nn.Module):
 
     def energy(
         self,
-        g: torch.Tensor,          # [N, D]
-        c_2: torch.Tensor,        # [E] source nodes (edge list)
+        g: torch.Tensor,        # [N, D]
+        c_2: torch.Tensor,        # [E] source nodes
         u_2: torch.Tensor,        # [E] dest nodes
+        adj: Optional[torch.Tensor] = None,
+        compute_corr: bool = False,
     ) -> torch.Tensor:
-        """Scalar attention energy (summed over all nodes and heads)."""
         N, D = g.shape
-        H, d = self.num_heads, self.head_dim
-
-        # Q, K: [N, H, d]
+        E = c_2.numel()
+        
         Q = torch.einsum("nd, hzd -> nhz", g, self.Wq)
         K = torch.einsum("nd, hzd -> nhz", g, self.Wk)
         
@@ -112,53 +66,62 @@ class _AttentionEnergy(nn.Module):
             Q = Q + self.Bq.unsqueeze(0)
             K = K + self.Bk.unsqueeze(0)
 
-        # Raw scores per edge: dot(Q_src, K_dst) per head  →  [E, H]
-        betas = self.betas.abs().clamp_min(1e-6)  # keep positive
+        H = self.num_heads
+        betas = self.betas.abs().clamp_min(1e-6)
 
-        if c_2.numel() == 0:
+        if adj is not None and adj.dim() == 3:
+            a1 = torch.einsum("h, qhz, khz -> hqk", betas, Q, K)
+            a11 = torch.einsum("qkh,hm->qkm", a1.permute(1, 2, 0), self.Hw) * adj
+            a11 = torch.where(a11 == 0, torch.full_like(a11, float("-inf")), a11)
+            a21 = torch.logsumexp(a11, dim=1)
+            a21 = torch.where(a21 == float("-inf"), torch.zeros_like(a21), a21)
+            return ((-1.0 / betas) * a21.sum(dim=0)).sum()
+
+        if E == 0:
             return g.new_zeros(1).squeeze()
 
-        # [E, H]
-        scores = (Q[c_2] * K[u_2]).sum(dim=-1)
-        scores = scores * betas.unsqueeze(0)
-        
-        # Apply head mixing Hw: [E, H] @ [H, H] -> [E, H]
-        # This matches the JAX logic: (A1.transpose(1, 2, 0) @ self.Hw)
-        scores = scores @ self.Hw
+        chunk_size = 500_000
+        scores_max = torch.full((N, H), float('-inf'), device=g.device, dtype=g.dtype)
+        for i in range(0, E, chunk_size):
+            end = min(i + chunk_size, E)
+            c_chunk = c_2[i:end]
+            u_chunk = u_2[i:end]
+            s_chunk = (Q[c_chunk] * K[u_chunk]).sum(dim=-1)
+            if compute_corr:
+                corr = (g[c_chunk] * g[u_chunk]).sum(dim=-1, keepdim=True)
+                s_chunk = s_chunk * corr
+            s_final = s_chunk * betas.unsqueeze(0)
+            scores_max.scatter_reduce_(0, c_chunk.unsqueeze(-1).expand(-1, H), s_final, reduce="amax", include_self=True)
 
-        # Segment logsumexp per (dst_node, head).
-        lse = _segment_logsumexp_2d(scores, c_2, N)     # [N, H]
+        exp_sum = g.new_zeros(N, H)
+        for i in range(0, E, chunk_size):
+            end = min(i + chunk_size, E)
+            c_chunk = c_2[i:end]
+            u_chunk = u_2[i:end]
+            s_chunk = (Q[c_chunk] * K[u_chunk]).sum(dim=-1)
+            if compute_corr:
+                corr = (g[c_chunk] * g[u_chunk]).sum(dim=-1, keepdim=True)
+                s_chunk = s_chunk * corr
+            s_final = s_chunk * betas.unsqueeze(0)
+            s_shifted = s_final - scores_max[c_chunk]
+            exp_sum.scatter_add_(0, c_chunk.unsqueeze(-1).expand(-1, H), torch.exp(s_shifted))
 
-        # Mask out isolated nodes
-        in_degree = torch.bincount(c_2, minlength=N)
-        lse = lse.masked_fill((in_degree == 0).unsqueeze(1), 0.0)
-
-        # E_att = (-1/β) * Σ_i Σ_h lse_h(i)
-        inv_beta = (1.0 / betas).unsqueeze(0)     # [1, H]
-        E_att = -(inv_beta * lse).sum()
-        return E_att
+        lse = torch.log(exp_sum.clamp_min(1e-12)) + scores_max
+        return -(1.0 / betas.unsqueeze(0) * lse).sum()
 
 
 class _HNNEnergy(nn.Module):
-    """
-    Hopfield network channel energy.
+    """Hopfield network channel energy."""
 
-    E_hnn = -0.5 * ||f(W g)||²
-
-    where f is relu (default), gelu, or logsumexp-based (lse).
-    W: [D, D_hid]
-    """
-
-    def __init__(self, hidden_dim: int, multiplier: float = 4.0, chn_type: str = "relu") -> None:
+    def __init__(self, hidden_dim: int, multiplier: float = 4.0, chn_type: str = "relu", use_bias: bool = True) -> None:
         super().__init__()
         hid_dim = int(multiplier * hidden_dim)
-        self.W = nn.Linear(hidden_dim, hid_dim, bias=True)
+        self.W = nn.Linear(hidden_dim, hid_dim, bias=use_bias)
         self.chn_type = chn_type.lower()
         self.hid_dim = hid_dim
 
     def energy(self, g: torch.Tensor) -> torch.Tensor:
-        """Scalar Hopfield channel energy."""
-        h = self.W(g)   # [N, hid_dim]
+        h = self.W(g)
         if self.chn_type == "relu":
             A = F.relu(h)
             return -0.5 * (A * A).sum()
@@ -172,48 +135,8 @@ class _HNNEnergy(nn.Module):
             raise ValueError(f"Unknown chn_type: {self.chn_type}")
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _segment_logsumexp_2d(src: torch.Tensor, segment_ids: torch.Tensor, num_segments: int) -> torch.Tensor:
-    """
-    Compute logsumexp over segments for a 2D source tensor [E, H].
-    Returns [N, H] output.
-
-    Numerically stable: subtracts per-segment max before exponentiating.
-    """
-    N, H = num_segments, src.size(1)
-    E = src.size(0)
-
-    idx = segment_ids.unsqueeze(1).expand(E, H)  # [E, H]
-
-    # Max per segment
-    seg_max = src.new_full((N, H), float('-inf'))
-    seg_max.scatter_reduce_(0, idx, src, reduce="amax", include_self=True)
-
-    # Expand max back to edges, shift
-    max_expanded = seg_max[segment_ids]   # [E, H]
-    # Replace -inf max (empty segment) with 0 to avoid NaN
-    max_expanded = torch.where(max_expanded == float('-inf'), src.new_zeros(()), max_expanded)
-    x_shifted = src - max_expanded
-
-    # Sum of exps
-    sum_exp = src.new_zeros(N, H)
-    sum_exp.scatter_add_(0, idx, x_shifted.exp())
-
-    lse = sum_exp.log() + seg_max
-    # Where seg_max is still -inf (empty segments), force lse to -inf
-    lse = torch.where(seg_max == float('-inf'), seg_max, lse)
-    return lse
-
-
-# ---------------------------------------------------------------------------
-# ET Block (one block = one ELN + attention energy + HNN energy)
-# ---------------------------------------------------------------------------
-
 class _ETBlock(nn.Module):
-    """A single ET energy block: attention energy + Hopfield channel energy."""
+    """A single ET energy block."""
 
     def __init__(
         self,
@@ -223,58 +146,56 @@ class _ETBlock(nn.Module):
         multiplier: float,
         chn_type: str,
         use_bias_attn: bool,
+        use_bias_norm: bool,
+        use_bias_chn: bool,
     ) -> None:
         super().__init__()
-        self.norm = EnergyLayerNorm(hidden_dim, use_bias=True)
+        self.norm = EnergyLayerNorm(hidden_dim, use_bias=use_bias_norm)
         self.attn = _AttentionEnergy(hidden_dim, num_heads, head_dim, use_bias=use_bias_attn)
-        self.hnn = _HNNEnergy(hidden_dim, multiplier=multiplier, chn_type=chn_type)
+        self.hnn = _HNNEnergy(hidden_dim, multiplier=multiplier, chn_type=chn_type, use_bias=use_bias_chn)
 
     def step(
         self,
         x: torch.Tensor,
         c_2: torch.Tensor,
         u_2: torch.Tensor,
+        adj: Optional[torch.Tensor],
         alpha: float,
+        compute_corr: bool = True,
+        noise_std: float = 0.02,
+        vary_noise: bool = False,
+        step_idx: int = 0,
         create_graph: bool = False,
-    ) -> Tuple[torch.Tensor, float]:
-        """
-        One gradient descent step.
-        Computes grad w.r.t. normalized state g, applies update to original state x.
-        """
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         g = self.norm(x)
         g = g.requires_grad_(True)
-        e = self.energy_from_g(g, c_2, u_2)
+        e = self.energy_from_g(g, c_2, u_2, adj=adj)
         grad, = torch.autograd.grad(e, g, create_graph=create_graph)
-        x_new = x - alpha * grad
-        return x_new, e.detach().item()
+        
+        if vary_noise and noise_std > 0.0:
+            current_noise = noise_std / pow(1.0 + float(step_idx), 0.55)
+        else:
+            current_noise = noise_std
+            
+        noise = torch.zeros_like(grad)
+        if current_noise > 0.0:
+            noise = torch.randn_like(grad) * (alpha ** 0.5) * current_noise
+            
+        x_new = x - alpha * grad + noise
+        return x_new, e.detach()
 
-    def energy_from_g(self, g: torch.Tensor, c_2: torch.Tensor, u_2: torch.Tensor) -> torch.Tensor:
-        """Total energy from normalized state g."""
-        return self.attn.energy(g, c_2, u_2) + self.hnn.energy(g)
+    def energy_from_g(
+        self,
+        g: torch.Tensor,
+        c_2: torch.Tensor,
+        u_2: torch.Tensor,
+        adj: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self.attn.energy(g, c_2, u_2, adj=adj) + self.hnn.energy(g)
 
-    def energy(self, x: torch.Tensor, c_2: torch.Tensor, u_2: torch.Tensor) -> torch.Tensor:
-        """Total energy from original state x (includes ELN)."""
-        g = self.norm(x)
-        return self.energy_from_g(g, c_2, u_2)
-
-
-# ---------------------------------------------------------------------------
-# Full ET Graph Classifier
-# ---------------------------------------------------------------------------
 
 class ETGraphClassifier(nn.Module):
-    """
-    Energy Transformer for graph classification.
-
-    Follows the same forward interface as EnergyGraphClassifier so the existing
-    trainers, DataLoaders, and evaluation scripts work without modification.
-
-    Key differences from GET:
-    - Energy is the sum of a graph-masked attention term and a Hopfield channel term
-    - No motif (3-body) or memory branch
-    - Update rule: x ← x - α * ∇_x E  (single gradient step per iteration)
-    - Multiple ET blocks (depth) can be stacked; each block has its own ELN + params
-    """
+    """Energy Transformer for graph classification."""
 
     def __init__(
         self,
@@ -283,58 +204,63 @@ class ETGraphClassifier(nn.Module):
         num_classes: int,
         num_heads: int,
         head_dim: int,
-        num_steps: int = 5,            # gradient descent iterations per block
-        num_blocks: int = 1,           # number of stacked ET blocks
-        alpha: float = 0.1,            # step size
-        multiplier: float = 4.0,       # HNN hidden expansion ratio
-        chn_type: str = "relu",        # "relu" | "gelu" | "lse"
-        use_bias_attn: bool = False,   # bias in Q/K projections (matches JAX default)
-        update_damping: float = 0.0,   # optional damping: effective_alpha = alpha * (1 - damping)
-        inference_mode_train: str = "fixed",   # always "fixed" for ET (no Armijo)
+        num_steps: int = 5,
+        num_blocks: int = 1,
+        alpha: float = 0.1,
+        multiplier: float = 4.0,
+        chn_type: str = "relu",
+        use_bias_attn: bool = False,
+        use_bias_chn: bool = False,
+        use_bias_norm: bool = True,
+        use_cls_token: bool = True,
+        pos_k: int = 15,
+        embed_type: str = "eigen",
+        flip_sign: bool = False,
+        compute_corr: bool = True,
+        noise_std: float = 0.02,
+        vary_noise: bool = False,
+        readout_mode: str = "cls",
+        update_damping: float = 0.0,
+        inference_mode_train: str = "fixed",
         inference_mode_eval: str = "fixed",
     ) -> None:
         super().__init__()
-
         self.hidden_dim = hidden_dim
         self.num_classes = num_classes
-        self.num_heads = num_heads
-        self.head_dim = head_dim
         self.num_steps = num_steps
         self.num_blocks = num_blocks
-        self.alpha = float(alpha)
-        damping = float(max(0.0, min(update_damping, 1.0)))
-        self.effective_alpha = self.alpha * (1.0 - damping)
-        self.inference_mode_train = inference_mode_train
-        self.inference_mode_eval = inference_mode_eval
-
-        # Training uses create_graph=True for higher-order autodiff
+        self.alpha = float(alpha) * (1.0 - update_damping)
+        self.use_cls_token = bool(use_cls_token)
+        self.pos_k = int(pos_k)
+        self.embed_type = str(embed_type)
+        self.flip_sign = bool(flip_sign)
+        self.compute_corr = bool(compute_corr)
+        self.noise_std = float(noise_std)
+        self.vary_noise = bool(vary_noise)
+        self.readout_mode = str(readout_mode).lower()
         self.requires_double_backward = True
 
-        # Input encoder: linear → ReLU → linear, same as GET
         self.encoder = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # Stack of ET blocks
         self.blocks = nn.ModuleList([
-            _ETBlock(
-                hidden_dim=hidden_dim,
-                num_heads=num_heads,
-                head_dim=head_dim,
-                multiplier=multiplier,
-                chn_type=chn_type,
-                use_bias_attn=use_bias_attn,
-            )
+            _ETBlock(hidden_dim, num_heads, head_dim, multiplier, chn_type, use_bias_attn, use_bias_norm, use_bias_chn)
             for _ in range(num_blocks)
         ])
 
+        self.cls_token = nn.Parameter(torch.randn(1, hidden_dim) * 0.02)
+        pos_dim = self.pos_k if self.embed_type.lower() != "svd" else 2 * self.pos_k
+        self.pos_proj = nn.Linear(pos_dim, hidden_dim) if pos_dim > 0 else None
         self.readout = nn.Linear(hidden_dim, num_classes)
 
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
+    def _pool_graph_mean(self, x_state: torch.Tensor, batch_idx: torch.Tensor, num_graphs: int) -> torch.Tensor:
+        out = x_state.new_zeros((num_graphs, x_state.size(-1)))
+        out.index_add_(0, batch_idx, x_state)
+        counts = torch.bincount(batch_idx, minlength=num_graphs).to(dtype=x_state.dtype).unsqueeze(-1).clamp_min(1.0)
+        return out / counts
 
     def forward(
         self,
@@ -342,39 +268,41 @@ class ETGraphClassifier(nn.Module):
         inference_mode: Optional[str] = None,
         return_solver_stats: bool = False,
     ):
-        x = self.encoder(batch_data["x"])
-        c_2 = batch_data["c_2"]
-        u_2 = batch_data["u_2"]
-        num_graphs = int(batch_data["num_graphs"].item())
-        batch_idx = batch_data["batch"]
-
+        ctx = build_et_batch_context(
+            batch_data,
+            use_cls_token=self.use_cls_token,
+            pos_k=self.pos_k,
+            embed_type=self.embed_type,
+            flip_sign=self.flip_sign,
+        )
         create_graph = self.training
         energy_trace: List[float] = []
-        alpha = self.effective_alpha
 
-        for block in self.blocks:
-            for _ in range(self.num_steps):
-                x, e_val = block.step(x, c_2, u_2, alpha=alpha, create_graph=create_graph)
-                energy_trace.append(e_val)
+        x = self.encoder(batch_data["x"])
+        if self.use_cls_token:
+            x = torch.cat([x, self.cls_token.expand(ctx.num_graphs, -1)], dim=0)
+        if self.pos_proj is not None and ctx.pos.numel() > 0:
+            x = x + self.pos_proj(ctx.pos.to(dtype=x.dtype, device=x.device))
 
-        # Mean pool per graph
-        pooled = self._pool(x, batch_idx, num_graphs)
-        logits = self.readout(pooled)
+        for b_idx, block in enumerate(self.blocks):
+            for s_idx in range(self.num_steps):
+                x, e_val = block.step(
+                    x, ctx.c_2, ctx.u_2, None, self.alpha,
+                    compute_corr=self.compute_corr, noise_std=self.noise_std,
+                    vary_noise=self.vary_noise, step_idx=s_idx + b_idx * self.num_steps,
+                    create_graph=create_graph
+                )
+                energy_trace.append(float(e_val))
+
+        if self.readout_mode == "cls" and self.use_cls_token:
+            graph_repr = x[ctx.original_node_count:]
+        else:
+            graph_repr = self._pool_graph_mean(x[:ctx.original_node_count], batch_data["batch"], ctx.num_graphs)
+
+        logits = self.readout(graph_repr)
         if self.num_classes == 1:
             logits = logits.squeeze(-1)
 
         if return_solver_stats:
-            stats = {
-                "mode": "et_fixed",
-                "alpha": self.effective_alpha,
-                "num_steps": self.num_steps * self.num_blocks,
-                "grad_norms": [],  # not tracked to avoid CUDA syncs
-            }
-            return logits, energy_trace, stats
+            return logits, energy_trace, {"mode": "et_fixed"}
         return logits
-
-    def _pool(self, x: torch.Tensor, batch_idx: torch.Tensor, num_graphs: int) -> torch.Tensor:
-        out = x.new_zeros(num_graphs, x.size(-1))
-        out.index_add(0, batch_idx, x)
-        counts = torch.bincount(batch_idx, minlength=num_graphs).to(dtype=x.dtype).unsqueeze(-1).clamp_min(1.0)
-        return out / counts

@@ -1,0 +1,8 @@
+name: "stage4_tu_nci1"
+in_dim: 32
+max_motifs_per_anchor: 8
+task_type: "multiclass"
+train_ratio: 0.7
+val_ratio: 0.15
+dataset_root: "data"
+tu_name: "NCI1"

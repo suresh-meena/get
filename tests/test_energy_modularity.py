@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from torch_geometric.data import Batch
 
 from get.data import SyntheticGraphDataset, collate_graph_samples
 from get.energy import ENERGY_SPECS, build_energy
@@ -99,6 +100,48 @@ def test_fixed_step_solver_accepts_explicit_gradient_closure():
 
     x_final, _, _ = solver.run(x0, energy_fn, energy_and_grad_fn)
     assert torch.allclose(x_final, torch.tensor([[-1.0]], dtype=torch.float32))
+
+
+def test_collate_graph_samples_preserves_offsets_and_pos():
+    samples = [
+        {
+            "x": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            "y": torch.tensor([1.0]),
+            "c_2": torch.tensor([0], dtype=torch.long),
+            "u_2": torch.tensor([1], dtype=torch.long),
+            "c_3": torch.tensor([0], dtype=torch.long),
+            "u_3": torch.tensor([0], dtype=torch.long),
+            "v_3": torch.tensor([1], dtype=torch.long),
+            "t_tau": torch.tensor([1], dtype=torch.long),
+            "pos": torch.tensor([[0.1], [0.2]]),
+        },
+        {
+            "x": torch.tensor([[5.0, 6.0]]),
+            "y": torch.tensor([0.0]),
+            "c_2": torch.tensor([], dtype=torch.long),
+            "u_2": torch.tensor([], dtype=torch.long),
+            "c_3": torch.tensor([], dtype=torch.long),
+            "u_3": torch.tensor([], dtype=torch.long),
+            "v_3": torch.tensor([], dtype=torch.long),
+            "t_tau": torch.tensor([], dtype=torch.long),
+            "pos": torch.tensor([[0.3]]),
+        },
+    ]
+
+    out = collate_graph_samples(samples)
+
+    assert isinstance(out, Batch)
+    assert out["x"].shape == (3, 2)
+    assert torch.equal(out["x"], torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]))
+    assert torch.equal(out["batch"], torch.tensor([0, 0, 1], dtype=torch.long))
+    assert torch.equal(out["num_graphs"], torch.tensor(2, dtype=torch.long))
+    assert torch.equal(out["c_2"], torch.tensor([0], dtype=torch.long))
+    assert torch.equal(out["u_2"], torch.tensor([1], dtype=torch.long))
+    assert torch.equal(out["c_3"], torch.tensor([0], dtype=torch.long))
+    assert torch.equal(out["u_3"], torch.tensor([0], dtype=torch.long))
+    assert torch.equal(out["v_3"], torch.tensor([1], dtype=torch.long))
+    assert torch.equal(out["t_tau"], torch.tensor([1], dtype=torch.long))
+    assert torch.equal(out["pos"], torch.tensor([[0.1], [0.2], [0.3]]))
 
 
 def test_armijo_eval_backtracks_are_capped():

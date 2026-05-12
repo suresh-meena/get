@@ -28,7 +28,7 @@ class ExternalGraphBaseline(nn.Module):
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         x = batch["x"]
         b = batch["batch"]
-        num_graphs = int(batch["num_graphs"].item())
+        num_graphs = int(batch["y"].shape[0])
 
         pooled = x.new_zeros((num_graphs, x.size(-1)))
         pooled.index_add_(0, b, x)

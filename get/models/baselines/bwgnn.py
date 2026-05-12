@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import math
-import numpy as np
 import scipy.special
 import sympy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import MessagePassing
-from torch_geometric.utils import add_self_loops, degree
+from torch_geometric.utils import degree
 
 
 def calculate_theta2(d: int):
@@ -80,7 +78,7 @@ class BWGNNBaseline(nn.Module):
         x = batch_data["x"]
         edge_index = torch.stack([batch_data["c_2"], batch_data["u_2"]], dim=0) if batch_data["c_2"].numel() > 0 else torch.empty((2, 0), dtype=torch.long, device=x.device)
         batch = batch_data["batch"]
-        num_graphs = int(batch_data["num_graphs"].item())
+        num_graphs = int(batch_data["y"].shape[0])
 
         h = self.act(self.linear1(x))
         h = self.act(self.linear2(h))

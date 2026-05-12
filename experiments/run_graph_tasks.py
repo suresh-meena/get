@@ -6,23 +6,24 @@ import sys
 import statistics
 from pathlib import Path
 from typing import Dict
-from typing import Iterable, List, Optional, Tuple
+from typing import List
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
 from sklearn.model_selection import KFold, StratifiedKFold
+from torch_geometric.loader import DataLoader
+from torch_geometric.utils import to_dense_adj
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from external.graph_baselines.torch_baselines import ExternalGraphBaseline
-from get.data import SyntheticGraphDataset, collate_graph_samples
-from get.models import EnergyGraphClassifier
-from get.trainers import UnifiedTrainer
-from get.utils.seed import seed_everything
-from experiments.protocol.data import split_items, summarize_splits
+from external.graph_baselines.torch_baselines import ExternalGraphBaseline  # noqa: E402
+from get.data import SyntheticGraphDataset  # noqa: E402
+from get.models import EnergyGraphClassifier  # noqa: E402
+from get.trainers import UnifiedTrainer  # noqa: E402
+from get.utils.seed import seed_everything  # noqa: E402
+from experiments.protocol.data import split_items, summarize_splits  # noqa: E402
 
 
 def _apply_task_preset(args: argparse.Namespace) -> argparse.Namespace:
@@ -56,6 +57,86 @@ def _apply_task_preset(args: argparse.Namespace) -> argparse.Namespace:
     raise ValueError(f"Unknown task_preset: {args.task_preset}")
 
 
+def _apply_benchmark_preset(args: argparse.Namespace) -> argparse.Namespace:
+    preset = args.benchmark_preset.lower()
+    if preset == "none":
+        return args
+
+    args.model_name = "etfaithful"
+    args.et_hidden_dim = 128
+    args.et_num_heads = 12
+    args.et_head_dim = 64
+    args.et_num_steps = 1
+    args.et_num_blocks = 4
+    args.et_alpha = 0.1
+    args.et_multiplier = 4.0
+    args.et_chn_type = "relu"
+    args.et_use_bias_attn = False
+    args.et_use_bias_chn = False
+    args.et_use_bias_norm = True
+    args.et_use_cls_token = True
+    args.et_pos_k = 15
+    args.et_embed_type = "eigen"
+    args.et_flip_sign = False
+    args.et_compute_corr = True
+    args.et_noise_std = 0.02
+    args.et_vary_noise = False
+    args.et_readout_mode = "cls"
+    args.lambda_m = 1.0
+    args.use_amp = False
+    args.num_workers = 8
+
+    if preset == "et_zinc":
+        args.dataset_name = "ZINC"
+        args.batch_size = max(1, 128 * (torch.cuda.device_count() if torch.cuda.is_available() else 1))
+        args.eval_batch_size = args.batch_size
+        args.epochs = 50
+        args.patience = 50
+    elif preset == "et_dd":
+        args.dataset_name = "DD"
+        args.batch_size = 64
+        args.eval_batch_size = 64
+        args.epochs = 300
+        args.patience = 300
+    elif preset == "et_tu":
+        args.batch_size = 64
+        args.eval_batch_size = 64
+        args.epochs = 50
+        args.patience = 50
+    else:
+        raise ValueError(f"Unknown benchmark_preset: {args.benchmark_preset}")
+    return args
+
+
+def _loader_kwargs(args: argparse.Namespace) -> Dict[str, object]:
+    kwargs: Dict[str, object] = {
+        "num_workers": args.num_workers,
+        "pin_memory": torch.cuda.is_available(),
+        "persistent_workers": False,
+    }
+    if args.num_workers > 0:
+        kwargs["prefetch_factor"] = 1
+    return kwargs
+
+
+def _runtime_config(args: argparse.Namespace) -> dict:
+    model_name = str(args.model_name).lower()
+    return {
+        "task_preset": args.task_preset,
+        "benchmark_preset": args.benchmark_preset,
+        "dataset_name": args.dataset_name,
+        "model_name": args.model_name,
+        "use_amp": bool(args.use_amp),
+        "amp_dtype": args.amp_dtype,
+        "lambda_m": float(args.lambda_m) if model_name == "fullget" else 0.0,
+        "raw_lambda_m": float(args.lambda_m),
+        "lambda_2": float(args.lambda_2),
+        "lambda_3": float(args.lambda_3),
+        "inference_mode_train": args.inference_mode_train,
+        "inference_mode_eval": args.inference_mode_eval,
+    }
+
+
 def _dataset_task_type(dataset_name: str) -> str:
     return "multiclass" if dataset_name.lower() == "csl" else "binary"
 
@@ -70,9 +151,9 @@ def _remap_multiclass_labels(samples: List[Dict[str, torch.Tensor]]) -> tuple[Li
     mapping = {label: idx for idx, label in enumerate(labels)}
     remapped: List[Dict[str, torch.Tensor]] = []
     for sample in samples:
-        sample_copy = dict(sample)
+        sample_copy = sample.clone() if hasattr(sample, "clone") else dict(sample)
         label = int(sample_copy["y"].view(-1)[0].item())
-        sample_copy["y"] = torch.tensor([float(mapping[label])], dtype=torch.float32)
+        sample_copy["y"] = torch.tensor([float(mapping[label])], dtype=torch.float32, device=sample_copy["y"].device)
         remapped.append(sample_copy)
     return remapped, len(labels)
 
@@ -86,7 +167,7 @@ def _build_tudataset_loaders(args: argparse.Namespace):
         max_motifs_per_anchor=args.max_motifs_per_anchor,
         task_type="auto"
     )
-    all_samples = [dataset[i] for i in range(len(dataset))]
+    all_samples = dataset.items if hasattr(dataset, "items") else [dataset[i] for i in range(len(dataset))]
     if args.max_graphs > 0:
         all_samples = all_samples[:args.max_graphs]
 
@@ -109,10 +190,11 @@ def _build_loaders_from_samples(train_items, val_items, test_items, args, task_t
     val_ds = _ListGraphDataset(val_items)
     test_ds = _ListGraphDataset(test_items)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
+    loader_kwargs = _loader_kwargs(args)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
     eval_bs = args.eval_batch_size or args.batch_size
-    val_loader = DataLoader(val_ds, batch_size=eval_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
-    test_loader = DataLoader(test_ds, batch_size=eval_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
+    val_loader = DataLoader(val_ds, batch_size=eval_bs, shuffle=False, **loader_kwargs)
+    test_loader = DataLoader(test_ds, batch_size=eval_bs, shuffle=False, **loader_kwargs)
     
     split_stats = summarize_splits({"train": train_items, "val": val_items, "test": test_items}, task_type=task_type)
     return train_loader, val_loader, test_loader, split_stats
@@ -137,11 +219,12 @@ def _build_loaders(args: argparse.Namespace):
     val_ds = SyntheticGraphDataset(num_graphs=args.num_val_graphs, seed=args.seed + 1, **common)
     test_ds = SyntheticGraphDataset(num_graphs=args.num_test_graphs, seed=args.seed + 2, **common)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
+    loader_kwargs = _loader_kwargs(args)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
     eval_bs = args.eval_batch_size or args.batch_size
-    val_loader = DataLoader(val_ds, batch_size=eval_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
-    test_loader = DataLoader(test_ds, batch_size=eval_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
-    split_stats = summarize_splits({"train": list(train_ds), "val": list(val_ds), "test": list(test_ds)}, task_type="binary")
+    val_loader = DataLoader(val_ds, batch_size=eval_bs, shuffle=False, **loader_kwargs)
+    test_loader = DataLoader(test_ds, batch_size=eval_bs, shuffle=False, **loader_kwargs)
+    split_stats = summarize_splits({"train": train_ds.items, "val": val_ds.items, "test": test_ds.items}, task_type="binary")
     return train_loader, val_loader, test_loader, split_stats, "binary", 1
 
 
@@ -159,9 +242,7 @@ def _pyg_data_to_sample(data, in_dim: int, max_motifs_per_anchor: int, task_type
     elif x.size(1) > in_dim:
         x = x[:, :in_dim]
 
-    adj = torch.zeros((n, n), dtype=torch.bool)
-    if edge_index.numel() > 0:
-        adj[edge_index[0], edge_index[1]] = True
+    adj = to_dense_adj(edge_index, max_num_nodes=n).squeeze(0).to(dtype=torch.bool)
     adj.fill_diagonal_(False)
 
     y = data.y
@@ -234,30 +315,15 @@ def _build_real_stage2_loaders(args: argparse.Namespace):
     val_ds = _ListGraphDataset(val_items)
     test_ds = _ListGraphDataset(test_items)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
+    loader_kwargs = _loader_kwargs(args)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
     eval_bs = args.eval_batch_size or args.batch_size
-    val_loader = DataLoader(val_ds, batch_size=eval_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
-    test_loader = DataLoader(test_ds, batch_size=eval_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
+    val_loader = DataLoader(val_ds, batch_size=eval_bs, shuffle=False, **loader_kwargs)
+    test_loader = DataLoader(test_ds, batch_size=eval_bs, shuffle=False, **loader_kwargs)
     split_stats = summarize_splits({"train": train_items, "val": val_items, "test": test_items}, task_type=task_type)
     return train_loader, val_loader, test_loader, split_stats, task_type, num_classes
 
 
-def _build_loaders_from_samples(
-    train_items: List[Dict[str, torch.Tensor]],
-    val_items: List[Dict[str, torch.Tensor]],
-    test_items: List[Dict[str, torch.Tensor]],
-    args: argparse.Namespace,
-    task_type: str,
-):
-    train_ds = _ListGraphDataset(train_items)
-    val_ds = _ListGraphDataset(val_items)
-    test_ds = _ListGraphDataset(test_items)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
-    eval_bs = args.eval_batch_size or args.batch_size
-    val_loader = DataLoader(val_ds, batch_size=eval_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
-    test_loader = DataLoader(test_ds, batch_size=eval_bs, shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_graph_samples)
-    split_stats = summarize_splits({"train": train_items, "val": val_items, "test": test_items}, task_type=task_type)
-    return train_loader, val_loader, test_loader, split_stats
 
 
 def _run_single_fit(
@@ -332,16 +398,26 @@ def _build_model(args: argparse.Namespace, task_type: str, num_classes: int) -> 
         from get.models import ETGraphClassifier
         return ETGraphClassifier(
             in_dim=args.in_dim,
-            hidden_dim=args.hidden_dim,
+            hidden_dim=getattr(args, "et_hidden_dim", args.hidden_dim),
             num_classes=out_dim,
-            num_steps=args.num_steps,
-            num_heads=args.num_heads,
-            head_dim=args.head_dim,
-            num_blocks=getattr(args, "et_num_blocks", 1),
-            alpha=args.fixed_step_size,
+            num_steps=getattr(args, "et_num_steps", 1),
+            num_heads=getattr(args, "et_num_heads", args.num_heads),
+            head_dim=getattr(args, "et_head_dim", args.head_dim),
+            num_blocks=getattr(args, "et_num_blocks", 4),
+            alpha=getattr(args, "et_alpha", args.fixed_step_size),
             multiplier=getattr(args, "et_multiplier", 4.0),
             chn_type=getattr(args, "et_chn_type", "relu"),
             use_bias_attn=getattr(args, "et_use_bias_attn", False),
+            use_bias_chn=getattr(args, "et_use_bias_chn", False),
+            use_bias_norm=getattr(args, "et_use_bias_norm", True),
+            use_cls_token=getattr(args, "et_use_cls_token", True),
+            pos_k=getattr(args, "et_pos_k", 15),
+            embed_type=getattr(args, "et_embed_type", "eigen"),
+            flip_sign=getattr(args, "et_flip_sign", False),
+            compute_corr=getattr(args, "et_compute_corr", True),
+            noise_std=getattr(args, "et_noise_std", 0.02),
+            vary_noise=getattr(args, "et_vary_noise", False),
+            readout_mode=getattr(args, "et_readout_mode", "cls"),
             update_damping=args.update_damping,
             inference_mode_train=args.inference_mode_train,
             inference_mode_eval=args.inference_mode_eval,
@@ -352,7 +428,7 @@ def _build_model(args: argparse.Namespace, task_type: str, num_classes: int) -> 
             in_dim=args.in_dim,
             hidden_dim=args.hidden_dim,
             num_classes=out_dim,
-            d=getattr(args, "bwgnn_order", 2)
+            d=getattr(args, "bwgnn_order", 3)
         )
     if name in {"graphtransformer", "gt"}:
         from get.models.baselines import GraphTransformerBaseline
@@ -361,9 +437,9 @@ def _build_model(args: argparse.Namespace, task_type: str, num_classes: int) -> 
             hidden_dim=args.hidden_dim,
             num_classes=out_dim,
             num_heads=getattr(args, "gt_num_heads", getattr(args, "num_heads", 4)),
-            n_layers=getattr(args, "gt_num_layers", getattr(args, "num_steps", 6)),
-            dropout=getattr(args, "gt_dropout", 0.0),
-            ffn_ratio=getattr(args, "gt_ffn_ratio", 2),
+            n_layers=getattr(args, "gt_num_layers", getattr(args, "num_steps", 8)),
+            dropout=getattr(args, "gt_dropout", 0.2),
+            ffn_ratio=getattr(args, "gt_ffn_ratio", 4),
             layer_norm=getattr(args, "gt_layer_norm", True),
             residual=getattr(args, "gt_residual", True)
         )
@@ -388,7 +464,7 @@ def _build_model(args: argparse.Namespace, task_type: str, num_classes: int) -> 
         num_motif_types=2,
         lambda_2=args.lambda_2,
         lambda_3=args.lambda_3 if energy_name == "get_full" else 0.0,
-        lambda_m=args.lambda_m,
+        lambda_m=args.lambda_m if energy_name == "get_full" else 0.0,
         beta_2=args.beta_2,
         beta_3=args.beta_3,
         beta_m=args.beta_m,
@@ -413,6 +489,7 @@ def main() -> None:
         default="none",
         choices=["none", "csl", "brec", "graph_classification", "graph_anomaly"],
     )
+    p.add_argument("--benchmark_preset", type=str, default="none", choices=["none", "et_tu", "et_zinc", "et_dd"])
     p.add_argument("--dataset_name", type=str, default="synthetic")
     p.add_argument("--dataset_root", type=str, default="data")
     p.add_argument("--brec_file", type=str, default="")
@@ -431,16 +508,16 @@ def main() -> None:
     p.add_argument("--in_dim", type=int, default=32)
     p.add_argument("--max_motifs_per_anchor", type=int, default=8)
 
-    p.add_argument("--hidden_dim", type=int, default=128)
-    p.add_argument("--num_heads", type=int, default=4)
+    p.add_argument("--hidden_dim", type=int, default=192)
+    p.add_argument("--num_heads", type=int, default=6)
     p.add_argument("--head_dim", type=int, default=32)
-    p.add_argument("--num_steps", type=int, default=4)
-    p.add_argument("--R", type=int, default=2)
-    p.add_argument("--K", type=int, default=8)
+    p.add_argument("--num_steps", type=int, default=8)
+    p.add_argument("--R", type=int, default=3)
+    p.add_argument("--K", type=int, default=48)
 
     p.add_argument("--lambda_2", type=float, default=1.0)
     p.add_argument("--lambda_3", type=float, default=10.0)
-    p.add_argument("--lambda_m", type=float, default=0.0)
+    p.add_argument("--lambda_m", type=float, default=1.0)
     p.add_argument("--beta_2", type=float, default=1.0)
     p.add_argument("--beta_3", type=float, default=1.0)
     p.add_argument("--beta_m", type=float, default=1.0)
@@ -456,28 +533,43 @@ def main() -> None:
     p.add_argument("--inference_mode_eval", type=str, default="armijo", choices=["fixed", "armijo"])
     
     # ET-specific parameters
-    p.add_argument("--et_num_blocks", type=int, default=1)
+    p.add_argument("--et_num_blocks", type=int, default=4)
+    p.add_argument("--et_hidden_dim", type=int, default=128)
+    p.add_argument("--et_num_heads", type=int, default=12)
+    p.add_argument("--et_head_dim", type=int, default=64)
+    p.add_argument("--et_num_steps", type=int, default=1)
+    p.add_argument("--et_alpha", type=float, default=0.1)
     p.add_argument("--et_multiplier", type=float, default=4.0)
     p.add_argument("--et_chn_type", type=str, default="relu", choices=["relu", "gelu", "lse"])
     p.add_argument("--et_use_bias_attn", action="store_true", default=False)
+    p.add_argument("--et_use_bias_chn", action="store_true", default=False)
+    p.add_argument("--et_use_bias_norm", action="store_true", default=True)
+    p.add_argument("--et_use_cls_token", action="store_true", default=True)
+    p.add_argument("--et_pos_k", type=int, default=15)
+    p.add_argument("--et_embed_type", type=str, default="eigen", choices=["eigen", "svd"])
+    p.add_argument("--et_flip_sign", action="store_true", default=False)
+    p.add_argument("--et_compute_corr", action="store_true", default=True)
+    p.add_argument("--et_noise_std", type=float, default=0.02)
+    p.add_argument("--et_vary_noise", action="store_true", default=False)
+    p.add_argument("--et_readout_mode", type=str, default="cls", choices=["cls", "mean"])
 
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--eval_batch_size", type=int, default=16)
-    p.add_argument("--num_workers", type=int, default=0)
+    p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--patience", type=int, default=3)
     
     # BWGNN-specific parameters
-    p.add_argument("--bwgnn_order", type=int, default=2, help="Order for BWGNN polynomial filter")
+    p.add_argument("--bwgnn_order", type=int, default=3, help="Order for BWGNN polynomial filter")
     
     # GraphTransformer-specific parameters
     p.add_argument("--gt_num_heads", type=int, default=4, help="Number of heads for Graph Transformer")
-    p.add_argument("--gt_num_layers", type=int, default=2, help="Number of layers for Graph Transformer")
-    p.add_argument("--gt_dropout", type=float, default=0.0, help="Dropout for Graph Transformer")
-    p.add_argument("--gt_ffn_ratio", type=int, default=2, help="FFN expansion ratio for Graph Transformer")
+    p.add_argument("--gt_num_layers", type=int, default=3, help="Number of layers for Graph Transformer")
+    p.add_argument("--gt_dropout", type=float, default=0.2, help="Dropout for Graph Transformer")
+    p.add_argument("--gt_ffn_ratio", type=int, default=4, help="FFN expansion ratio for Graph Transformer")
     p.add_argument("--gt_layer_norm", action="store_true", default=True, help="Use layer norm in Graph Transformer")
     p.add_argument("--gt_residual", action="store_true", default=True, help="Use residual in Graph Transformer")
 
@@ -492,9 +584,10 @@ def main() -> None:
     p.add_argument("--compile_scope", type=str, default="eval_only", choices=["eval_only", "all"])
 
     p.add_argument("--output", type=str, default="outputs/graph_tasks/last_metrics.json")
-    p.add_argument("--num_runs", type=int, default=3, help="Number of independent runs with different seeds")
+    p.add_argument("--num_runs", type=int, default=1, help="Number of independent runs with different seeds")
     args = p.parse_args()
     args = _apply_task_preset(args)
+    args = _apply_benchmark_preset(args)
 
     seed_everything(args.seed)
     if args.device == "cuda":
@@ -522,7 +615,7 @@ def main() -> None:
             elif args.dataset_name.lower() in real_datasets:
                 from get.data import RealWorldGraphDataset
                 dataset = RealWorldGraphDataset(name=args.dataset_name, root=args.dataset_root, in_dim=args.in_dim, max_motifs_per_anchor=args.max_motifs_per_anchor, task_type="auto")
-                all_samples = [dataset[i] for i in range(len(dataset))]
+                all_samples = dataset.items if hasattr(dataset, "items") else [dataset[i] for i in range(len(dataset))]
                 num_classes = dataset.num_classes
                 task_type = dataset.task_type
             else:
@@ -552,6 +645,7 @@ def main() -> None:
                 m = _run_single_fit(args=args, device=device, train_loader=train_loader, val_loader=val_loader, test_loader=test_loader, task_type=task_type, num_classes=num_classes)
                 m["fold"] = fold_idx
                 m["split_stats"] = fold_split_stats
+                m["runtime_config"] = _runtime_config(args)
                 fold_metrics.append(m)
 
             test_accs = [float(m["test"]["acc"]) for m in fold_metrics]
@@ -564,6 +658,7 @@ def main() -> None:
                 "num_classes": int(num_classes),
                 "fold_metrics": fold_metrics,
                 "split_stats": summarize_splits({"all": all_samples}, task_type=task_type),
+                "runtime_config": _runtime_config(args),
                 "summary": {
                     "test_acc_mean": float(statistics.mean(test_accs)),
                     "test_acc_std": float(statistics.pstdev(test_accs) if len(test_accs) > 1 else 0.0),
@@ -587,6 +682,7 @@ def main() -> None:
             metrics["task_type"] = task_type
             metrics["num_classes"] = int(num_classes)
             metrics["split_stats"] = split_stats
+            metrics["runtime_config"] = _runtime_config(args)
         
         all_run_metrics.append(metrics)
 

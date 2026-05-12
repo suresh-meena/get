@@ -4,194 +4,183 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Dict, List, Any
 
 import numpy as np
 import torch
-from sklearn.model_selection import KFold, StratifiedKFold
+from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from get.data.synthetic import collate_graph_samples
 from get.utils.seed import seed_everything
-
-from experiments.protocol.data import ListGraphDataset, build_dataset, summarize_splits
-from experiments.protocol.registry import TASK_SPECS
-from experiments.protocol.training import fit_once, make_loaders
+from get.data import (
+    ListGraphDataset, 
+    build_dataset, 
+    summarize_splits, 
+    TASK_SPECS, 
+    get_k_fold_splits, 
+    collate_graph_samples,
+    split_items
+)
+from get.models import build_model
+from get.trainers import UnifiedTrainer
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Full protocol runner (Stage 1-4)")
     p.add_argument("--task", type=str, required=True, choices=sorted(TASK_SPECS.keys()))
-    p.add_argument("--model_name", type=str, default="fullget", choices=["fullget", "pairwiseget", "quadratic_only", "et", "etfaithful", "external_baseline", "gin", "gcn", "gat"])
+    p.add_argument("--model_name", type=str, default="fullget", choices=["fullget", "pairwiseget", "quadratic_only", "et", "etfaithful", "gt", "bwgnn", "external_baseline", "gin", "gcn", "gat"])
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--dataset_root", type=str, default="data")
-    p.add_argument("--brec_file", type=str, default="")
     p.add_argument("--tu_name", type=str, default="MUTAG")
     p.add_argument("--cv_folds", type=int, default=1)
-    p.add_argument("--max_graphs", type=int, default=0)
-    p.add_argument("--ego_hops", type=int, default=1)
-
     p.add_argument("--seed", type=int, default=123)
-    p.add_argument("--min_nodes", type=int, default=10)
-    p.add_argument("--max_nodes", type=int, default=20)
-    p.add_argument("--edge_prob", type=float, default=0.2)
     p.add_argument("--in_dim", type=int, default=32)
     p.add_argument("--max_motifs_per_anchor", type=int, default=8)
-
+    p.add_argument("--max_graphs", type=int, default=0)
+    p.add_argument("--train_ratio", type=float, default=0.7)
+    p.add_argument("--val_ratio", type=float, default=0.15)
+    
+    # Model parameters
     p.add_argument("--hidden_dim", type=int, default=128)
     p.add_argument("--num_heads", type=int, default=4)
     p.add_argument("--head_dim", type=int, default=32)
-    p.add_argument("--num_steps", type=int, default=4)
-    p.add_argument("--R", type=int, default=2)
-    p.add_argument("--K", type=int, default=8)
+    p.add_argument("--num_steps", type=int, default=8)
+    p.add_argument("--num_blocks", type=int, default=1)
+    
+    # GET specific
     p.add_argument("--lambda_2", type=float, default=1.0)
     p.add_argument("--lambda_3", type=float, default=10.0)
-    p.add_argument("--lambda_m", type=float, default=0.0)
+    p.add_argument("--lambda_m", type=float, default=1.0)
     p.add_argument("--beta_2", type=float, default=1.0)
     p.add_argument("--beta_3", type=float, default=1.0)
     p.add_argument("--beta_m", type=float, default=1.0)
-    p.add_argument("--update_damping", type=float, default=0.0)
-    p.add_argument("--fixed_step_size", type=float, default=0.1)
-    p.add_argument("--armijo_eta0", type=float, default=0.2)
-    p.add_argument("--armijo_gamma", type=float, default=0.5)
-    p.add_argument("--armijo_c", type=float, default=1e-4)
-    p.add_argument("--armijo_max_backtracks", type=int, default=20)
-    p.add_argument("--armijo_eval_max_backtracks", type=int, default=5)
-    p.add_argument("--inference_mode_train", type=str, default="fixed", choices=["fixed", "armijo"])
-    p.add_argument("--inference_mode_eval", type=str, default="armijo", choices=["fixed", "armijo"])
     
-    # ET-specific parameters
-    p.add_argument("--et_num_blocks", type=int, default=1)
-    p.add_argument("--et_multiplier", type=float, default=4.0)
-    p.add_argument("--et_chn_type", type=str, default="relu", choices=["relu", "gelu", "lse"])
-    p.add_argument("--et_use_bias_attn", action="store_true", default=False)
+    # ET specific
+    p.add_argument("--alpha", type=float, default=0.1)
+    p.add_argument("--multiplier", type=float, default=4.0)
+    p.add_argument("--pos_k", type=int, default=15)
     
-    # New flags for GET optimization
-    p.add_argument("--use_energy_norm", action="store_true", default=True)
-    p.add_argument("--no_energy_norm", action="store_false", dest="use_energy_norm")
-    p.add_argument("--agg_mode", type=str, default="softmax", choices=["softmax", "sum"])
-
-    p.add_argument("--epochs", type=int, default=3)
-    p.add_argument("--batch_size", type=int, default=16)
-    p.add_argument("--eval_batch_size", type=int, default=16)
-    p.add_argument("--num_workers", type=int, default=0)
-    p.add_argument("--pin_memory", action="store_true")
+    # Training parameters
+    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-4)
-    
-    # AMP & Compile
-    p.add_argument("--use_amp", action="store_true")
-    p.add_argument("--amp_dtype", type=str, default="fp16", choices=["fp16", "bf16"])
-    p.add_argument("--max_grad_norm", type=float, default=1.0)
-    p.add_argument("--compile", action="store_true")
-    p.add_argument("--compile_backend", type=str, default="inductor")
-    p.add_argument("--compile_dynamic", action="store_true", default=True)
-    p.add_argument("--compile_mode", type=str, default="default")
-    p.add_argument("--compile_allow_double_backward", action="store_true")
-    p.add_argument("--compile_scope", type=str, default="eval_only", choices=["eval_only", "all"])
+    p.add_argument("--use_amp", action="store_true", default=True)
+    p.add_argument("--no_amp", action="store_false", dest="use_amp")
+    p.add_argument("--patience", type=int, default=20)
     
     p.add_argument("--output", type=str, default="outputs/protocol/last_metrics.json")
     return p
 
 
-def resolve_device(device_arg: str) -> torch.device:
-    if device_arg == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(device_arg)
+def run_experiment(args: argparse.Namespace, tr_items, va_items, te_items, task_type: str, num_classes: int, device: torch.device) -> Dict:
+    # Map argparse to the factory config format
+    cfg_dict = vars(args)
+    # Factory expects some specific keys
+    cfg_dict["task_type"] = task_type
+    cfg_dict["num_classes"] = num_classes
+    
+    # Convert to DictConfig for factory
+    cfg = DictConfig(cfg_dict)
+    
+    model = build_model(cfg).to(device)
+    
+    trainer_cfg = {
+        "epochs": args.epochs,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "patience": args.patience,
+        "use_amp": args.use_amp,
+        "task_type": task_type,
+        "num_classes": num_classes
+    }
+    
+    train_loader = DataLoader(ListGraphDataset(tr_items), batch_size=args.batch_size, shuffle=True, collate_fn=collate_graph_samples)
+    val_loader = DataLoader(ListGraphDataset(va_items), batch_size=args.batch_size, shuffle=False, collate_fn=collate_graph_samples)
+    test_loader = DataLoader(ListGraphDataset(te_items), batch_size=args.batch_size, shuffle=False, collate_fn=collate_graph_samples)
+    
+    trainer = UnifiedTrainer(model=model, device=device, trainer_cfg=trainer_cfg)
+    return trainer.fit(train_loader, val_loader, test_loader)
 
 
 def main():
-    args = build_arg_parser().parse_args()
+    parser = build_arg_parser()
+    args = parser.parse_args()
     seed_everything(args.seed)
-    args.eval_batch_size = args.eval_batch_size or args.batch_size
-    device = resolve_device(args.device)
-
+    
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
+        
     spec = TASK_SPECS[args.task]
+    task_type = spec.task_type
+    
+    # Load dataset
     items, num_classes = build_dataset(args.task, args)
-    total_graphs = sum(len(v) for v in items.values()) if isinstance(items, dict) else len(items)
-    if total_graphs < 4:
-        raise RuntimeError("Dataset too small after loading; increase --max_graphs or fix dataset path")
-
-    if args.cv_folds > 1 and args.task == "stage2_csl":
-        if not isinstance(items, dict):
-            raise RuntimeError("stage2_csl cross-validation requires split-preserving official splits")
-
-        trainval_items = list(items["train"]) + list(items["val"])
-        test_items = list(items["test"])
-        if len(trainval_items) < args.cv_folds:
-            raise RuntimeError(f"Not enough train/val samples ({len(trainval_items)}) for cv_folds={args.cv_folds}")
-
-        trainval_labels = np.array([int(sample["y"].view(-1)[0].item()) for sample in trainval_items])
-        try:
-            splitter = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=args.seed)
-            fold_iter = splitter.split(np.arange(len(trainval_items)), trainval_labels)
-        except ValueError:
-            splitter = KFold(n_splits=args.cv_folds, shuffle=True, random_state=args.seed)
-            fold_iter = splitter.split(np.arange(len(trainval_items)))
-        fold = []
-        for i, (train_idx, val_idx) in enumerate(fold_iter, start=1):
-            tr_items = [trainval_items[j] for j in train_idx.tolist()]
-            va_items = [trainval_items[j] for j in val_idx.tolist()]
-            tr = DataLoader(ListGraphDataset(tr_items), batch_size=args.batch_size, shuffle=True, collate_fn=collate_graph_samples, num_workers=args.num_workers, pin_memory=args.pin_memory)
-            va = DataLoader(ListGraphDataset(va_items), batch_size=args.eval_batch_size, shuffle=False, collate_fn=collate_graph_samples, num_workers=args.num_workers, pin_memory=args.pin_memory)
-            te = DataLoader(ListGraphDataset(test_items), batch_size=args.eval_batch_size, shuffle=False, collate_fn=collate_graph_samples, num_workers=args.num_workers, pin_memory=args.pin_memory)
-            m = fit_once(args, spec.task_type, num_classes, tr, va, te, device)
-            m["fold"] = i
-            m["split_stats"] = summarize_splits({"train": tr_items, "val": va_items, "test": test_items}, task_type=spec.task_type)
-            fold.append(m)
-        accs = [f["test"].get("acc", 0.0) for f in fold]
-        losses = [f["test"].get("loss", 0.0) for f in fold]
-        result = {
+    
+    all_results = []
+    
+    if args.cv_folds > 1:
+        print(f"\n>>> Starting {args.cv_folds}-fold Cross-Validation for {args.task} (Model: {args.model_name})")
+        # Ensure items is a list for k-fold
+        if isinstance(items, dict):
+            # If already split, we merge back if allowed or raise error
+            if args.task in {"stage3_zinc", "stage3_molhiv"}:
+                 raise ValueError("k-fold CV is not supported for datasets with official fixed splits.")
+            items_list = items["train"] + items["val"] + items["test"]
+        else:
+            items_list = items
+            
+        folds = get_k_fold_splits(items_list, num_folds=args.cv_folds, seed=args.seed, task_type=task_type)
+        for fold_idx, (tr, va, te) in enumerate(folds):
+            print(f"\n>>> Fold {fold_idx + 1}/{args.cv_folds}")
+            metrics = run_experiment(args, tr, va, te, task_type, num_classes, device)
+            metrics["fold"] = fold_idx + 1
+            all_results.append(metrics)
+            
+        # Summary
+        import statistics
+        score_key = "acc" if task_type != "regression" else "mae"
+        scores = [r["test"][score_key] for r in all_results]
+        summary = {
+            "test_metric_mean": statistics.mean(scores),
+            "test_metric_std": statistics.stdev(scores) if len(scores) > 1 else 0.0,
+            "num_folds": args.cv_folds
+        }
+        final_output = {
             "task": args.task,
-            "cv_folds": args.cv_folds,
-            "fold_metrics": fold,
-            "split_stats": summarize_splits(items, task_type=spec.task_type),
-            "summary": {
-                "test_metric_mean": float(np.mean(accs) if accs else 0.0),
-                "test_metric_std": float(np.std(accs) if accs else 0.0),
-                "test_loss_mean": float(np.mean(losses) if losses else 0.0),
-                "test_loss_std": float(np.std(losses) if losses else 0.0),
-            },
+            "model": args.model_name,
+            "summary": summary,
+            "all_results": all_results
         }
     else:
+        print(f"\n>>> Starting single run for {args.task} (Model: {args.model_name})")
         if isinstance(items, dict):
-            tr = DataLoader(
-                ListGraphDataset(items["train"]),
-                batch_size=args.batch_size,
-                shuffle=True,
-                collate_fn=collate_graph_samples,
-                num_workers=args.num_workers,
-                pin_memory=args.pin_memory,
-            )
-            va = DataLoader(
-                ListGraphDataset(items["val"]),
-                batch_size=args.eval_batch_size,
-                shuffle=False,
-                collate_fn=collate_graph_samples,
-                num_workers=args.num_workers,
-                pin_memory=args.pin_memory,
-            )
-            te = DataLoader(
-                ListGraphDataset(items["test"]),
-                batch_size=args.eval_batch_size,
-                shuffle=False,
-                collate_fn=collate_graph_samples,
-                num_workers=args.num_workers,
-                pin_memory=args.pin_memory,
-            )
-            split_stats = summarize_splits(items, task_type=spec.task_type)
+            tr, va, te = items["train"], items["val"], items["test"]
         else:
-            tr, va, te, split_stats = make_loaders(items, args, task_type=spec.task_type, return_split_stats=True)
-        m = fit_once(args, spec.task_type, num_classes, tr, va, te, device)
-        result = {"task": args.task, "stage": spec.stage, "metrics": m, "split_stats": split_stats}
-
-    out = Path(args.output)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(result, indent=2), encoding="utf-8")
-    print(json.dumps(result, indent=2))
+            tr, va, te = split_items(items, seed=args.seed, train_ratio=args.train_ratio, val_ratio=args.val_ratio, task_type=task_type)
+            
+        metrics = run_experiment(args, tr, va, te, task_type, num_classes, device)
+        final_output = {
+            "task": args.task,
+            "model": args.model_name,
+            "metrics": metrics
+        }
+        
+    # Save output
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(final_output, indent=2))
+    print(f"\nResults saved to {args.output}")
+    if "summary" in final_output:
+        print(json.dumps(final_output["summary"], indent=2))
+    else:
+        print(json.dumps(final_output["metrics"]["test"], indent=2))
 
 
 if __name__ == "__main__":

@@ -30,7 +30,8 @@ class GETEnergy(nn.Module):
         E_mem = self.memory(G, batch, num_graphs, params, projections)
         
         lambda_sum = params.get('lambda_sum', 0.0)
-        if hasattr(lambda_sum, 'item'): lambda_sum = lambda_sum.item()
+        if hasattr(lambda_sum, 'item'):
+            lambda_sum = lambda_sum.item()
         E_sum = 0.0
         if lambda_sum > 0:
             E_sum = lambda_sum * self.linear_agg(X, c_2, u_2, batch, num_graphs)

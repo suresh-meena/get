@@ -1,10 +1,10 @@
 name: "GraphTransformer"
 factory: "gt"
-hidden_dim: 64
+hidden_dim: 96
 num_classes: 2
-gt_num_heads: 2
-gt_num_layers: 1
-gt_dropout: 0.3
+gt_num_heads: 4
+gt_num_layers: 3
+gt_dropout: 0.2
 gt_ffn_ratio: 4
 gt_layer_norm: true
 gt_residual: false
