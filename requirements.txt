@@ -1,4 +1,4 @@
-# Development requirements for the GET repository.
+# Unified requirements for the GET repository.
 # CUDA 12.6 is the preferred GPU stack for current experiments.
 # Install with:
 #   python -m pip install -U pip
