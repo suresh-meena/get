@@ -84,7 +84,7 @@ def _apply_benchmark_preset(args: argparse.Namespace) -> argparse.Namespace:
     args.et_vary_noise = False
     args.et_readout_mode = "cls"
     args.lambda_m = 1.0
-    args.use_amp = False
+    args.use_amp = True
     args.num_workers = 8
 
     if preset == "et_zinc":
@@ -321,7 +321,7 @@ def _run_single_fit(
         "mode": getattr(args, "compile_mode", "default") if getattr(args, "compile_mode", "default") != "default" else None,
         "allow_double_backward": getattr(args, "compile_allow_double_backward", False),
     }
-    compile_scope = str(getattr(args, "compile_scope", "eval_only")).lower()
+    compile_scope = str(getattr(args, "compile_scope", "all")).lower()
     if compile_cfg["enabled"]:
         if compile_scope == "all":
             if getattr(model, "requires_double_backward", False):
@@ -559,14 +559,16 @@ def main() -> None:
     p.add_argument("--gt_residual", action="store_true", default=True, help="Use residual in Graph Transformer")
 
     # AMP & Compile
-    p.add_argument("--use_amp", action="store_true")
-    p.add_argument("--amp_dtype", type=str, default="fp16", choices=["fp16", "bf16"])
-    p.add_argument("--compile", action="store_true")
+    p.add_argument("--use_amp", action="store_true", default=True)
+    p.add_argument("--no_amp", action="store_false", dest="use_amp")
+    p.add_argument("--amp_dtype", type=str, default="bf16", choices=["fp16", "bf16"])
+    p.add_argument("--compile", action="store_true", default=True)
+    p.add_argument("--no_compile", action="store_false", dest="compile")
     p.add_argument("--compile_backend", type=str, default="inductor")
     p.add_argument("--compile_dynamic", action="store_true", default=True)
     p.add_argument("--compile_mode", type=str, default="default")
     p.add_argument("--compile_allow_double_backward", action="store_true")
-    p.add_argument("--compile_scope", type=str, default="eval_only", choices=["eval_only", "all"])
+    p.add_argument("--compile_scope", type=str, default="all", choices=["all", "eval_only"])
 
     p.add_argument("--output", type=str, default="outputs/graph_tasks/last_metrics.json")
     p.add_argument("--num_runs", type=int, default=1, help="Number of independent runs with different seeds")

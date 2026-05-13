@@ -3,24 +3,30 @@ import torch.nn.functional as F
 from torch_geometric.utils import degree
 
 
+def scatter_sum(src: torch.Tensor, index: torch.Tensor, dim: int, dim_size: int) -> torch.Tensor:
+    index = index.view(-1, *([1] * (src.dim() - 1))).expand_as(src)
+    size = list(src.shape)
+    size[dim] = dim_size
+    return torch.scatter_reduce(src.new_zeros(size), dim, index, src, "sum", include_self=False)
+
+
 def segment_logsumexp(x: torch.Tensor, segment_ids: torch.Tensor, num_segments: int, dim: int = -1):
     if dim < 0:
         dim = x.dim() + dim
 
-    x_moved = x.movedim(dim, 0)
-    index = segment_ids.view(-1, *([1] * (x_moved.dim() - 1))).expand_as(x_moved)
+    index = segment_ids.view(-1, *([1] * (x.dim() - 1))).expand_as(x)
+    size = [num_segments] + list(x.shape[1:])
 
-    out_max = x_moved.new_full((num_segments, *x_moved.shape[1:]), float("-inf"))
-    out_max.scatter_reduce_(0, index, x_moved, reduce="amax", include_self=True)
+    out_max = torch.scatter_reduce(x.new_full(size, float("-inf")), dim, index, x, "amax", include_self=False)
 
-    max_expanded = out_max.index_select(0, segment_ids)
+    idx_shape = [1] * x.dim()
+    idx_shape[dim] = len(segment_ids)
+    max_expanded = out_max.gather(dim, segment_ids.view(*idx_shape).expand_as(x))
     max_expanded = torch.where(torch.isneginf(max_expanded), torch.zeros_like(max_expanded), max_expanded)
-    x_shifted = x_moved - max_expanded
+    x_shifted = x - max_expanded
 
-    out_sum = x_moved.new_zeros((num_segments, *x_moved.shape[1:]))
-    out_sum.scatter_add_(0, index, torch.exp(x_shifted))
-    result = torch.log(out_sum.clamp_min(1e-12)) + out_max
-    return result.movedim(0, dim)
+    out_sum = scatter_sum(torch.exp(x_shifted), segment_ids, dim, num_segments)
+    return torch.log(out_sum.clamp_min(1e-12)) + out_max
 
 
 def fused_motif_dot(

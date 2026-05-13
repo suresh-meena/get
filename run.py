@@ -29,7 +29,7 @@ ALL_TASKS = STAGE1_TASKS + STAGE2_TASKS + STAGE3_TASKS + STAGE4_TASKS
 
 ALL_MODELS = [
     "fullget", "pairwiseget", "quadratic_only",
-    "get_ham_global", "get_ham_cls", "get_ham_full",
+    "get_ham_global",
     "et", "gt", "bwgnn", "gin", "gcn", "gat",
 ]
 

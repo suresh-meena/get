@@ -12,31 +12,7 @@ from get.solvers import ArmijoSolver, FixedStepSolver
 from .energy_norm import EnergyLayerNorm
 
 
-def _maybe_add_cls_token(x: torch.Tensor, batch_idx: torch.Tensor, num_graphs: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    extra = x.new_zeros((num_graphs, x.size(-1)))
-    x_with_cls = torch.cat([x, extra], dim=0)
-    cls_batch = torch.arange(num_graphs, device=x.device, dtype=batch_idx.dtype)
-    batch_with_cls = torch.cat([batch_idx, cls_batch], dim=0)
-    cls_mask = torch.cat([
-        torch.zeros(x.size(0), dtype=torch.bool, device=x.device),
-        torch.ones(num_graphs, dtype=torch.bool, device=x.device),
-    ], dim=0)
-    return x_with_cls, batch_with_cls, cls_mask
-
-
-def _extend_pairwise_for_cls(c_2: torch.Tensor, u_2: torch.Tensor, batch_idx: torch.Tensor, num_graphs: int, n_orig: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    if num_graphs == 0 or n_orig == 0:
-        return c_2, u_2
-    cls_pos = n_orig + batch_idx[:n_orig]
-    node_idx = torch.arange(n_orig, device=c_2.device, dtype=c_2.dtype)
-    if c_2.numel() == 0:
-        return torch.cat([cls_pos, node_idx]), torch.cat([node_idx, cls_pos])
-    return torch.cat([c_2, cls_pos, node_idx]), torch.cat([u_2, node_idx, cls_pos])
-
-
 class GETBlock(nn.Module):
-    """Single energy block using branch-based ComposedEnergy."""
-
     def __init__(
         self,
         hidden_dim: int,
@@ -46,7 +22,6 @@ class GETBlock(nn.Module):
         K: int,
         num_motif_types: int,
         use_bias_norm: bool = True,
-        use_cls_token: bool = False,
         edge_attr_dim: int = 0,
         lambda_g: float = 0.0,
         beta_g: float = 1.0,
@@ -60,7 +35,6 @@ class GETBlock(nn.Module):
         self.R = R
         self.K = K
         self.num_motif_types = num_motif_types
-        self.use_cls_token = use_cls_token
         self.lambda_g = lambda_g
         self.beta_g = beta_g
         self.max_global_nodes = max_global_nodes
@@ -174,13 +148,11 @@ class EnergyGraphClassifier(nn.Module):
         agg_mode: str = "softmax",
         num_blocks: int = 1,
         readout_mode: str = "graph",
-        use_cls_token: bool = False,
         edge_attr_dim: int = 0,
         lambda_g: float = 0.0,
         beta_g: float = 1.0,
         max_global_nodes: int = 512,
         global_chunk_size: int = 256,
-        use_branch_registry: bool = False,
         branch_names: Optional[List[str]] = None,
     ) -> None:
         super().__init__()
@@ -197,7 +169,6 @@ class EnergyGraphClassifier(nn.Module):
         self.K = K
         self.num_motif_types = num_motif_types
         self.readout_mode = str(readout_mode).lower()
-        self.use_cls_token = use_cls_token
 
         self.lambda_2 = float(lambda_2)
         self.lambda_3 = float(lambda_3)
@@ -233,7 +204,7 @@ class EnergyGraphClassifier(nn.Module):
             GETBlock(
                 hidden_dim=hidden_dim, num_heads=num_heads, head_dim=head_dim,
                 R=R, K=K, num_motif_types=num_motif_types,
-                use_bias_norm=use_energy_norm, use_cls_token=use_cls_token,
+                use_bias_norm=use_energy_norm,
                 edge_attr_dim=edge_attr_dim, lambda_g=self.lambda_g, beta_g=self.beta_g,
                 max_global_nodes=max_global_nodes,
                 branch_names=branch_names,
@@ -242,7 +213,6 @@ class EnergyGraphClassifier(nn.Module):
         ])
 
         self.graph_readout = nn.Linear(hidden_dim * 3, num_classes)
-        self.cls_readout = nn.Linear(hidden_dim, num_classes)
         self.node_readout = nn.Linear(hidden_dim, num_classes)
 
         self.fixed_solver = FixedStepSolver(
@@ -264,8 +234,6 @@ class EnergyGraphClassifier(nn.Module):
             avg_degree = float(avg_degree.detach().item())
         self._global_avg_degree = float(avg_degree)
 
-
-
     def _build_params(self) -> Dict[str, float | str]:
         return {
             "lambda_2": self.lambda_2, "lambda_3": self.lambda_3,
@@ -275,11 +243,7 @@ class EnergyGraphClassifier(nn.Module):
             "agg_mode": self.agg_mode,
         }
 
-    def _pool_graph_concat(self, x_state: torch.Tensor, batch_idx: torch.Tensor, num_graphs: int, cls_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if cls_mask is not None:
-            node_mask = ~cls_mask
-            x_state = x_state[node_mask]
-            batch_idx = batch_idx[node_mask]
+    def _pool_graph_concat(self, x_state: torch.Tensor, batch_idx: torch.Tensor, num_graphs: int) -> torch.Tensor:
         return torch.cat([
             global_mean_pool(x_state, batch_idx),
             global_add_pool(x_state, batch_idx),
@@ -295,29 +259,6 @@ class EnergyGraphClassifier(nn.Module):
         x0 = self.encoder(batch_data["x"])
         mode = inference_mode or (self.inference_mode_train if self.training else self.inference_mode_eval)
         num_graphs = int(batch_data["y"].shape[0])
-
-        if self.use_cls_token:
-            n_orig = x0.size(0)
-            old_num_edges = batch_data["c_2"].numel()
-            batch_cls = batch_data["batch"].clone()
-            x0, batch_cls, cls_mask = _maybe_add_cls_token(x0, batch_cls, num_graphs)
-            c2_cls, u2_cls = _extend_pairwise_for_cls(
-                batch_data["c_2"].clone(), batch_data["u_2"].clone(), batch_cls, num_graphs, n_orig,
-            )
-            batch_data = {
-                **batch_data,
-                "batch": batch_cls,
-                "c_2": c2_cls,
-                "u_2": u2_cls,
-            }
-            edge_attr = batch_data.get("edge_attr")
-            if edge_attr is not None and edge_attr.numel() > 0 and edge_attr.size(0) == old_num_edges:
-                extra_edges = c2_cls.numel() - old_num_edges
-                if extra_edges > 0:
-                    pad = edge_attr.new_zeros((extra_edges, *edge_attr.shape[1:]))
-                    batch_data["edge_attr"] = torch.cat([edge_attr, pad], dim=0)
-        else:
-            cls_mask = None
 
         params_cache = self._build_params()
         scaler = None
@@ -361,11 +302,8 @@ class EnergyGraphClassifier(nn.Module):
 
         if self.readout_mode == "node":
             logits = self.node_readout(x_final)
-        elif self.readout_mode == "cls" and cls_mask is not None:
-            cls_state = x_final[cls_mask]
-            logits = self.cls_readout(cls_state)
         else:
-            pooled = self._pool_graph_concat(x_final, batch_data["batch"], num_graphs, cls_mask=cls_mask)
+            pooled = self._pool_graph_concat(x_final, batch_data["batch"], num_graphs)
             logits = self.graph_readout(pooled)
 
         if self.num_classes == 1:

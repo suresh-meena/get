@@ -45,7 +45,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="fullget",
         choices=[
             "fullget", "pairwiseget", "quadratic_only",
-            "get_ham_global", "get_ham_cls", "get_ham_full",
+            "get_ham_global",
             "et", "etfaithful", "gt", "bwgnn", "external_baseline",
             "gin", "gcn", "gat",
         ],
@@ -103,9 +103,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--output_file", type=str, default="")
     p.add_argument("--output", type=str, default="")
     p.add_argument("--output_dir", type=str, default="outputs/protocol")
-    p.add_argument("--compile", action="store_true", default=False, help="Enable torch.compile for eval")
-    p.add_argument("--compile_scope", type=str, default="eval_only", choices=["eval_only", "all"],
-                   help="'all' compiles train and eval paths; use 'eval_only' if your backend still has issues")
+    p.add_argument("--compile", action="store_true", default=True, help="Enable torch.compile for train and eval")
+    p.add_argument("--no_compile", action="store_false", dest="compile", help="Disable torch.compile")
+    p.add_argument("--compile_scope", type=str, default="all", choices=["all", "eval_only"],
+                   help="'all' compiles train and eval paths; use 'eval_only' to keep training eager")
     return p
 
 
@@ -161,10 +162,22 @@ def run_experiment(args: argparse.Namespace, tr_items, va_items, te_items, task_
     model = build_model(cfg).to(device)
     parameter_count = _count_params(model)
 
+    compile_enabled = bool(getattr(args, "compile", False))
+    compile_scope = str(getattr(args, "compile_scope", "all")).lower()
+
     eval_model = model
-    if getattr(args, "compile", False):
-        compile_cfg = {"enabled": True, "scope": "eval_only"}
-        eval_model = maybe_compile_model(model, compile_cfg)
+    if compile_enabled:
+        if compile_scope == "all":
+            if getattr(model, "requires_double_backward", False):
+                raise ValueError("compile_scope='all' is unsupported for models that still require double backward. Use compile_scope='eval_only'.")
+            compile_cfg = {"enabled": True, "scope": "all"}
+            model = maybe_compile_model(model, compile_cfg)
+            eval_model = model
+        elif compile_scope == "eval_only":
+            compile_cfg = {"enabled": True, "scope": "eval_only", "allow_double_backward": True}
+            eval_model = maybe_compile_model(model, compile_cfg)
+        else:
+            raise ValueError(f"Unsupported compile_scope '{compile_scope}'. Use 'eval_only' or 'all'.")
 
     trainer_cfg = {
         "epochs": args.epochs,
@@ -209,31 +222,13 @@ def run_experiment(args: argparse.Namespace, tr_items, va_items, te_items, task_
 
     model_name = str(getattr(args, "model_name", "fullget")).lower()
     is_ham = model_name.startswith("get_ham_")
+    energy_trace = []
     enabled_branches = {
         "pairwise": True,
-        "motif": model_name in ("fullget", "get_ham_global", "get_ham_cls", "get_ham_full"),
-        "memory": model_name in ("fullget", "get_ham_global", "get_ham_cls", "get_ham_full"),
-        "global_attention": model_name in ("get_ham_global", "get_ham_cls", "get_ham_full"),
-        "cls_token": model_name in ("get_ham_cls", "get_ham_full"),
+        "motif": model_name in ("fullget", "get_ham_global"),
+        "memory": model_name in ("fullget", "get_ham_global"),
+        "global_attention": model_name in ("get_ham_global"),
     }
-    readout_mode = "graph"
-    if model_name == "get_ham_cls":
-        readout_mode = "cls"
-
-    energy_trace = []
-    try:
-        was_training = model.training
-        model.eval()
-        _it = iter(test_loader)
-        _batch = next(_it)
-        _batch = move_batch_to_device(_batch, device)
-        out = model(_batch, return_solver_stats=True)
-        if isinstance(out, (tuple, list)) and len(out) >= 2 and isinstance(out[1], list):
-            energy_trace = out[1]
-        if was_training:
-            model.train()
-    except Exception:
-        pass
 
     result = {
         "train": fit_result.get("final_train", {}),
@@ -247,10 +242,10 @@ def run_experiment(args: argparse.Namespace, tr_items, va_items, te_items, task_
         "runtime_seconds": elapsed,
         "peak_cuda_memory_mb": peak_memory_mb,
         "enabled_branches": enabled_branches,
-        "readout_mode": readout_mode,
+        "readout_mode": "graph",
         "solver_state_keys": ["H"],
         "num_inference_steps": int(getattr(args, "num_steps", 8)),
-        "compile_scope": "eval_only",
+        "compile_scope": compile_scope,
     }
     if str(getattr(args, "task", "")) == "stage2_brec":
         by_cat = _evaluate_brec_by_category(trainer, args, te_items)

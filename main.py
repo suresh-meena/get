@@ -152,14 +152,10 @@ def _run_single_experiment(
     is_ham = model_name.startswith("get_ham_")
     enabled_branches = {
         "pairwise": True,
-        "motif": model_name in ("fullget", "get_ham_global", "get_ham_cls", "get_ham_full"),
-        "memory": model_name in ("fullget", "get_ham_global", "get_ham_cls", "get_ham_full"),
-        "global_attention": model_name in ("get_ham_global", "get_ham_cls", "get_ham_full"),
-        "cls_token": model_name in ("get_ham_cls", "get_ham_full"),
+        "motif": model_name in ("fullget", "get_ham_global"),
+        "memory": model_name in ("fullget", "get_ham_global"),
+        "global_attention": model_name in ("get_ham_global"),
     }
-    readout_mode = "graph"
-    if model_name == "get_ham_cls":
-        readout_mode = "cls"
 
     return {
         "train": fit_result.get("final_train", {}),
@@ -172,7 +168,6 @@ def _run_single_experiment(
         "runtime_seconds": elapsed,
         "peak_cuda_memory_mb": peak_memory,
         "enabled_branches": enabled_branches,
-        "readout_mode": readout_mode,
         "solver_state_keys": ["H"],
         "num_inference_steps": int(run_cfg.get("num_steps", 8)),
         "compile_scope": compile_scope,

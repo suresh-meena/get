@@ -6,10 +6,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torch_geometric.utils import scatter
 from get.energy.ops import (
     positive_param, inverse_temperature,
-    segment_logsumexp, fused_motif_dot,
+    segment_logsumexp, fused_motif_dot, scatter_sum,
 )
 
 
@@ -76,11 +75,11 @@ class PairwiseBranch(EnergyBranch):
         mode = params.get("agg_mode", "softmax")
         if mode == "sum":
             scores = torch.exp(beta_2 * ell_2) if params.get("sum_exp", False) else ell_2
-            agg_2 = scatter(scores, c_2, dim=0, dim_size=num_nodes, reduce="sum")
+            agg_2 = scatter_sum(scores, c_2, 0, num_nodes)
             scaler = context.get("degree_scaler")
             if scaler is not None:
                 agg_2 = agg_2 * scaler.unsqueeze(-1)
-            graph_agg = scatter(agg_2, batch_idx, dim=0, dim_size=num_graphs, reduce="sum")
+            graph_agg = scatter_sum(agg_2, batch_idx, 0, num_graphs)
             return lambda_2 * graph_agg
         else:
             lse_2 = segment_logsumexp(beta_2 * ell_2, c_2, num_nodes, dim=0)
@@ -92,7 +91,7 @@ class PairwiseBranch(EnergyBranch):
             scaler = context.get("degree_scaler")
             if scaler is not None:
                 lse_2 = lse_2 * scaler.unsqueeze(-1)
-            graph_lse = scatter(lse_2, batch_idx, dim=0, dim_size=num_graphs, reduce="sum")
+            graph_lse = scatter_sum(lse_2, batch_idx, 0, num_graphs)
             return (lambda_2 / beta_2) * graph_lse
 
 
@@ -139,11 +138,11 @@ class MotifBranch(EnergyBranch):
         mode = params.get("agg_mode", "softmax")
         if mode == "sum":
             scores = torch.exp(beta_3 * ell_3) if params.get("sum_exp", False) else ell_3
-            agg_3 = scatter(scores, c_3, dim=0, dim_size=num_nodes, reduce="sum")
+            agg_3 = scatter_sum(scores, c_3, 0, num_nodes)
             scaler = context.get("degree_scaler")
             if scaler is not None:
                 agg_3 = agg_3 * scaler.unsqueeze(-1)
-            graph_agg = scatter(agg_3, batch_idx, dim=0, dim_size=num_graphs, reduce="sum")
+            graph_agg = scatter_sum(agg_3, batch_idx, 0, num_graphs)
             return lambda_3 * graph_agg
         else:
             lse_3 = segment_logsumexp(beta_3 * ell_3, c_3, num_nodes, dim=0)
@@ -155,7 +154,7 @@ class MotifBranch(EnergyBranch):
             scaler = context.get("degree_scaler")
             if scaler is not None:
                 lse_3 = lse_3 * scaler.unsqueeze(-1)
-            graph_lse = scatter(lse_3, batch_idx, dim=0, dim_size=num_graphs, reduce="sum")
+            graph_lse = scatter_sum(lse_3, batch_idx, 0, num_graphs)
             return (lambda_3 / beta_3) * graph_lse
 
 
@@ -187,7 +186,7 @@ class MemoryBranch(EnergyBranch):
         beta_m = inverse_temperature(params, "beta_m", beta_max=beta_max)
         lse_m = torch.logsumexp(beta_m * ell_m, dim=-1)
         per_node = (lambda_m / beta_m) * lse_m
-        per_graph = scatter(per_node, batch_idx, dim=0, dim_size=num_graphs, reduce="sum")
+        per_graph = scatter_sum(per_node, batch_idx, 0, num_graphs)
         return per_graph
 
 

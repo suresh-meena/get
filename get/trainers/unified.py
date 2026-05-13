@@ -65,8 +65,8 @@ class UnifiedTrainer:
         self.log_every_steps = int(trainer_cfg.get("log_every_steps", 10))
         self.patience = int(trainer_cfg.get("patience", 10))
         self.use_tqdm = bool(trainer_cfg.get("use_tqdm", False))
-        self.use_amp = bool(trainer_cfg.get("use_amp", False)) and device.type == "cuda"
-        self.amp_dtype = str(trainer_cfg.get("amp_dtype", "auto")).lower()
+        self.use_amp = bool(trainer_cfg.get("use_amp", True)) and device.type == "cuda"
+        self.amp_dtype = str(trainer_cfg.get("amp_dtype", "bf16")).lower()
         if self.amp_dtype == "auto" and device.type == "cuda":
             self.amp_dtype = "bf16" if torch.cuda.is_bf16_supported() else "fp16"
         self.task_type = str(trainer_cfg.get("task_type", "binary")).lower()

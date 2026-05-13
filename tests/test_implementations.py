@@ -466,140 +466,12 @@ def test_get_ham_global_multi_graph_multi_head_forward_is_finite():
     assert torch.isfinite(out).all()
 
 
-def test_get_ham_cls_integrated_forward_is_finite():
-    """CLS readout must use hidden-dim CLS states, not graph concat readout."""
-    from types import SimpleNamespace
-    import torch
-    from get.data.synthetic import sample_from_edge_index, collate_graph_samples
-    from get.models.factory import build_model
 
-    edge_index = torch.tensor(
-        [[0, 1, 2, 3, 0, 1], [1, 2, 3, 0, 2, 3]],
-        dtype=torch.long,
-    )
-    x = torch.randn(4, 5)
-    y = torch.tensor([1.0])
-    batch = collate_graph_samples([
-        sample_from_edge_index(edge_index, 4, x, y, max_motifs_per_anchor=4)
-    ])
-
-    cfg = SimpleNamespace(
-        model_name="get_ham_cls",
-        task_type="binary",
-        num_classes=1,
-        in_dim=5,
-        hidden_dim=8,
-        num_steps=1,
-        num_heads=2,
-        head_dim=4,
-        R=2,
-        K=3,
-        num_motif_types=2,
-        lambda_2=1.0,
-        lambda_3=1.0,
-        lambda_m=1.0,
-        lambda_g=1.0,
-        beta_2=1.0,
-        beta_3=1.0,
-        beta_m=1.0,
-        beta_g=1.0,
-        update_damping=0.0,
-        fixed_step_size=0.01,
-        inference_mode_train="fixed",
-        inference_mode_eval="fixed",
-        max_global_nodes=32,
-    )
-    model = build_model(cfg)
-    out = model(batch)
-    assert out.shape == (1,)
-    assert torch.isfinite(out).all()
-
-
-def test_get_ham_full_integrated_forward_is_finite():
-    """Full HAM should keep CLS enabled but use graph readout for logits."""
-    from types import SimpleNamespace
-    import torch
-    from get.data.synthetic import sample_from_edge_index, collate_graph_samples
-    from get.models.factory import build_model
-
-    edge_index = torch.tensor(
-        [[0, 1, 2, 3, 0, 1], [1, 2, 3, 0, 2, 3]],
-        dtype=torch.long,
-    )
-    x = torch.randn(4, 5)
-    y = torch.tensor([1.0])
-    batch = collate_graph_samples([
-        sample_from_edge_index(edge_index, 4, x, y, max_motifs_per_anchor=4)
-    ])
-
-    cfg = SimpleNamespace(
-        model_name="get_ham_full",
-        task_type="binary",
-        num_classes=1,
-        in_dim=5,
-        hidden_dim=8,
-        num_steps=1,
-        num_heads=2,
-        head_dim=4,
-        R=2,
-        K=3,
-        num_motif_types=2,
-        lambda_2=1.0,
-        lambda_3=1.0,
-        lambda_m=1.0,
-        lambda_g=1.0,
-        beta_2=1.0,
-        beta_3=1.0,
-        beta_m=1.0,
-        beta_g=1.0,
-        update_damping=0.0,
-        fixed_step_size=0.01,
-        inference_mode_train="fixed",
-        inference_mode_eval="fixed",
-        max_global_nodes=32,
-    )
-    model = build_model(cfg)
-    assert model.readout_mode == "graph"
-    assert model.use_cls_token is True
-    out = model(batch)
-    assert out.shape == (1,)
-    assert torch.isfinite(out).all()
 
 
 # ---------------------------------------------------------------------------
-# 10. CLS opt-in behavior
+# 10. Readout [mean; sum; max]
 # ---------------------------------------------------------------------------
-
-def test_cls_token_adds_one_token_per_graph():
-    """Enabling CLS must add one token per graph."""
-    from get.models.energy_classifier import _maybe_add_cls_token, _extend_pairwise_for_cls
-    import torch
-    x = torch.randn(10, 4)
-    batch = torch.tensor([0, 0, 0, 0, 0, 1, 1, 1, 1, 1], dtype=torch.long)
-    c_2 = torch.tensor([0, 1, 2, 3, 5, 6, 7, 8], dtype=torch.long)
-    u_2 = torch.tensor([1, 2, 3, 0, 6, 7, 8, 5], dtype=torch.long)
-    n_orig = x.size(0)
-    x_cls, batch_cls, cls_mask = _maybe_add_cls_token(x, batch, 2)
-    assert x_cls.size(0) == 12, "Should add 2 CLS tokens (one per graph)"
-    assert batch_cls.size(0) == 12
-    assert cls_mask.sum().item() == 2, "Exactly 2 CLS tokens should be marked"
-    c_2_ext, u_2_ext = _extend_pairwise_for_cls(c_2, u_2, batch_cls, 2, n_orig)
-    assert c_2_ext.numel() > c_2.numel(), "CLS should add pairwise edges"
-
-
-def test_cls_token_default_off():
-    """Disabling CLS must leave PairwiseGET/FullGET output unchanged vs baseline."""
-    from get.models.energy_classifier import EnergyGraphClassifier
-    import torch
-    model_no_cls = EnergyGraphClassifier(
-        in_dim=4, hidden_dim=64, num_classes=2, num_steps=1,
-        num_heads=2, head_dim=32, R=2, K=4, num_motif_types=2,
-        lambda_2=1.0, lambda_3=0.0, lambda_m=0.0,
-        beta_2=1.0, beta_3=1.0, beta_m=1.0,
-        update_damping=0.0, energy_name="pairwise_only",
-        use_cls_token=False, readout_mode="graph",
-    ).eval()
-    assert model_no_cls.use_cls_token is False
 
 
 # ---------------------------------------------------------------------------
@@ -607,7 +479,6 @@ def test_cls_token_default_off():
 # ---------------------------------------------------------------------------
 
 def test_readout_concat_mean_sum_max():
-    """Test _pool_graph_concat returns [mean; sum; max] concatenated."""
     from get.models.energy_classifier import EnergyGraphClassifier
     import torch
     model = EnergyGraphClassifier(
@@ -615,13 +486,12 @@ def test_readout_concat_mean_sum_max():
         num_heads=2, head_dim=32, R=2, K=4, num_motif_types=2,
         lambda_2=1.0, lambda_3=0.0, lambda_m=0.0,
         beta_2=1.0, beta_3=1.0, beta_m=1.0,
-        update_damping=0.0, energy_name="pairwise_only",
-        use_cls_token=False, readout_mode="graph",
+        update_damping=0.0, readout_mode="graph",
     ).eval()
     x = torch.randn(6, 64)
     batch = torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.long)
     pooled = model._pool_graph_concat(x, batch, 2)
-    assert pooled.size(-1) == 64 * 3, f"[mean; sum; max] should be 3*hidden_dim, got {pooled.size(-1)}"
+    assert pooled.size(-1) == 64 * 3
 
 
 # ---------------------------------------------------------------------------

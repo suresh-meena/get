@@ -3,8 +3,8 @@ device: "auto"  # auto | cpu | cuda
 inference_mode_train: "fixed"
 inference_mode_eval: "armijo"
 compile:
-  enabled: false
-  scope: "eval_only"  # eval_only | all
+  enabled: true
+  scope: "all"  # all | eval_only
   allow_double_backward: false
   backend: "inductor"
   dynamic: true

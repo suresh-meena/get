@@ -58,17 +58,17 @@ PYTHONPATH=. python main.py model.energy_name=quadratic_only
 
 Supported values: `get_full`, `pairwise_only`, `quadratic_only`.
 
-Enable `torch.compile` (optional):
+`torch.compile` is enabled by default for train and eval. Disable it with `experiment.compile.enabled=false` if needed:
 
 ```bash
-PYTHONPATH=. python main.py experiment.compile.enabled=true
+PYTHONPATH=. python main.py
 ```
 
-Default scope is `experiment.compile.scope=eval_only`, which compiles eval path only and keeps training uncompiled when you want the safest path.
-Use `experiment.compile.scope=all` to compile both train and eval paths.
+Default scope is `experiment.compile.scope=all`, which compiles both train and eval paths.
+Use `experiment.compile.scope=eval_only` to keep training uncompiled when you want the safest path.
 GET and ET inner-loop gradients now use `torch.func.grad`, so the old double-backward guard is no longer needed for these models.
 
-AMP is config-driven via `trainer.use_amp` and `trainer.amp_dtype` (`fp16` or `bf16`).
+AMP is config-driven via `trainer.use_amp` and `trainer.amp_dtype` (`bf16` by default).
 
 For older end-to-end training scripts, see `legacy/`.
 
