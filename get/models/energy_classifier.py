@@ -271,9 +271,10 @@ class EnergyGraphClassifier(nn.Module):
         x = x0
         collect_solver_stats = bool(return_solver_stats)
         for block in self.blocks:
-            def energy_fn(curr_x: torch.Tensor) -> torch.Tensor:
+            def _energy_fn(curr_x: torch.Tensor) -> torch.Tensor:
                 return block.energy_from_g(curr_x, batch_data, params_cache, scaler, num_graphs)
 
+            energy_fn = torch.compile(_energy_fn, dynamic=True, fullgraph=False)
             grad_energy_fn = torch.func.grad(energy_fn)
 
             def energy_and_grad_fn(curr_x: torch.Tensor, create_graph: bool = False) -> tuple[torch.Tensor, torch.Tensor]:

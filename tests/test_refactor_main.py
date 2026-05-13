@@ -135,4 +135,3 @@ def test_refactor_main_compile_all_smoke(tmp_path: Path):
     metrics = run_from_cfg(cfg)
     assert "test" in metrics
     assert metrics["epochs_ran"] >= 1
-    assert metrics["compile_scope"] == "all"

@@ -29,7 +29,7 @@ from get.data import (
 )
 from get.models import build_model
 from get.trainers import UnifiedTrainer
-from get.utils import maybe_compile_model, seed_everything, move_batch_to_device
+from get.utils import seed_everything, move_batch_to_device
 from experiments.common import resolve_device, score_key_for_task
 
 
@@ -113,21 +113,7 @@ def _run_single_experiment(
 
     model = build_model(DictConfig(run_cfg)).to(device)
     parameter_count = sum(p.numel() for p in model.parameters())
-
-    compile_cfg = cfg.experiment.get("compile", {"enabled": False})
-    compile_scope = str(compile_cfg.get("scope", "eval_only")).lower()
     eval_model = model
-
-    if bool(compile_cfg.get("enabled", False)):
-        if compile_scope == "all":
-            if getattr(model, "requires_double_backward", False):
-                raise ValueError("compile.scope='all' is unsupported for models that still require double backward. Use compile.scope='eval_only'.")
-            model = maybe_compile_model(model, compile_cfg)
-            eval_model = model
-        elif compile_scope == "eval_only":
-            eval_compile_cfg = dict(compile_cfg)
-            eval_compile_cfg["allow_double_backward"] = True
-            eval_model = maybe_compile_model(model, eval_compile_cfg)
 
     trainer_cfg = OmegaConf.to_container(cfg.trainer, resolve=True)
     trainer_cfg["task_type"] = task_type
@@ -170,7 +156,6 @@ def _run_single_experiment(
         "enabled_branches": enabled_branches,
         "solver_state_keys": ["H"],
         "num_inference_steps": int(run_cfg.get("num_steps", 8)),
-        "compile_scope": compile_scope,
     }
 
 

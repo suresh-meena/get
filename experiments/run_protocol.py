@@ -20,7 +20,6 @@ if str(ROOT) not in sys.path:
 
 from get.utils.seed import seed_everything
 from get.utils.device import move_batch_to_device
-from get.utils.compile import maybe_compile_model
 from experiments.common import score_key_for_task as _score_key_for_task
 from get.data import (
     ListGraphDataset,
@@ -103,10 +102,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--output_file", type=str, default="")
     p.add_argument("--output", type=str, default="")
     p.add_argument("--output_dir", type=str, default="outputs/protocol")
-    p.add_argument("--compile", action="store_true", default=True, help="Enable torch.compile for train and eval")
-    p.add_argument("--no_compile", action="store_false", dest="compile", help="Disable torch.compile")
-    p.add_argument("--compile_scope", type=str, default="all", choices=["all", "eval_only"],
-                   help="'all' compiles train and eval paths; use 'eval_only' to keep training eager")
     return p
 
 
@@ -161,23 +156,7 @@ def run_experiment(args: argparse.Namespace, tr_items, va_items, te_items, task_
 
     model = build_model(cfg).to(device)
     parameter_count = _count_params(model)
-
-    compile_enabled = bool(getattr(args, "compile", False))
-    compile_scope = str(getattr(args, "compile_scope", "all")).lower()
-
     eval_model = model
-    if compile_enabled:
-        if compile_scope == "all":
-            if getattr(model, "requires_double_backward", False):
-                raise ValueError("compile_scope='all' is unsupported for models that still require double backward. Use compile_scope='eval_only'.")
-            compile_cfg = {"enabled": True, "scope": "all"}
-            model = maybe_compile_model(model, compile_cfg)
-            eval_model = model
-        elif compile_scope == "eval_only":
-            compile_cfg = {"enabled": True, "scope": "eval_only", "allow_double_backward": True}
-            eval_model = maybe_compile_model(model, compile_cfg)
-        else:
-            raise ValueError(f"Unsupported compile_scope '{compile_scope}'. Use 'eval_only' or 'all'.")
 
     trainer_cfg = {
         "epochs": args.epochs,
@@ -245,7 +224,6 @@ def run_experiment(args: argparse.Namespace, tr_items, va_items, te_items, task_
         "readout_mode": "graph",
         "solver_state_keys": ["H"],
         "num_inference_steps": int(getattr(args, "num_steps", 8)),
-        "compile_scope": compile_scope,
     }
     if str(getattr(args, "task", "")) == "stage2_brec":
         by_cat = _evaluate_brec_by_category(trainer, args, te_items)

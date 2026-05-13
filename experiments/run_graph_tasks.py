@@ -311,35 +311,9 @@ def _run_single_fit(
     task_type: str,
     num_classes: int,
 ) -> Dict[str, Dict[str, float]]:
-    from get.utils.compile import maybe_compile_model
     model = _build_model(args, task_type=task_type, num_classes=num_classes, edge_attr_dim=getattr(args, "edge_attr_dim", 0))
-    
-    compile_cfg = {
-        "enabled": getattr(args, "compile", False),
-        "backend": getattr(args, "compile_backend", "inductor"),
-        "dynamic": getattr(args, "compile_dynamic", True),
-        "mode": getattr(args, "compile_mode", "default") if getattr(args, "compile_mode", "default") != "default" else None,
-        "allow_double_backward": getattr(args, "compile_allow_double_backward", False),
-    }
-    compile_scope = str(getattr(args, "compile_scope", "all")).lower()
-    if compile_cfg["enabled"]:
-        if compile_scope == "all":
-            if getattr(model, "requires_double_backward", False):
-                raise ValueError(
-                    "compile_scope='all' is unsupported for models that still require double backward. "
-                    "Use compile_scope='eval_only'."
-                )
-            model = maybe_compile_model(model, compile_cfg)
-            eval_model = model
-        elif compile_scope == "eval_only":
-            eval_compile_cfg = dict(compile_cfg)
-            eval_compile_cfg["allow_double_backward"] = True
-            eval_model = maybe_compile_model(model, eval_compile_cfg)
-        else:
-            raise ValueError(f"Unsupported compile_scope '{compile_scope}'. Use 'eval_only' or 'all'.")
-    else:
-        eval_model = model
-    
+    eval_model = model
+
     trainer_cfg: Dict[str, object] = {
         "epochs": args.epochs,
         "lr": args.lr,
