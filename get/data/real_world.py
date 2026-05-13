@@ -24,6 +24,7 @@ class RealWorldGraphDataset(Dataset):
         root: str = "data/real",
         in_dim: int = 32,
         max_motifs_per_anchor: int = 8,
+        pos_k: int = 0,
         task_type: str = "auto",
         cache_enabled: bool = True,
         cache_root: str | None = None,
@@ -33,11 +34,12 @@ class RealWorldGraphDataset(Dataset):
         self.root = root
         self.in_dim = in_dim
         self.max_motifs_per_anchor = max_motifs_per_anchor
+        self.pos_k = int(pos_k)
         self.cache_enabled = cache_enabled
         self.cache_root = Path(cache_root).expanduser() if cache_root is not None else Path(root).expanduser() / "processed_cache" / "real_world"
-        self.cache_version = "v2" # Bump version for lazy loading
+        self.cache_version = "v3" # Bump version for positional-embedding caching
         
-        self.processed_dir = self.cache_root / self.name.upper() / f"dim_{in_dim}_motifs_{max_motifs_per_anchor}"
+        self.processed_dir = self.cache_root / self.name.upper() / f"dim_{in_dim}_motifs_{max_motifs_per_anchor}_pos_{self.pos_k}"
 
         metadata = self._load_metadata()
         if metadata is not None:
@@ -117,6 +119,7 @@ class RealWorldGraphDataset(Dataset):
             "name": self.name,
             "in_dim": self.in_dim,
             "max_motifs_per_anchor": self.max_motifs_per_anchor,
+            "pos_k": self.pos_k,
             "task_type": self.task_type,
             "label_map": self.label_map,
             "num_classes": self.num_classes,
@@ -162,4 +165,15 @@ class RealWorldGraphDataset(Dataset):
         else:
             label = torch.tensor([float(y_val)], dtype=torch.float32)
 
-        return sample_from_edge_index(edge_index, n, x, label, self.max_motifs_per_anchor, edge_attr=edge_attr)
+        sample = sample_from_edge_index(
+            edge_index,
+            n,
+            x,
+            label,
+            self.max_motifs_per_anchor,
+            pos_k=self.pos_k,
+            edge_attr=edge_attr,
+        )
+        if self.pos_k > 0:
+            sample.pos_embed_type = "eigen"
+        return sample

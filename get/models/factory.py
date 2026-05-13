@@ -47,11 +47,8 @@ def build_model(cfg: Any) -> torch.nn.Module:
 
     # GET Variants
     if model_name in {"fullget", "pairwiseget", "quadratic_only"}:
-        energy_name = "get_full"
-        if model_name == "pairwiseget":
-            energy_name = "pairwise_only"
-        elif model_name == "quadratic_only":
-            energy_name = "quadratic_only"
+        lambda_3_val = 0.0 if model_name in ("pairwiseget", "quadratic_only") else float(get_val("lambda_3", 10.0))
+        lambda_m_val = 0.0 if model_name in ("pairwiseget", "quadratic_only") else float(get_val("lambda_m", 1.0))
 
         return EnergyGraphClassifier(
             in_dim=in_dim,
@@ -64,8 +61,8 @@ def build_model(cfg: Any) -> torch.nn.Module:
             K=int(get_val("K", 48)),
             num_motif_types=int(get_val("num_motif_types", 2)),
             lambda_2=float(get_val("lambda_2", 1.0)),
-            lambda_3=float(get_val("lambda_3", 10.0)) if energy_name == "get_full" else 0.0,
-            lambda_m=float(get_val("lambda_m", 1.0)) if energy_name == "get_full" else 0.0,
+            lambda_3=lambda_3_val,
+            lambda_m=lambda_m_val,
             beta_2=float(get_val("beta_2", 1.0)),
             beta_3=float(get_val("beta_3", 1.0)),
             beta_m=float(get_val("beta_m", 1.0)),
@@ -78,7 +75,7 @@ def build_model(cfg: Any) -> torch.nn.Module:
             armijo_eval_max_backtracks=int(get_val("armijo_eval_max_backtracks", 5)),
             inference_mode_train=str(get_val("inference_mode_train", "fixed")),
             inference_mode_eval=str(get_val("inference_mode_eval", "armijo")),
-            energy_name=energy_name,
+            energy_name="get_full",
             use_energy_norm=bool(get_val("use_energy_norm", True)),
             agg_mode=str(get_val("agg_mode", "softmax")),
             readout_mode="node" if task_type.startswith("node_") else "graph",
@@ -191,7 +188,7 @@ def build_model(cfg: Any) -> torch.nn.Module:
             energy_name="get_full",
             use_energy_norm=bool(get_val("use_energy_norm", True)),
             agg_mode=str(get_val("agg_mode", "softmax")),
-            readout_mode="cls",
+            readout_mode="graph",
             num_blocks=int(get_val("num_blocks", 1)),
             use_cls_token=True,
             max_global_nodes=int(get_val("max_global_nodes", 512)),

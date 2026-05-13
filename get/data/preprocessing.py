@@ -33,6 +33,7 @@ def run_preprocessing(args: argparse.Namespace) -> None:
             root=args.dataset_root,
             in_dim=args.in_dim,
             max_motifs_per_anchor=args.max_motifs_per_anchor,
+            pos_k=args.pos_k,
             task_type=args.task_type,
             cache_enabled=True,
         )

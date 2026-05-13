@@ -29,3 +29,4 @@ tqdm
 pytest
 ruff
 pytest-benchmark
+ripgrep>=15.0.0

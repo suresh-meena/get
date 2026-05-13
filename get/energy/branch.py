@@ -6,9 +6,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from torch_geometric.utils import scatter
 from get.energy.ops import (
     positive_param, inverse_temperature,
-    segment_logsumexp, scatter_add_nd, fused_motif_dot,
+    segment_logsumexp, fused_motif_dot,
 )
 
 
@@ -25,10 +26,11 @@ class QuadraticBranch(EnergyBranch):
     def forward(self, state, batch, context):
         H = state["H"]
         batch_idx = batch.batch if hasattr(batch, "batch") else context.get("batch")
-        num_graphs = context.get("num_graphs", int(batch_idx.max().item() + 1) if batch_idx is not None else 1)
+        num_graphs = context.get("num_graphs", (batch_idx.max() + 1) if batch_idx is not None else 1)
         per_graph = H.new_zeros(num_graphs)
         per_graph.scatter_add_(0, batch_idx, (H * H).sum(dim=-1))
-        return 0.5 * per_graph
+        counts = torch.bincount(batch_idx, minlength=num_graphs).to(dtype=H.dtype, device=H.device)
+        return 0.5 * per_graph / counts.clamp_min(1.0)
 
 
 class PairwiseBranch(EnergyBranch):
@@ -49,7 +51,7 @@ class PairwiseBranch(EnergyBranch):
         c_2 = batch.c_2 if hasattr(batch, "c_2") else context.get("c_2")
         u_2 = batch.u_2 if hasattr(batch, "u_2") else context.get("u_2")
         batch_idx = batch.batch if hasattr(batch, "batch") else context.get("batch")
-        num_graphs = context.get("num_graphs", int(batch_idx.max().item() + 1) if batch_idx is not None else 1)
+        num_graphs = context.get("num_graphs", (batch_idx.max() + 1) if batch_idx is not None else 1)
         num_nodes = H.size(0)
 
         if Q2 is None or c_2 is None or c_2.numel() == 0:
@@ -58,24 +60,40 @@ class PairwiseBranch(EnergyBranch):
         scale = Q2.size(-1) ** 0.5
         ell_2 = (Q2[c_2] * K2[u_2]).sum(dim=-1) / scale
 
+        if params.get("pairwise_symmetric", False):
+            src = torch.cat([c_2, u_2], dim=0)
+            dst = torch.cat([u_2, c_2], dim=0)
+            ell_sym = (Q2[src] * K2[dst]).sum(dim=-1) / scale
+            ell_2 = ell_2 + ell_sym[c_2.numel():]
+
         a_2 = proj.get("a_2")
         if a_2 is not None:
             ell_2 = ell_2 + a_2
 
-        beta_2 = inverse_temperature(params, "beta_2")
-        lse_2 = segment_logsumexp(beta_2 * ell_2, c_2, num_nodes, dim=0)
-        if c_2.numel() > 0:
-            counts = torch.bincount(c_2, minlength=num_nodes)
-            empty = counts.eq(0)
-            if empty.any():
-                lse_2 = lse_2.masked_fill(empty.view(-1, *([1] * (lse_2.dim() - 1))), 0.0)
+        beta_max = params.get("beta_max", None)
+        beta_2 = inverse_temperature(params, "beta_2", beta_max=beta_max)
 
-        scaler = context.get("degree_scaler")
-        if scaler is not None:
-            lse_2 = lse_2 * scaler.unsqueeze(-1)
-
-        graph_lse = scatter_add_nd(H.new_zeros((num_graphs, lse_2.shape[-1])), batch_idx, lse_2, dim=0)
-        return (lambda_2 / beta_2) * graph_lse
+        mode = params.get("agg_mode", "softmax")
+        if mode == "sum":
+            scores = torch.exp(beta_2 * ell_2) if params.get("sum_exp", False) else ell_2
+            agg_2 = scatter(scores, c_2, dim=0, dim_size=num_nodes, reduce="sum")
+            scaler = context.get("degree_scaler")
+            if scaler is not None:
+                agg_2 = agg_2 * scaler.unsqueeze(-1)
+            graph_agg = scatter(agg_2, batch_idx, dim=0, dim_size=num_graphs, reduce="sum")
+            return lambda_2 * graph_agg
+        else:
+            lse_2 = segment_logsumexp(beta_2 * ell_2, c_2, num_nodes, dim=0)
+            lse_2 = torch.where(
+                torch.bincount(c_2, minlength=num_nodes).eq(0).view(-1, *([1] * (lse_2.dim() - 1))),
+                torch.zeros_like(lse_2),
+                lse_2,
+            )
+            scaler = context.get("degree_scaler")
+            if scaler is not None:
+                lse_2 = lse_2 * scaler.unsqueeze(-1)
+            graph_lse = scatter(lse_2, batch_idx, dim=0, dim_size=num_graphs, reduce="sum")
+            return (lambda_2 / beta_2) * graph_lse
 
 
 class MotifBranch(EnergyBranch):
@@ -98,7 +116,7 @@ class MotifBranch(EnergyBranch):
         v_3 = batch.v_3 if hasattr(batch, "v_3") else context.get("v_3")
         t_tau = batch.t_tau if hasattr(batch, "t_tau") else context.get("t_tau")
         batch_idx = batch.batch if hasattr(batch, "batch") else context.get("batch")
-        num_graphs = context.get("num_graphs", int(batch_idx.max().item() + 1) if batch_idx is not None else 1)
+        num_graphs = context.get("num_graphs", (batch_idx.max() + 1) if batch_idx is not None else 1)
         num_nodes = H.size(0)
         R = int(params.get("R", 1))
 
@@ -115,20 +133,30 @@ class MotifBranch(EnergyBranch):
             T_selected = T_params[t_tau]
         ell_3 = fused_motif_dot(Q3[c_3], K3[u_3], K3[v_3], T_selected) / scale
 
-        beta_3 = inverse_temperature(params, "beta_3")
-        lse_3 = segment_logsumexp(beta_3 * ell_3, c_3, num_nodes, dim=0)
-        if c_3.numel() > 0:
-            counts = torch.bincount(c_3, minlength=num_nodes)
-            empty = counts.eq(0)
-            if empty.any():
-                lse_3 = lse_3.masked_fill(empty.view(-1, *([1] * (lse_3.dim() - 1))), 0.0)
+        beta_max = params.get("beta_max", None)
+        beta_3 = inverse_temperature(params, "beta_3", beta_max=beta_max)
 
-        scaler = context.get("degree_scaler")
-        if scaler is not None:
-            lse_3 = lse_3 * scaler.unsqueeze(-1)
-
-        graph_lse = scatter_add_nd(H.new_zeros((num_graphs, lse_3.shape[-1])), batch_idx, lse_3, dim=0)
-        return (lambda_3 / beta_3) * graph_lse
+        mode = params.get("agg_mode", "softmax")
+        if mode == "sum":
+            scores = torch.exp(beta_3 * ell_3) if params.get("sum_exp", False) else ell_3
+            agg_3 = scatter(scores, c_3, dim=0, dim_size=num_nodes, reduce="sum")
+            scaler = context.get("degree_scaler")
+            if scaler is not None:
+                agg_3 = agg_3 * scaler.unsqueeze(-1)
+            graph_agg = scatter(agg_3, batch_idx, dim=0, dim_size=num_graphs, reduce="sum")
+            return lambda_3 * graph_agg
+        else:
+            lse_3 = segment_logsumexp(beta_3 * ell_3, c_3, num_nodes, dim=0)
+            lse_3 = torch.where(
+                torch.bincount(c_3, minlength=num_nodes).eq(0).view(-1, *([1] * (lse_3.dim() - 1))),
+                torch.zeros_like(lse_3),
+                lse_3,
+            )
+            scaler = context.get("degree_scaler")
+            if scaler is not None:
+                lse_3 = lse_3 * scaler.unsqueeze(-1)
+            graph_lse = scatter(lse_3, batch_idx, dim=0, dim_size=num_graphs, reduce="sum")
+            return (lambda_3 / beta_3) * graph_lse
 
 
 class MemoryBranch(EnergyBranch):
@@ -147,7 +175,7 @@ class MemoryBranch(EnergyBranch):
         Qm = proj.get("Qm")
         Km = proj.get("Km")
         batch_idx = batch.batch if hasattr(batch, "batch") else context.get("batch")
-        num_graphs = context.get("num_graphs", int(batch_idx.max().item() + 1) if batch_idx is not None else 1)
+        num_graphs = context.get("num_graphs", (batch_idx.max() + 1) if batch_idx is not None else 1)
 
         if Qm is None or Km is None:
             return H.new_zeros(num_graphs)
@@ -155,10 +183,11 @@ class MemoryBranch(EnergyBranch):
         scale = Qm.size(-1) ** 0.5
         ell_m = torch.einsum("nhd,hkd->nhk", Qm, Km) / scale
 
-        beta_m = inverse_temperature(params, "beta_m")
+        beta_max = params.get("beta_max", None)
+        beta_m = inverse_temperature(params, "beta_m", beta_max=beta_max)
         lse_m = torch.logsumexp(beta_m * ell_m, dim=-1)
         per_node = (lambda_m / beta_m) * lse_m
-        per_graph = scatter_add_nd(H.new_zeros((num_graphs, per_node.shape[-1])), batch_idx, per_node, dim=0)
+        per_graph = scatter(per_node, batch_idx, dim=0, dim_size=num_graphs, reduce="sum")
         return per_graph
 
 
@@ -182,7 +211,7 @@ class GlobalAttentionBranch(EnergyBranch):
         Qg = proj.get("Qg")
         Kg = proj.get("Kg")
         batch_idx = batch.batch if hasattr(batch, "batch") else context.get("batch")
-        num_graphs = context.get("num_graphs", int(batch_idx.max().item() + 1) if batch_idx is not None else 1)
+        num_graphs = context.get("num_graphs", (batch_idx.max() + 1) if batch_idx is not None else 1)
 
         if Qg is None or Kg is None:
             return H.new_zeros(num_graphs)
@@ -190,8 +219,6 @@ class GlobalAttentionBranch(EnergyBranch):
         scale = Qg.size(-1) ** 0.5
         beta_g = inverse_temperature(params, "beta_g")
 
-        # Avoid dense N x N masking across the whole batch. Compute per-graph
-        # attention blocks using contiguous node ranges from batch assignments.
         counts = torch.bincount(batch_idx, minlength=num_graphs)
         if counts.numel() == 0:
             return H.new_zeros(num_graphs)
@@ -248,8 +275,8 @@ class GlobalAttentionBranch(EnergyBranch):
                     continue
                 s = int(starts[gidx].item())
                 e = s + ng
-                qg = Qg[s:e]  # [ng, H, d]
-                kg = Kg[s:e]  # [ng, H, d]
+                qg = Qg[s:e]
+                kg = Kg[s:e]
                 lse_g = qg.new_full((ng, qg.size(1)), float("-inf"))
                 for ks in range(0, ng, chunk_size):
                     ke = min(ks + chunk_size, ng)
@@ -279,19 +306,16 @@ def get_branch(name: str) -> EnergyBranch:
 
 
 def enabled_branches_from_config(model_cfg: Any) -> Dict[str, bool]:
-    """Extract enabled branch flags from a config object."""
     return {
         "pairwise": bool(getattr(model_cfg, "pairwise", True)),
         "motif": bool(getattr(model_cfg, "motif", True)),
         "memory": bool(getattr(model_cfg, "memory", True)),
         "global_attention": bool(getattr(model_cfg, "global_attention", False)),
-        "structural_memory": bool(getattr(model_cfg, "structural_memory", False)),
-        "dynamic_edges": bool(getattr(model_cfg, "dynamic_edges", False)),
     }
 
 
 class _QuadraticBranchCached(QuadraticBranch):
-    """Single cached instance to avoid re-creating on every forward call."""
+    pass
 
 _quad_branch = _QuadraticBranchCached()
 
@@ -332,7 +356,6 @@ class ComposedEnergy(nn.Module):
         return total, branch_energies
 
 
-# Register built-in branches
 register_branch(PairwiseBranch())
 register_branch(MotifBranch())
 register_branch(MemoryBranch())

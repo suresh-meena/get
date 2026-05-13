@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import time
 from pathlib import Path
 from typing import Dict, List, Any
 
@@ -20,6 +19,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from get.utils.seed import seed_everything
+from get.utils.device import move_batch_to_device
+from get.utils.compile import maybe_compile_model
+from experiments.common import score_key_for_task as _score_key_for_task
 from get.data import (
     ListGraphDataset,
     build_dataset,
@@ -31,7 +33,7 @@ from get.data import (
     split_items,
 )
 from get.models import build_model
-from get.trainers import UnifiedTrainer
+from experiments.common import fit_unified_trainer, make_loader_kwargs, resolve_device
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -101,6 +103,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--output_file", type=str, default="")
     p.add_argument("--output", type=str, default="")
     p.add_argument("--output_dir", type=str, default="outputs/protocol")
+    p.add_argument("--compile", action="store_true", default=False, help="Enable torch.compile for eval")
+    p.add_argument("--compile_scope", type=str, default="eval_only", choices=["eval_only", "all"],
+                   help="'all' compiles train and eval paths; use 'eval_only' if your backend still has issues")
     return p
 
 
@@ -108,32 +113,8 @@ def _count_params(model: torch.nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
-def _get_peak_cuda_memory() -> float:
-    if torch.cuda.is_available():
-        return torch.cuda.max_memory_allocated() / (1024 * 1024)
-    return 0.0
-
-
-def _score_key_for_task(task_type: str) -> str:
-    if task_type == "regression":
-        return "mae"
-    if task_type in {"binary", "node_binary", "multilabel"}:
-        return "auc"
-    return "acc"
-
-
-def _maybe_wrap_prefetch(loader, *, use_prefetch: bool, device: torch.device):
-    if not use_prefetch:
-        return loader
-    if device.type != "cuda":
-        return loader
-    if not _has_prefetch_loader:
-        return loader
-    return PrefetchLoader(loader, device=device)
-
-
 def _evaluate_brec_by_category(
-    trainer: UnifiedTrainer,
+    trainer,
     args: argparse.Namespace,
     te_items,
 ) -> Dict[str, Dict[str, float]]:
@@ -152,10 +133,7 @@ def _evaluate_brec_by_category(
 
     id_to_name = getattr(args, "_brec_category_names", {}) or {}
     out: Dict[str, Dict[str, float]] = {}
-    num_workers = int(getattr(args, "num_workers", 0))
-    pin_memory = torch.cuda.is_available()
-    persistent_workers = num_workers > 0
-    prefetch_factor = 2 if num_workers > 0 else None
+    loader_kwargs = make_loader_kwargs(getattr(args, "num_workers", 0))
 
     for cat_id, samples in grouped.items():
         name = str(id_to_name.get(cat_id, f"category_{cat_id}"))
@@ -164,10 +142,7 @@ def _evaluate_brec_by_category(
             batch_size=args.batch_size,
             shuffle=False,
             collate_fn=collate_graph_samples,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=persistent_workers,
-            prefetch_factor=prefetch_factor,
+            **loader_kwargs,
         )
         stats = trainer._run_epoch(loader, train=False)
         out[name] = {k: float(v) for k, v in stats.items() if isinstance(v, (int, float))}
@@ -186,6 +161,11 @@ def run_experiment(args: argparse.Namespace, tr_items, va_items, te_items, task_
     model = build_model(cfg).to(device)
     parameter_count = _count_params(model)
 
+    eval_model = model
+    if getattr(args, "compile", False):
+        compile_cfg = {"enabled": True, "scope": "eval_only"}
+        eval_model = maybe_compile_model(model, compile_cfg)
+
     trainer_cfg = {
         "epochs": args.epochs,
         "lr": args.lr,
@@ -196,44 +176,36 @@ def run_experiment(args: argparse.Namespace, tr_items, va_items, te_items, task_
         "num_classes": num_classes,
     }
 
-    num_workers = int(getattr(args, "num_workers", 0))
-    pin_memory = torch.cuda.is_available()
-    persistent_workers = num_workers > 0
-    prefetch_factor = 2 if num_workers > 0 else None
+    loader_kwargs = make_loader_kwargs(getattr(args, "num_workers", 0))
 
     train_loader = torch.utils.data.DataLoader(
         ListGraphDataset(tr_items), batch_size=args.batch_size, shuffle=True,
-        collate_fn=collate_graph_samples, num_workers=num_workers,
-        pin_memory=pin_memory, persistent_workers=persistent_workers,
-        prefetch_factor=prefetch_factor,
+        collate_fn=collate_graph_samples, **loader_kwargs,
     )
     val_loader = torch.utils.data.DataLoader(
         ListGraphDataset(va_items), batch_size=args.batch_size, shuffle=False,
-        collate_fn=collate_graph_samples, num_workers=num_workers,
-        pin_memory=pin_memory, persistent_workers=persistent_workers,
-        prefetch_factor=prefetch_factor,
+        collate_fn=collate_graph_samples, **loader_kwargs,
     )
     test_loader = torch.utils.data.DataLoader(
         ListGraphDataset(te_items), batch_size=args.batch_size, shuffle=False,
-        collate_fn=collate_graph_samples, num_workers=num_workers,
-        pin_memory=pin_memory, persistent_workers=persistent_workers,
-        prefetch_factor=prefetch_factor,
+        collate_fn=collate_graph_samples, **loader_kwargs,
     )
 
     use_prefetch = bool(getattr(args, "use_pyg_prefetch_loader", False))
-    train_loader = _maybe_wrap_prefetch(train_loader, use_prefetch=use_prefetch, device=device)
-    val_loader = _maybe_wrap_prefetch(val_loader, use_prefetch=use_prefetch, device=device)
-    test_loader = _maybe_wrap_prefetch(test_loader, use_prefetch=use_prefetch, device=device)
+    if use_prefetch and device.type == "cuda" and _has_prefetch_loader:
+        train_loader = PrefetchLoader(train_loader, device=device)
+        val_loader = PrefetchLoader(val_loader, device=device)
+        test_loader = PrefetchLoader(test_loader, device=device)
 
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
-
-    start_time = time.time()
-    trainer = UnifiedTrainer(model=model, device=device, trainer_cfg=trainer_cfg)
-    fit_result = trainer.fit(train_loader, val_loader, test_loader)
-    elapsed = time.time() - start_time
-
-    history = fit_result.pop("history", {"train": [], "val": []})
+    trainer, fit_result, history, elapsed, peak_memory_mb = fit_unified_trainer(
+        model=model,
+        eval_model=eval_model,
+        device=device,
+        trainer_cfg=trainer_cfg,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=test_loader,
+    )
 
     model_name = str(getattr(args, "model_name", "fullget")).lower()
     is_ham = model_name.startswith("get_ham_")
@@ -243,9 +215,25 @@ def run_experiment(args: argparse.Namespace, tr_items, va_items, te_items, task_
         "memory": model_name in ("fullget", "get_ham_global", "get_ham_cls", "get_ham_full"),
         "global_attention": model_name in ("get_ham_global", "get_ham_cls", "get_ham_full"),
         "cls_token": model_name in ("get_ham_cls", "get_ham_full"),
-        "structural_memory": False,
-        "dynamic_edges": False,
     }
+    readout_mode = "graph"
+    if model_name == "get_ham_cls":
+        readout_mode = "cls"
+
+    energy_trace = []
+    try:
+        was_training = model.training
+        model.eval()
+        _it = iter(test_loader)
+        _batch = next(_it)
+        _batch = move_batch_to_device(_batch, device)
+        out = model(_batch, return_solver_stats=True)
+        if isinstance(out, (tuple, list)) and len(out) >= 2 and isinstance(out[1], list):
+            energy_trace = out[1]
+        if was_training:
+            model.train()
+    except Exception:
+        pass
 
     result = {
         "train": fit_result.get("final_train", {}),
@@ -254,10 +242,12 @@ def run_experiment(args: argparse.Namespace, tr_items, va_items, te_items, task_
         "best_val_score": fit_result["best_val_score"],
         "epochs_ran": fit_result["epochs_ran"],
         "history": history,
+        "energy_trace": energy_trace,
         "parameter_count": parameter_count,
         "runtime_seconds": elapsed,
-        "peak_cuda_memory_mb": _get_peak_cuda_memory(),
+        "peak_cuda_memory_mb": peak_memory_mb,
         "enabled_branches": enabled_branches,
+        "readout_mode": readout_mode,
         "solver_state_keys": ["H"],
         "num_inference_steps": int(getattr(args, "num_steps", 8)),
         "compile_scope": "eval_only",
@@ -273,10 +263,7 @@ def main():
     parser = build_arg_parser()
     args = parser.parse_args()
 
-    if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(args.device)
+    device = resolve_device(args.device)
 
     spec = TASK_SPECS[args.task]
     task_type = spec.task_type
@@ -355,6 +342,8 @@ def main():
                 "test": metrics["test"],
                 "test_by_category": metrics.get("test_by_category", {}),
                 "history": metrics["history"],
+                "energy_trace": metrics.get("energy_trace", []),
+                "num_inference_steps": metrics.get("num_inference_steps", 0),
                 "runtime_seconds": metrics["runtime_seconds"],
                 "peak_cuda_memory_mb": metrics["peak_cuda_memory_mb"],
             }

@@ -116,9 +116,8 @@ def test_result_schema_smoke(tmp_path):
 # 5. Compile guard
 # ---------------------------------------------------------------------------
 
-def test_compile_scope_all_raises_for_double_backward_model(tmp_path):
-    """compile_scope='all' must raise for models that require double backward."""
-    import json
+def test_compile_scope_all_accepts_get_model(tmp_path):
+    """compile_scope='all' should run for GET models once inner grads use torch.func.grad."""
     cmd = [
         sys.executable, str(ROOT / "main.py"),
         "dataset.name=stage1_wedge_triangle",
@@ -132,8 +131,9 @@ def test_compile_scope_all_raises_for_double_backward_model(tmp_path):
         f"+output_dir={tmp_path}",
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    assert proc.returncode != 0, "compile_scope='all' should raise for double-backward models"
-    assert "double backward" in proc.stderr.lower() or "unsupported" in proc.stderr.lower()
+    assert proc.returncode == 0, proc.stderr
+    assert "double backward" not in proc.stderr.lower()
+    assert "compile.scope='all'" not in proc.stderr
 
 
 def test_compile_guard_eval_only_accepted(tmp_path):
@@ -286,26 +286,18 @@ def test_branch_registry_pairwiseget_defaults_disable_global_and_cls():
         motif = False
         memory = False
         global_attention = False
-        structural_memory = False
-        dynamic_edges = False
 
     class _FullGETCfg:
         pairwise = True
         motif = True
         memory = True
         global_attention = False
-        structural_memory = False
-        dynamic_edges = False
 
     pw = enabled_branches_from_config(_PairwiseCfg)
     assert pw["global_attention"] is False
-    assert pw["structural_memory"] is False
-    assert pw["dynamic_edges"] is False
 
     fg = enabled_branches_from_config(_FullGETCfg)
     assert fg["global_attention"] is False
-    assert fg["structural_memory"] is False
-    assert fg["dynamic_edges"] is False
     assert fg["pairwise"] is True
     assert fg["motif"] is True
 
@@ -518,6 +510,57 @@ def test_get_ham_cls_integrated_forward_is_finite():
         max_global_nodes=32,
     )
     model = build_model(cfg)
+    out = model(batch)
+    assert out.shape == (1,)
+    assert torch.isfinite(out).all()
+
+
+def test_get_ham_full_integrated_forward_is_finite():
+    """Full HAM should keep CLS enabled but use graph readout for logits."""
+    from types import SimpleNamespace
+    import torch
+    from get.data.synthetic import sample_from_edge_index, collate_graph_samples
+    from get.models.factory import build_model
+
+    edge_index = torch.tensor(
+        [[0, 1, 2, 3, 0, 1], [1, 2, 3, 0, 2, 3]],
+        dtype=torch.long,
+    )
+    x = torch.randn(4, 5)
+    y = torch.tensor([1.0])
+    batch = collate_graph_samples([
+        sample_from_edge_index(edge_index, 4, x, y, max_motifs_per_anchor=4)
+    ])
+
+    cfg = SimpleNamespace(
+        model_name="get_ham_full",
+        task_type="binary",
+        num_classes=1,
+        in_dim=5,
+        hidden_dim=8,
+        num_steps=1,
+        num_heads=2,
+        head_dim=4,
+        R=2,
+        K=3,
+        num_motif_types=2,
+        lambda_2=1.0,
+        lambda_3=1.0,
+        lambda_m=1.0,
+        lambda_g=1.0,
+        beta_2=1.0,
+        beta_3=1.0,
+        beta_m=1.0,
+        beta_g=1.0,
+        update_damping=0.0,
+        fixed_step_size=0.01,
+        inference_mode_train="fixed",
+        inference_mode_eval="fixed",
+        max_global_nodes=32,
+    )
+    model = build_model(cfg)
+    assert model.readout_mode == "graph"
+    assert model.use_cls_token is True
     out = model(batch)
     assert out.shape == (1,)
     assert torch.isfinite(out).all()

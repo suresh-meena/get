@@ -23,7 +23,16 @@ from torchmetrics.classification import (
 from torchmetrics.regression import MeanAbsoluteError
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
 
-from get.utils.device import move_batch_to_device, assert_cuda_batch
+from get.utils.device import move_batch_to_device
+
+
+def _iter_stat_samples(loader: Iterable[Dict[str, torch.Tensor]]):
+    dataset = getattr(loader, "dataset", None)
+    if dataset is not None and hasattr(dataset, "__len__") and hasattr(dataset, "__getitem__"):
+        for idx in range(len(dataset)):
+            yield dataset[idx]
+        return
+    yield from loader
 
 
 def _set_global_avg_degree(model: torch.nn.Module, avg_degree: float | None) -> None:
@@ -105,7 +114,7 @@ class UnifiedTrainer:
         self.warmup_scheduler = LambdaLR(self.optimizer, lr_lambda)
         self.cosine_scheduler = CosineAnnealingLR(
             self.optimizer, 
-            T_max=self.epochs - warmup_epochs, 
+            T_max=max(1, self.epochs - warmup_epochs), 
             eta_min=float(trainer_cfg.get("min_lr", 5e-6))
         )
 
@@ -189,8 +198,6 @@ class UnifiedTrainer:
 
         for batch in iterator:
             batch = move_batch_to_device(batch, self.device)
-            if getattr(self, "_debug_assert_cuda", False) and self.device.type == "cuda":
-                assert_cuda_batch(batch, warn_only=True)
             mask = None
             if self.task_type == "multiclass":
                 targets = batch["y"].view(-1).long()
@@ -296,8 +303,7 @@ class UnifiedTrainer:
         degree_sum = torch.zeros(1, device=self.device)
         node_sum = torch.zeros(1, device=self.device)
 
-        for batch in train_loader:
-            batch = move_batch_to_device(batch, self.device)
+        for batch in _iter_stat_samples(train_loader):
             if self.task_type == "multiclass":
                 saw_targets = True
             elif self.task_type in {"multilabel", "node_binary"}:

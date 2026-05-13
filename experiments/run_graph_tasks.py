@@ -19,12 +19,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from external.graph_baselines.torch_baselines import ExternalGraphBaseline  # noqa: E402
-from get.data import SyntheticGraphDataset  # noqa: E402
+from get.data import SyntheticGraphDataset, ListGraphDataset  # noqa: E402
 from get.data.synthetic import sample_from_edge_index  # noqa: E402
 from get.models import EnergyGraphClassifier  # noqa: E402
-from get.trainers import UnifiedTrainer  # noqa: E402
 from get.utils.seed import seed_everything  # noqa: E402
 from get.data import infer_edge_attr_dim, split_items, summarize_splits  # noqa: E402
+from experiments.common import fit_unified_trainer, make_loader_kwargs, resolve_device  # noqa: E402
 
 
 def _apply_task_preset(args: argparse.Namespace) -> argparse.Namespace:
@@ -109,18 +109,6 @@ def _apply_benchmark_preset(args: argparse.Namespace) -> argparse.Namespace:
     return args
 
 
-def _loader_kwargs(args: argparse.Namespace) -> Dict[str, object]:
-    num_workers = int(getattr(args, "num_workers", 0))
-    kwargs: Dict[str, object] = {
-        "num_workers": num_workers,
-        "pin_memory": torch.cuda.is_available(),
-        "persistent_workers": num_workers > 0,
-    }
-    if num_workers > 0:
-        kwargs["prefetch_factor"] = 2
-    return kwargs
-
-
 def _runtime_config(args: argparse.Namespace) -> dict:
     model_name = str(args.model_name).lower()
     return {
@@ -167,6 +155,7 @@ def _build_tudataset_loaders(args: argparse.Namespace):
         root=args.dataset_root,
         in_dim=args.in_dim,
         max_motifs_per_anchor=args.max_motifs_per_anchor,
+        pos_k=getattr(args, "et_pos_k", 0),
         task_type="auto"
     )
     all_samples = dataset.items if hasattr(dataset, "items") else [dataset[i] for i in range(len(dataset))]
@@ -188,11 +177,11 @@ def _build_tudataset_loaders(args: argparse.Namespace):
 
 
 def _build_loaders_from_samples(train_items, val_items, test_items, args, task_type):
-    train_ds = _ListGraphDataset(train_items)
-    val_ds = _ListGraphDataset(val_items)
-    test_ds = _ListGraphDataset(test_items)
+    train_ds = ListGraphDataset(train_items)
+    val_ds = ListGraphDataset(val_items)
+    test_ds = ListGraphDataset(test_items)
 
-    loader_kwargs = _loader_kwargs(args)
+    loader_kwargs = make_loader_kwargs(getattr(args, "num_workers", 0))
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
     eval_bs = args.eval_batch_size or args.batch_size
     val_loader = DataLoader(val_ds, batch_size=eval_bs, shuffle=False, **loader_kwargs)
@@ -221,7 +210,7 @@ def _build_loaders(args: argparse.Namespace):
     val_ds = SyntheticGraphDataset(num_graphs=args.num_val_graphs, seed=args.seed + 1, **common)
     test_ds = SyntheticGraphDataset(num_graphs=args.num_test_graphs, seed=args.seed + 2, **common)
 
-    loader_kwargs = _loader_kwargs(args)
+    loader_kwargs = make_loader_kwargs(getattr(args, "num_workers", 0))
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
     eval_bs = args.eval_batch_size or args.batch_size
     val_loader = DataLoader(val_ds, batch_size=eval_bs, shuffle=False, **loader_kwargs)
@@ -254,17 +243,6 @@ def _pyg_data_to_sample(data, in_dim: int, max_motifs_per_anchor: int, task_type
         yy = torch.tensor([1.0 if float(y.item()) > 0 else 0.0], dtype=torch.float32)
 
     return sample_from_edge_index(edge_index=edge_index, num_nodes=n, x=x, y=yy, max_motifs_per_anchor=max_motifs_per_anchor)
-
-
-class _ListGraphDataset(torch.utils.data.Dataset):
-    def __init__(self, samples: List[Dict[str, torch.Tensor]]) -> None:
-        self.samples = samples
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        return self.samples[idx]
 
 
 def _load_csl_samples(args: argparse.Namespace) -> tuple[List[Dict[str, torch.Tensor]], int]:
@@ -309,11 +287,11 @@ def _build_real_stage2_loaders(args: argparse.Namespace):
 
     train_items, val_items, test_items = split_items(samples, seed=args.seed, train_ratio=0.70, val_ratio=0.15, task_type=task_type)
 
-    train_ds = _ListGraphDataset(train_items)
-    val_ds = _ListGraphDataset(val_items)
-    test_ds = _ListGraphDataset(test_items)
+    train_ds = ListGraphDataset(train_items)
+    val_ds = ListGraphDataset(val_items)
+    test_ds = ListGraphDataset(test_items)
 
-    loader_kwargs = _loader_kwargs(args)
+    loader_kwargs = make_loader_kwargs(getattr(args, "num_workers", 0))
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
     eval_bs = args.eval_batch_size or args.batch_size
     val_loader = DataLoader(val_ds, batch_size=eval_bs, shuffle=False, **loader_kwargs)
@@ -348,8 +326,8 @@ def _run_single_fit(
         if compile_scope == "all":
             if getattr(model, "requires_double_backward", False):
                 raise ValueError(
-                    "compile_scope='all' is unsupported for GET training because torch.compile "
-                    "does not currently support double backward. Use compile_scope='eval_only'."
+                    "compile_scope='all' is unsupported for models that still require double backward. "
+                    "Use compile_scope='eval_only'."
                 )
             model = maybe_compile_model(model, compile_cfg)
             eval_model = model
@@ -373,8 +351,16 @@ def _run_single_fit(
         "task_type": task_type,
         "num_classes": num_classes,
     }
-    trainer = UnifiedTrainer(model=model, eval_model=eval_model, device=device, trainer_cfg=trainer_cfg)
-    return trainer.fit(train_loader, val_loader, test_loader)
+    _, fit_result, _, _, _ = fit_unified_trainer(
+        model=model,
+        eval_model=eval_model,
+        device=device,
+        trainer_cfg=trainer_cfg,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=test_loader,
+    )
+    return fit_result
 
 
 def _build_model(args: argparse.Namespace, task_type: str, num_classes: int, edge_attr_dim: int = 0) -> torch.nn.Module:
@@ -589,14 +575,7 @@ def main() -> None:
     args = _apply_benchmark_preset(args)
 
     seed_everything(args.seed)
-    if args.device == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("Requested CUDA but not available")
-        device = torch.device("cuda")
-    elif args.device == "cpu":
-        device = torch.device("cpu")
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(args.device)
 
     all_run_metrics = []
     base_seed = args.seed

@@ -30,25 +30,7 @@ from get.data import (
 from get.models import build_model
 from get.trainers import UnifiedTrainer
 from get.utils import maybe_compile_model, seed_everything, move_batch_to_device
-
-
-def _score_key_for_task(task_type: str) -> str:
-    if task_type == "regression":
-        return "mae"
-    if task_type in {"binary", "node_binary", "multilabel"}:
-        return "auc"
-    return "acc"
-
-
-def _resolve_device(requested: str) -> torch.device:
-    requested = requested.lower()
-    if requested == "cpu":
-        return torch.device("cpu")
-    if requested == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("Requested CUDA device, but CUDA is not available.")
-        return torch.device("cuda")
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from experiments.common import resolve_device, score_key_for_task
 
 
 def _build_loaders_from_items(
@@ -139,7 +121,7 @@ def _run_single_experiment(
     if bool(compile_cfg.get("enabled", False)):
         if compile_scope == "all":
             if getattr(model, "requires_double_backward", False):
-                raise ValueError("compile.scope='all' is unsupported for GET/ET training because torch.compile does not currently support double backward. Use compile.scope='eval_only'.")
+                raise ValueError("compile.scope='all' is unsupported for models that still require double backward. Use compile.scope='eval_only'.")
             model = maybe_compile_model(model, compile_cfg)
             eval_model = model
         elif compile_scope == "eval_only":
@@ -174,9 +156,10 @@ def _run_single_experiment(
         "memory": model_name in ("fullget", "get_ham_global", "get_ham_cls", "get_ham_full"),
         "global_attention": model_name in ("get_ham_global", "get_ham_cls", "get_ham_full"),
         "cls_token": model_name in ("get_ham_cls", "get_ham_full"),
-        "structural_memory": False,
-        "dynamic_edges": False,
     }
+    readout_mode = "graph"
+    if model_name == "get_ham_cls":
+        readout_mode = "cls"
 
     return {
         "train": fit_result.get("final_train", {}),
@@ -189,6 +172,7 @@ def _run_single_experiment(
         "runtime_seconds": elapsed,
         "peak_cuda_memory_mb": peak_memory,
         "enabled_branches": enabled_branches,
+        "readout_mode": readout_mode,
         "solver_state_keys": ["H"],
         "num_inference_steps": int(run_cfg.get("num_steps", 8)),
         "compile_scope": compile_scope,
@@ -197,7 +181,7 @@ def _run_single_experiment(
 
 def run_from_cfg(cfg: DictConfig) -> Dict:
     seed_everything(int(cfg.seed))
-    device = _resolve_device(str(cfg.experiment.get("device", "auto")))
+    device = resolve_device(str(cfg.experiment.get("device", "auto")))
     base_seed = int(cfg.seed)
     ds = cfg.dataset
     dataset_name = str(ds.get("name", "synthetic")).lower()
@@ -257,7 +241,7 @@ def run_from_cfg(cfg: DictConfig) -> Dict:
             all_run_metrics.append(metrics)
 
     if len(all_run_metrics) > 1:
-        score_key = _score_key_for_task(task_type)
+        score_key = score_key_for_task(task_type)
         run_scores = [m["test"][score_key] for m in all_run_metrics]
         final_metrics = {
             "num_runs_or_folds": len(all_run_metrics),

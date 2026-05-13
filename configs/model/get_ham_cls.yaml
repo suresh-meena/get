@@ -19,6 +19,7 @@ beta_g: 1.0
 update_damping: 0.0
 use_energy_norm: true
 agg_mode: "softmax"
+readout_mode: "cls"
 use_cls_token: true
 max_global_nodes: 512
 edge_attr_dim: 0

@@ -1,25 +1,8 @@
-from functools import lru_cache
-
 import torch.nn as nn
-from .ops import scatter_add_nd
+from torch_geometric.utils import scatter
 
 class LinearAggregationEnergy(nn.Module):
-    """Linear aggregation energy branch: - \sum_{i,j} X_i^T X_j."""
-    
     def forward(self, X, c_2, u_2, batch, num_graphs):
-        # Gather neighbor states
-        X_u = X[u_2]
-        # Dot product with self
-        scores = (X[c_2] * X_u).sum(dim=-1)
-        # Energy per graph (sum over edges)
-        # Note: Factor 0.5 because each edge is counted twice in undirected c_2, u_2
-        energy = -0.5 * scatter_add_nd(X.new_zeros(num_graphs), batch[c_2], scores, dim=0)
+        scores = (X[c_2] * X[u_2]).sum(dim=-1)
+        energy = -0.5 * scatter(scores, batch[c_2], dim=0, dim_size=num_graphs, reduce="sum")
         return energy
-
-@lru_cache(maxsize=1)
-def _cached_linear_aggregation_energy() -> LinearAggregationEnergy:
-    return LinearAggregationEnergy()
-
-
-def compute_linear_aggregation_energy(X, c_2, u_2, batch, num_graphs):
-    return _cached_linear_aggregation_energy()(X, c_2, u_2, batch, num_graphs)

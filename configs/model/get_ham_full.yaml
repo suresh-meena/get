@@ -1,4 +1,4 @@
-# GET-HAM full: all stable branches (no dynamic edges)
+# GET-HAM full: all stable branches (no dynamic edges) with graph readout
 model_name: "get_ham_full"
 hidden_dim: 192
 num_heads: 6
@@ -19,6 +19,7 @@ beta_g: 1.0
 update_damping: 0.0
 use_energy_norm: true
 agg_mode: "softmax"
+readout_mode: "graph"
 use_cls_token: true
 max_global_nodes: 512
 edge_attr_dim: 0

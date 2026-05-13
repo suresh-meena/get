@@ -69,14 +69,6 @@ class _AttentionEnergy(nn.Module):
         H = self.num_heads
         betas = self.betas.abs().clamp_min(1e-6)
 
-        if adj is not None and adj.dim() == 3:
-            a1 = torch.einsum("h, qhz, khz -> hqk", betas, Q, K)
-            a11 = torch.einsum("qkh,hm->qkm", a1.permute(1, 2, 0), self.Hw) * adj
-            a11 = torch.where(a11 == 0, torch.full_like(a11, float("-inf")), a11)
-            a21 = torch.logsumexp(a11, dim=1)
-            a21 = torch.where(a21 == float("-inf"), torch.zeros_like(a21), a21)
-            return ((-1.0 / betas) * a21.sum(dim=0)).sum()
-
         if E == 0:
             return g.new_zeros(1).squeeze()
 
@@ -168,9 +160,9 @@ class _ETBlock(nn.Module):
         create_graph: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         g = self.norm(x)
-        g = g.requires_grad_(True)
         e = self.energy_from_g(g, c_2, u_2, adj=adj)
-        grad, = torch.autograd.grad(e, g, create_graph=create_graph)
+        del create_graph
+        grad = torch.func.grad(lambda curr_g: self.energy_from_g(curr_g, c_2, u_2, adj=adj))(g)
         
         if vary_noise and noise_std > 0.0:
             current_noise = noise_std / pow(1.0 + float(step_idx), 0.55)
@@ -221,8 +213,6 @@ class ETGraphClassifier(nn.Module):
         vary_noise: bool = False,
         readout_mode: str = "cls",
         update_damping: float = 0.0,
-        inference_mode_train: str = "fixed",
-        inference_mode_eval: str = "fixed",
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -238,7 +228,7 @@ class ETGraphClassifier(nn.Module):
         self.noise_std = float(noise_std)
         self.vary_noise = bool(vary_noise)
         self.readout_mode = str(readout_mode).lower()
-        self.requires_double_backward = True
+        self.requires_double_backward = False
 
         self.encoder = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),

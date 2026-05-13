@@ -1,15 +1,10 @@
-from functools import lru_cache
-
 import torch
 import torch.nn as nn
-from .ops import positive_param, inverse_temperature, scatter_add_nd
+from torch_geometric.utils import scatter
+from .ops import positive_param, inverse_temperature
 
 class MemoryEnergy(nn.Module):
-    def forward(self, G, batch, num_graphs, params, projections, return_grad=False):
-        # We enforce pure functional energy; return_grad is removed to rely on autograd.
-        d = params['d']
-        beta_max = params.get('beta_max', None)
-        
+    def forward(self, G, batch, num_graphs, params, projections):
         if not params.get('use_memory', True):
             return G.new_zeros((*G.shape[:-2], num_graphs))
 
@@ -18,20 +13,13 @@ class MemoryEnergy(nn.Module):
             return G.new_zeros((*G.shape[:-2], num_graphs))
 
         Qm, Km = projections['Qm'], projections['Km']
-        scale = d ** 0.5
-        beta_m = inverse_temperature(params, 'beta_m', beta_max=beta_max)
-        
-        # Qm is [num_nodes, num_heads, head_dim]
-        # Km is [num_heads, K, head_dim]
-        Lm = torch.einsum("nhd, hkd -> nhk", Qm, Km) / scale
-        lse_m = torch.logsumexp(beta_m * Lm, dim=-1)
-        
-        return (lambda_m / beta_m) * scatter_add_nd(lse_m.new_zeros((num_graphs, lse_m.shape[-1])), batch, lse_m, dim=0)
+        beta_m = inverse_temperature(params, 'beta_m', beta_max=params.get('beta_max', None))
 
-@lru_cache(maxsize=1)
-def _cached_memory_energy() -> MemoryEnergy:
-    return MemoryEnergy()
+        Lm = torch.einsum("nhd, hkd -> nhk", Qm, Km) / (params['d'] ** 0.5)
+        lse_m = torch.logsumexp(beta_m * Lm, dim=-1)
+
+        return (lambda_m / beta_m) * scatter(lse_m, batch, dim=0, dim_size=num_graphs, reduce="sum")
 
 
 def compute_memory_energy(G, batch, num_graphs, params, projections):
-    return _cached_memory_energy()(G, batch, num_graphs, params, projections)
+    return MemoryEnergy()(G, batch, num_graphs, params, projections)

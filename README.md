@@ -64,10 +64,9 @@ Enable `torch.compile` (optional):
 PYTHONPATH=. python main.py experiment.compile.enabled=true
 ```
 
-Default scope is `experiment.compile.scope=eval_only`, which compiles eval path only and keeps training uncompiled (safer for solver training).
+Default scope is `experiment.compile.scope=eval_only`, which compiles eval path only and keeps training uncompiled when you want the safest path.
 Use `experiment.compile.scope=all` to compile both train and eval paths.
-For GET training, compile is guarded by default because solver training uses higher-order autodiff.
-Set `experiment.compile.allow_double_backward=true` only if your backend supports it.
+GET and ET inner-loop gradients now use `torch.func.grad`, so the old double-backward guard is no longer needed for these models.
 
 AMP is config-driven via `trainer.use_amp` and `trainer.amp_dtype` (`fp16` or `bf16`).
 

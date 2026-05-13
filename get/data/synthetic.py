@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -11,19 +10,6 @@ import numba
 from torch_geometric.data import Batch, Data
 
 from get.energy.ops import positional_embeddings_from_edge_index
-
-
-@dataclass
-class GraphSample:
-    x: torch.Tensor
-    y: torch.Tensor
-    c_2: torch.Tensor
-    u_2: torch.Tensor
-    c_3: torch.Tensor
-    u_3: torch.Tensor
-    v_3: torch.Tensor
-    t_tau: torch.Tensor
-    pos: Optional[torch.Tensor] = None
 
 
 class GraphSampleData(Data):
@@ -154,6 +140,7 @@ def sample_from_edge_index(
         
     if pos_k > 0:
         sample.pos = positional_embeddings_from_edge_index(edge_index, num_nodes, k=pos_k)
+        sample.pos_embed_type = "eigen"
         
     return sample
 
@@ -235,6 +222,7 @@ def sample_from_adj(
     if pos_k > 0:
         edge_index = torch.stack([sample["c_2"], sample["u_2"]], dim=0)
         sample.pos = positional_embeddings_from_edge_index(edge_index, n, k=pos_k)
+        sample.pos_embed_type = "eigen"
         
     return sample
 

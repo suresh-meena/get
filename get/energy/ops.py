@@ -1,88 +1,26 @@
 import torch
 import torch.nn.functional as F
-from torch_geometric.utils import scatter, degree
-
-ts_scatter = None
-ts_scatter_add = None
-ts_scatter_max = None
-ts_scatter_logsumexp = None
-
-try:
-    from torch_scatter import scatter_logsumexp as ts_scatter_logsumexp  # type: ignore
-except Exception:
-    ts_scatter_logsumexp = None
-
-
-def segment_reduce_1d(src: torch.Tensor, segment_ids: torch.Tensor, num_segments: int, reduce="sum", dim: int = -1):
-    """
-    Optimized segmented reduction using PyTorch-Geometric's scatter.
-    This uses high-performance C++ kernels specialized for sparse graph reductions.
-    """
-    if dim < 0:
-        dim = src.dim() + dim
-        
-    out = scatter(src, segment_ids, dim=dim, dim_size=num_segments, reduce=reduce)
-    
-    # We still need counts for some scalers
-    counts = bincount_1d(segment_ids, num_segments)
-    return out, counts
-
-
-def bincount_1d(segment_ids: torch.Tensor, num_segments: int):
-    """Fast bincount wrapper."""
-    return torch.bincount(segment_ids, minlength=num_segments)
+from torch_geometric.utils import degree
 
 
 def segment_logsumexp(x: torch.Tensor, segment_ids: torch.Tensor, num_segments: int, dim: int = -1):
-    """
-    Computes logsumexp over segments using native PyTorch to support torch.compile.
-    Using scatter for max reduction.
-    """
     if dim < 0:
         dim = x.dim() + dim
 
-    # Fast path for non-compiled execution when torch_scatter is available.
-    if (
-        ts_scatter_logsumexp is not None
-        and dim == 0
-        and x.dim() >= 1
-        and segment_ids.dim() == 1
-        and segment_ids.numel() == x.size(0)
-        and not (hasattr(torch, "compiler") and torch.compiler.is_compiling())
-    ):
-        return ts_scatter_logsumexp(x, segment_ids, dim=0, dim_size=num_segments)
+    x_moved = x.movedim(dim, 0)
+    index = segment_ids.view(-1, *([1] * (x_moved.dim() - 1))).expand_as(x_moved)
 
-    def _logsumexp_fwd(x_val, ids, num_seg, d):
-        out_max = scatter(x_val, ids, dim=d, dim_size=num_seg, reduce="max")
+    out_max = x_moved.new_full((num_segments, *x_moved.shape[1:]), float("-inf"))
+    out_max.scatter_reduce_(0, index, x_moved, reduce="amax", include_self=True)
 
-        idx_shape = [1] * x_val.dim()
-        idx_shape[d] = len(ids)
-        idx = ids.view(*idx_shape).expand_as(x_val)
-        
-        max_expanded = torch.gather(out_max, d, idx)
-        max_expanded = torch.where(max_expanded == float('-inf'), torch.zeros_like(max_expanded), max_expanded)
-        x_shifted = x_val - max_expanded
+    max_expanded = out_max.index_select(0, segment_ids)
+    max_expanded = torch.where(torch.isneginf(max_expanded), torch.zeros_like(max_expanded), max_expanded)
+    x_shifted = x_moved - max_expanded
 
-        exp_x_shifted = torch.exp(x_shifted)
-        out_sum_exp = scatter(exp_x_shifted, ids, dim=d, dim_size=num_seg, reduce="sum")
-
-        neg_inf = torch.full_like(out_max, float("-inf"))
-        out = torch.where(out_sum_exp == 0, neg_inf, torch.log(out_sum_exp.clamp_min(1e-12)) + out_max)
-        return out
-
-    return _logsumexp_fwd(x, segment_ids, num_segments, dim)
-
-
-def scatter_add_nd(grad_buffer: torch.Tensor, indices: torch.Tensor, src: torch.Tensor, dim: int):
-    """
-    Memory-efficient N-dimensional scatter-add using scatter_add_.
-    """
-    if src.dtype != grad_buffer.dtype:
-        src = src.to(dtype=grad_buffer.dtype)
-    idx_shape = [1] * src.dim()
-    idx_shape[dim] = indices.size(0)
-    idx = indices.view(idx_shape).expand_as(src)
-    return grad_buffer.scatter_add_(dim, idx, src)
+    out_sum = x_moved.new_zeros((num_segments, *x_moved.shape[1:]))
+    out_sum.scatter_add_(0, index, torch.exp(x_shifted))
+    result = torch.log(out_sum.clamp_min(1e-12)) + out_max
+    return result.movedim(0, dim)
 
 
 def fused_motif_dot(
@@ -109,10 +47,7 @@ def positive_param(params: dict, name: str):
 def inverse_temperature(params: dict, name: str, beta_max=None):
     beta = positive_param(params, name)
     if beta_max is not None:
-        if torch.is_tensor(beta):
-            beta = beta.clamp(max=beta_max)
-        else:
-            beta = min(beta, beta_max)
+        beta = beta.clamp(max=beta_max) if torch.is_tensor(beta) else min(beta, beta_max)
     return beta
 
 
@@ -121,14 +56,10 @@ def get_degree_from_incidence(c_2: torch.Tensor, num_nodes: int):
     return degree(c_2, num_nodes=num_nodes, dtype=torch.float32)
 
 
-def compute_degree_scaler(degrees: torch.Tensor, avg_degree: torch.Tensor | float, mode="pna"):
+def compute_degree_scaler(degrees: torch.Tensor, avg_degree: float | torch.Tensor, mode="pna"):
     if mode == "pna":
-        if not torch.is_tensor(avg_degree):
-            avg_degree = torch.tensor(float(avg_degree), device=degrees.device, dtype=degrees.dtype)
-        else:
-            avg_degree = avg_degree.to(device=degrees.device, dtype=degrees.dtype)
-        avg_degree = avg_degree.clamp_min(1e-6)
-        return torch.log(degrees + 1.0) / torch.log(avg_degree + 1.0)
+        avg = avg_degree if isinstance(avg_degree, torch.Tensor) else torch.tensor(avg_degree, device=degrees.device, dtype=degrees.dtype)
+        return torch.log(degrees + 1.0) / torch.log(avg.clamp_min(1e-6) + 1.0)
     return torch.ones_like(degrees)
 
 

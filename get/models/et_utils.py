@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch_geometric.utils import to_dense_adj
 
+from get.energy.ops import positional_embeddings_from_edge_index
+
 
 @dataclass
 class ETBatchContext:
@@ -48,9 +50,8 @@ def build_et_batch_context(
     if "pos" in batch_data and batch_data["pos"].numel() > 0:
         pos_cat = batch_data["pos"].to(device=device, dtype=x.dtype)
     elif pos_k > 0:
-        if N > 4000:
-            pos_cat = torch.zeros((N, pos_k), device=device, dtype=x.dtype)
-        else:
+        embed_type = str(embed_type).lower()
+        if embed_type == "svd":
             edge_index = torch.stack([c_2, u_2], dim=0)
             padded_adj = to_dense_adj(edge_index, batch=batch)
             B, max_n, _ = padded_adj.shape
@@ -68,6 +69,36 @@ def build_et_batch_context(
             pos_cat = pe_padded[batch, local_node_ids]
             if flip_sign:
                 pos_cat = pos_cat * torch.randn_like(pos_cat).sign()
+        else:
+            pos_cat = torch.zeros((N, pos_k), device=device, dtype=x.dtype)
+            node_counts = torch.bincount(batch, minlength=num_graphs)
+            node_offsets = torch.cumsum(node_counts, dim=0)
+            node_offsets = F.pad(node_offsets[:-1], (1, 0))
+            for graph_idx in range(num_graphs):
+                node_count = int(node_counts[graph_idx].item())
+                if node_count == 0:
+                    continue
+
+                start = int(node_offsets[graph_idx].item())
+                node_indices = torch.arange(start, start + node_count, device=device)
+
+                edge_mask = batch[c_2] == graph_idx
+                if not edge_mask.any():
+                    continue
+
+                local_edge_index = torch.stack([
+                    c_2[edge_mask] - start,
+                    u_2[edge_mask] - start,
+                ], dim=0)
+                local_pos = positional_embeddings_from_edge_index(
+                    local_edge_index,
+                    node_count,
+                    k=pos_k,
+                    flip_sign=flip_sign,
+                )
+                if local_pos.numel() == 0:
+                    continue
+                pos_cat[node_indices] = local_pos.to(device=device, dtype=x.dtype)
     else:
         pos_cat = torch.empty((N, 0), device=device, dtype=x.dtype)
 

@@ -13,7 +13,7 @@ lambda_m: 1.0
 beta_2: 1.0
 beta_3: 1.0
 beta_m: 1.0
-num_motif_types: 24
+num_motif_types: 2
 R: 3
 K: 48
 dropout: 0.0
