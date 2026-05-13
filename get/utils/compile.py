@@ -34,6 +34,17 @@ def maybe_compile_model(model: torch.nn.Module, compile_cfg: Dict[str, Any] | No
     mode = compile_cfg.get("mode", None)
     fullgraph = bool(compile_cfg.get("fullgraph", False))
 
+    # CPU inductor compile can dominate short experiment runtime and make smoke
+    # checks flaky. Keep default behavior fast unless explicitly forced.
+    force_cpu_compile = bool(compile_cfg.get("force_cpu_compile", False))
+    on_cpu = True
+    for p in model.parameters():
+        on_cpu = on_cpu and (p.device.type == "cpu")
+        if not on_cpu:
+            break
+    if on_cpu and backend == "inductor" and not force_cpu_compile:
+        return model
+
     kwargs = {
         "backend": backend,
         "dynamic": dynamic,

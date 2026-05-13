@@ -6,22 +6,26 @@ from dataclasses import dataclass
 from functools import lru_cache
 from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 
 import networkx as nx
 import numpy as np
 import torch
 from sklearn.model_selection import StratifiedShuffleSplit, StratifiedKFold, KFold
 from torch.utils.data import Dataset
-from torch_geometric.utils import to_dense_adj
-
-from get.data.synthetic import sample_from_adj
+from get.data.synthetic import sample_from_adj, sample_from_edge_index
 
 
 @dataclass
 class TaskSpec:
     task_type: str  # binary | multiclass | multilabel | regression | node_binary
     stage: str
+
+
+@dataclass(frozen=True)
+class CachedSampleRef:
+    path: str
+    label0: float | None = None
 
 
 TASK_SPECS: Dict[str, TaskSpec] = {
@@ -35,6 +39,7 @@ TASK_SPECS: Dict[str, TaskSpec] = {
     "stage2_brec": TaskSpec(task_type="binary", stage="2"),
     "stage3_zinc": TaskSpec(task_type="regression", stage="3"),
     "stage3_molhiv": TaskSpec(task_type="binary", stage="3"),
+    "stage3_molpcba": TaskSpec(task_type="multilabel", stage="3"),
     "stage3_peptides_struct_probe": TaskSpec(task_type="regression", stage="3"),
     "stage3_peptides_func_probe": TaskSpec(task_type="multilabel", stage="3"),
     "stage4_tu_classification": TaskSpec(task_type="multiclass", stage="4"),
@@ -53,40 +58,141 @@ TASK_SPECS: Dict[str, TaskSpec] = {
 
 
 class ListGraphDataset(Dataset):
-    def __init__(self, samples: List[Dict[str, torch.Tensor]]):
+    def __init__(self, samples: List[Any]):
         self.samples = samples
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        return self.samples[idx]
+        return _load_sample_item(self.samples[idx])
 
 
-def _limit_split(items: List[Dict[str, torch.Tensor]], max_graphs: int) -> List[Dict[str, torch.Tensor]]:
+def _normalize_edge_attr(edge_attr: Any) -> Any:
+    if edge_attr is None or not torch.is_tensor(edge_attr) or edge_attr.numel() == 0:
+        return edge_attr
+    edge_attr = edge_attr.float()
+    if edge_attr.dim() == 1:
+        return edge_attr.unsqueeze(-1)
+    if edge_attr.dim() > 2:
+        return edge_attr.reshape(edge_attr.size(0), -1)
+    return edge_attr
+
+
+def _load_sample_item(item: Any) -> Dict[str, torch.Tensor]:
+    if isinstance(item, CachedSampleRef):
+        item = torch.load(item.path, map_location="cpu", weights_only=False)
+    elif isinstance(item, Path):
+        item = torch.load(str(item), map_location="cpu", weights_only=False)
+    elif isinstance(item, str):
+        item = torch.load(item, map_location="cpu", weights_only=False)
+    elif isinstance(item, tuple) and len(item) > 0 and isinstance(item[0], (str, Path)):
+        item = torch.load(str(item[0]), map_location="cpu", weights_only=False)
+
+    if isinstance(item, dict) and "edge_attr" in item:
+        item["edge_attr"] = _normalize_edge_attr(item["edge_attr"])
+    elif hasattr(item, "edge_attr"):
+        edge_attr = getattr(item, "edge_attr", None)
+        if edge_attr is not None:
+            setattr(item, "edge_attr", _normalize_edge_attr(edge_attr))
+    return item
+
+
+def _limit_split(items: List[Any], max_graphs: int) -> List[Any]:
     if max_graphs > 0:
         return items[:max_graphs]
     return items
 
 
-def _infer_output_dim(splits: Dict[str, List[Dict[str, torch.Tensor]]]) -> int:
-    for items in splits.values():
-        if items:
-            return int(items[0]["y"].numel())
-    return 1
-
-
-def _scalar_labels(items: List[Dict[str, torch.Tensor]]) -> List[int] | None:
-    labels: List[int] = []
-    for sample in items:
+def _sample_label0(sample: Any) -> float | None:
+    if isinstance(sample, CachedSampleRef):
+        return sample.label0
+    if isinstance(sample, tuple) and len(sample) > 1 and isinstance(sample[0], (str, Path)):
+        try:
+            return float(sample[1])
+        except Exception:
+            return None
+    if isinstance(sample, dict) and "y" in sample:
         y = sample["y"].reshape(-1)
         if y.numel() == 0:
             return None
-        labels.append(int(round(float(y[0].item()))))
+        return float(y[0].item())
+    if hasattr(sample, "y"):
+        y = getattr(sample, "y")
+        if y is None:
+            return None
+        y = y.reshape(-1)
+        if y.numel() == 0:
+            return None
+        return float(y[0].item())
+    return None
+
+
+def _infer_output_dim(splits: Dict[str, List[Any]]) -> int:
+    for items in splits.values():
+        if items:
+            first = items[0]
+            if isinstance(first, dict):
+                return int(first["y"].numel())
+            # For cached refs, output dim metadata is not available cheaply.
+            return 1
+    return 1
+
+
+def _iter_sample_items(items: Any):
+    if isinstance(items, dict):
+        for value in items.values():
+            yield from _iter_sample_items(value)
+        return
+    if hasattr(items, "samples") and not isinstance(items, (CachedSampleRef, Path, str)):
+        yield from _iter_sample_items(getattr(items, "samples"))
+        return
+    if isinstance(items, tuple) and len(items) > 0 and isinstance(items[0], (str, Path)):
+        yield items
+        return
+    if isinstance(items, (list, tuple)):
+        for item in items:
+            yield from _iter_sample_items(item)
+        return
+    yield items
+
+
+def _edge_attr_feature_dim(sample: Any) -> int:
+    edge_attr = sample.get("edge_attr") if isinstance(sample, dict) else getattr(sample, "edge_attr", None)
+    if edge_attr is None:
+        return 0
+    if not torch.is_tensor(edge_attr):
+        try:
+            edge_attr = torch.as_tensor(edge_attr)
+        except Exception:
+            return 0
+    if edge_attr.numel() == 0:
+        return 0
+    if edge_attr.dim() <= 1:
+        return 1
+    return int(edge_attr.size(-1))
+
+
+def infer_edge_attr_dim(items: Any) -> int:
+    for item in _iter_sample_items(items):
+        sample = _load_sample_item(item)
+        dim = _edge_attr_feature_dim(sample)
+        if dim > 0:
+            return dim
+    return 0
+
+
+def _scalar_labels(items: List[Any]) -> List[int] | None:
+    labels: List[int] = []
+    for sample in items:
+        y0 = _sample_label0(sample)
+        if y0 is None:
+            return None
+        labels.append(int(round(float(y0))))
     return labels
 
 
-def summarize_split_items(items: List[Dict[str, torch.Tensor]], task_type: str | None = None) -> Dict[str, object]:
+def summarize_split_items(items: List[Any], task_type: str | None = None) -> Dict[str, object]:
     summary: Dict[str, object] = {"num_graphs": len(items)}
     if not items:
         summary["single_class"] = True
@@ -94,7 +200,11 @@ def summarize_split_items(items: List[Dict[str, torch.Tensor]], task_type: str |
 
     labels = _scalar_labels(items) if task_type in {"binary", "multiclass"} else None
     if labels is None:
-        summary["target_dim"] = int(items[0]["y"].numel())
+        first = items[0]
+        if isinstance(first, dict):
+            summary["target_dim"] = int(first["y"].numel())
+        else:
+            summary["target_dim"] = "unknown"
         return summary
 
     counts = Counter(labels)
@@ -109,11 +219,18 @@ def summarize_split_items(items: List[Dict[str, torch.Tensor]], task_type: str |
     return summary
 
 
-def summarize_splits(splits: Dict[str, List[Dict[str, torch.Tensor]]], task_type: str | None = None) -> Dict[str, Dict[str, object]]:
+def summarize_splits(splits: Dict[str, List[Any]], task_type: str | None = None) -> Dict[str, Dict[str, object]]:
     return {split_name: summarize_split_items(split_items, task_type=task_type) for split_name, split_items in splits.items()}
 
 
-def graph_to_sample(data, in_dim: int, max_motifs_per_anchor: int, y_mode: str = "binary", pos_k: int = 0) -> Dict[str, torch.Tensor]:
+def graph_to_sample(
+    data,
+    in_dim: int,
+    max_motifs_per_anchor: int,
+    y_mode: str = "binary",
+    pos_k: int = 0,
+    preserve_nan_mask: bool = False,
+) -> Dict[str, torch.Tensor]:
     n = int(data.num_nodes)
     edge_index = data.edge_index.long()
     x = data.x
@@ -125,8 +242,7 @@ def graph_to_sample(data, in_dim: int, max_motifs_per_anchor: int, y_mode: str =
     elif x.size(1) > in_dim:
         x = x[:, :in_dim]
 
-    adj = to_dense_adj(edge_index, max_num_nodes=n).squeeze(0).to(dtype=torch.bool)
-    adj.fill_diagonal_(False)
+    edge_attr = getattr(data, "edge_attr", None)
 
     yv = data.y
     if yv is None:
@@ -141,11 +257,128 @@ def graph_to_sample(data, in_dim: int, max_motifs_per_anchor: int, y_mode: str =
     elif y_mode == "regression":
         yy = torch.tensor([float(y[0].item())])
     elif y_mode in {"multilabel", "vector"}:
-        yy = y.float().view(-1)
+        yv = y.float().view(-1)
+        if preserve_nan_mask:
+            valid_mask = torch.isfinite(yv)
+            yy = torch.where(valid_mask, yv, torch.zeros_like(yv))
+        else:
+            yy = torch.nan_to_num(yv, nan=0.0)
     else:
         raise ValueError(y_mode)
 
-    return sample_from_adj(adj=adj, x=x, y=yy, max_motifs_per_anchor=max_motifs_per_anchor, pos_k=pos_k)
+    sample = sample_from_edge_index(
+        edge_index=edge_index,
+        num_nodes=n,
+        x=x,
+        y=yy,
+        max_motifs_per_anchor=max_motifs_per_anchor,
+        pos_k=pos_k,
+        edge_attr=edge_attr,
+    )
+    if y_mode in {"multilabel", "vector"} and preserve_nan_mask:
+        sample.y_mask = valid_mask.bool()
+    return sample
+
+
+def _processed_cache_dir(args, cache_tag: str) -> Path:
+    root = Path(getattr(args, "dataset_root", "data")).expanduser()
+    key = "|".join(
+        [
+            "processed_v1",
+            cache_tag,
+            str(int(getattr(args, "in_dim", 32))),
+            str(int(getattr(args, "max_motifs_per_anchor", 8))),
+            str(int(getattr(args, "pos_k", 0))),
+        ]
+    )
+    digest = hashlib.md5(key.encode("utf-8")).hexdigest()
+    return root / "protocol_cache" / "processed" / cache_tag / digest
+
+
+def _cached_transform_split(
+    args,
+    cache_tag: str,
+    split_name: str,
+    dataset,
+    indices: List[int],
+    *,
+    y_mode: str,
+    preserve_nan_mask: bool = False,
+) -> List[CachedSampleRef]:
+    split_dir = _processed_cache_dir(args, cache_tag) / split_name
+    meta_path = split_dir / "meta.pt"
+    data_files = [split_dir / f"s_{i}.pt" for i in range(len(indices))]
+    if meta_path.exists() and all(p.exists() for p in data_files):
+        meta = torch.load(meta_path, map_location="cpu", weights_only=False)
+        labels = meta.get("labels0", [None] * len(indices))
+        return [CachedSampleRef(path=str(path), label0=(None if labels[i] is None else float(labels[i]))) for i, path in enumerate(data_files)]
+
+    split_dir.mkdir(parents=True, exist_ok=True)
+    refs: List[CachedSampleRef] = []
+    labels0: List[float | None] = []
+    for local_i, idx in enumerate(indices):
+        sample = graph_to_sample(
+            dataset[idx],
+            args.in_dim,
+            args.max_motifs_per_anchor,
+            y_mode=y_mode,
+            pos_k=getattr(args, "pos_k", 0),
+            preserve_nan_mask=preserve_nan_mask,
+        )
+        path = split_dir / f"s_{local_i}.pt"
+        torch.save(sample, path)
+        y0 = _sample_label0(sample)
+        labels0.append(y0)
+        refs.append(CachedSampleRef(path=str(path), label0=y0))
+    torch.save({"num_samples": len(indices), "labels0": labels0}, meta_path)
+    return refs
+
+
+def _canonical_brec_category(category: Any) -> str:
+    if category is None:
+        return "unknown"
+    raw = str(category).strip().lower().replace("-", "_").replace(" ", "_")
+    alias = {
+        "basic": "Basic",
+        "regular": "Regular",
+        "extension": "Extension",
+        "cfi": "CFI",
+        "4_vertex_condition": "4-Vertex_Condition",
+        "4vertex_condition": "4-Vertex_Condition",
+        "distance_regular": "Distance_Regular",
+    }
+    return alias.get(raw, str(category))
+
+
+def _coerce_brec_entries(payload: Any) -> List[Tuple[Any, str]]:
+    entries: List[Tuple[Any, str]] = []
+    if isinstance(payload, dict):
+        data_list = payload.get("data_list")
+        categories = payload.get("categories") or payload.get("brec_categories")
+        if data_list is None:
+            raise ValueError("BREC payload dict must contain `data_list`.")
+        if categories is not None and len(categories) == len(data_list):
+            for d, c in zip(data_list, categories):
+                entries.append((d, _canonical_brec_category(c)))
+            return entries
+        for d in data_list:
+            cat = getattr(d, "brec_category", None) or getattr(d, "category", None)
+            entries.append((d, _canonical_brec_category(cat)))
+        return entries
+
+    if not isinstance(payload, list):
+        raise ValueError("BREC file must contain a list or dict payload.")
+
+    for item in payload:
+        if isinstance(item, (tuple, list)) and len(item) >= 2:
+            entries.append((item[0], _canonical_brec_category(item[1])))
+            continue
+        if isinstance(item, dict) and "data" in item:
+            entries.append((item["data"], _canonical_brec_category(item.get("category"))))
+            continue
+        cat = getattr(item, "brec_category", None) or getattr(item, "category", None)
+        entries.append((item, _canonical_brec_category(cat)))
+    return entries
 
 
 def _random_split_items(items: List[Dict[str, torch.Tensor]], seed: int, train_ratio: float, val_ratio: float):
@@ -527,10 +760,27 @@ def _load_stage2_brec(args) -> Tuple[List[Dict[str, torch.Tensor]], int]:
     brec_file = getattr(args, "brec_file", "")
     if not brec_file:
         raise ValueError("--brec_file required for stage2_brec")
-    data_list = torch.load(Path(brec_file).expanduser(), map_location="cpu")
+
+    payload = torch.load(Path(brec_file).expanduser(), map_location="cpu", weights_only=False)
+    entries = _coerce_brec_entries(payload)
     if getattr(args, "max_graphs", 0) > 0:
-        data_list = data_list[: args.max_graphs]
-    samples = [graph_to_sample(d, args.in_dim, args.max_motifs_per_anchor, y_mode="binary", pos_k=getattr(args, "pos_k", 0)) for d in data_list]
+        entries = entries[: args.max_graphs]
+
+    categories = sorted({cat for _, cat in entries})
+    cat_to_id = {cat: idx for idx, cat in enumerate(categories)}
+    setattr(args, "_brec_category_names", {idx: cat for cat, idx in cat_to_id.items()})
+
+    samples = []
+    for data_obj, cat_name in entries:
+        sample = graph_to_sample(
+            data_obj,
+            args.in_dim,
+            args.max_motifs_per_anchor,
+            y_mode="binary",
+            pos_k=getattr(args, "pos_k", 0),
+        )
+        sample.brec_category_id = torch.tensor([cat_to_id[cat_name]], dtype=torch.long)
+        samples.append(sample)
     return samples, 2
 
 
@@ -539,10 +789,18 @@ def _load_stage3_zinc(args) -> Tuple[List[Dict[str, torch.Tensor]], int]:
 
     root = Path(getattr(args, "dataset_root", "data")).expanduser() / "pyg"
     parts = {s: ZINC(root=str(root), subset=True, split=s) for s in ["train", "val", "test"]}
-    splits: Dict[str, List[Dict[str, torch.Tensor]]] = {}
+    splits: Dict[str, List[CachedSampleRef]] = {}
     for split, dataset in parts.items():
-        items = _limit_split(list(dataset), getattr(args, "max_graphs", 0))
-        splits[split] = [graph_to_sample(d, args.in_dim, args.max_motifs_per_anchor, y_mode="regression", pos_k=getattr(args, "pos_k", 0)) for d in items]
+        idxs = list(range(len(dataset)))
+        idxs = _limit_split(idxs, getattr(args, "max_graphs", 0))
+        splits[split] = _cached_transform_split(
+            args,
+            cache_tag="stage3_zinc",
+            split_name=split,
+            dataset=dataset,
+            indices=idxs,
+            y_mode="regression",
+        )
     return splits, 1
 
 
@@ -551,12 +809,41 @@ def _load_stage3_molhiv(args) -> Tuple[List[Dict[str, torch.Tensor]], int]:
 
     ds = PygGraphPropPredDataset(name="ogbg-molhiv", root=str(Path(getattr(args, "dataset_root", "data")).expanduser() / "ogb"))
     idx = ds.get_idx_split()
-    splits: Dict[str, List[Dict[str, torch.Tensor]]] = {}
+    splits: Dict[str, List[CachedSampleRef]] = {}
     for split_name, split_idx in {"train": idx["train"], "val": idx["valid"], "test": idx["test"]}.items():
         order = split_idx.tolist()
         order = order[: args.max_graphs] if getattr(args, "max_graphs", 0) > 0 else order
-        splits[split_name] = [graph_to_sample(ds[i], args.in_dim, args.max_motifs_per_anchor, y_mode="binary", pos_k=getattr(args, "pos_k", 0)) for i in order]
+        splits[split_name] = _cached_transform_split(
+            args,
+            cache_tag="stage3_molhiv",
+            split_name=split_name,
+            dataset=ds,
+            indices=order,
+            y_mode="binary",
+        )
     return splits, 2
+
+
+def _load_stage3_molpcba(args) -> Tuple[Dict[str, List[CachedSampleRef]], int]:
+    from ogb.graphproppred import PygGraphPropPredDataset
+
+    ds = PygGraphPropPredDataset(name="ogbg-molpcba", root=str(Path(getattr(args, "dataset_root", "data")).expanduser() / "ogb"))
+    idx = ds.get_idx_split()
+    splits: Dict[str, List[CachedSampleRef]] = {}
+    num_targets = int(ds.num_tasks)
+    for split_name, split_idx in {"train": idx["train"], "val": idx["valid"], "test": idx["test"]}.items():
+        order = split_idx.tolist()
+        order = order[: args.max_graphs] if getattr(args, "max_graphs", 0) > 0 else order
+        splits[split_name] = _cached_transform_split(
+            args,
+            cache_tag="stage3_molpcba",
+            split_name=split_name,
+            dataset=ds,
+            indices=order,
+            y_mode="multilabel",
+            preserve_nan_mask=True,
+        )
+    return splits, num_targets
 
 
 def _load_stage3_peptides(args) -> Tuple[List[Dict[str, torch.Tensor]], int]:
@@ -564,22 +851,46 @@ def _load_stage3_peptides(args) -> Tuple[List[Dict[str, torch.Tensor]], int]:
 
     root = Path(getattr(args, "dataset_root", "data")).expanduser() / "pyg"
     parts = {s: LRGBDataset(root=str(root), name="Peptides-struct", split=s) for s in ["train", "val", "test"]}
-    splits: Dict[str, List[Dict[str, torch.Tensor]]] = {}
+    num_targets = int(parts["train"][0].y.view(-1).numel()) if len(parts["train"]) > 0 else 1
+    splits: Dict[str, List[CachedSampleRef]] = {}
     for split, dataset in parts.items():
-        items = _limit_split(list(dataset), getattr(args, "max_graphs", 0))
-        splits[split] = [graph_to_sample(d, args.in_dim, args.max_motifs_per_anchor, y_mode="vector", pos_k=getattr(args, "pos_k", 0)) for d in items]
-    return splits, _infer_output_dim(splits)
+        idxs = list(range(len(dataset)))
+        idxs = _limit_split(idxs, getattr(args, "max_graphs", 0))
+        splits[split] = _cached_transform_split(
+            args,
+            cache_tag="stage3_peptides_struct",
+            split_name=split,
+            dataset=dataset,
+            indices=idxs,
+            y_mode="vector",
+        )
+    return splits, num_targets
 
 
-def _load_stage3_peptides_func(args) -> Tuple[Dict[str, List[Dict[str, torch.Tensor]]], int]:
+def _load_stage3_peptides_func(args) -> Tuple[Dict[str, List[CachedSampleRef]], int]:
     from torch_geometric.datasets import LRGBDataset
 
     root = Path(getattr(args, "dataset_root", "data")).expanduser() / "pyg"
     out = {}
-    for s in ["train", "val", "test"]:
-        part = _limit_split(list(LRGBDataset(root=str(root), name="Peptides-func", split=s)), getattr(args, "max_graphs", 0))
-        out[s] = [graph_to_sample(d, args.in_dim, args.max_motifs_per_anchor, y_mode="multilabel", pos_k=getattr(args, "pos_k", 0)) for d in part]
-    return out, _infer_output_dim(out)
+    train_ds = LRGBDataset(root=str(root), name="Peptides-func", split="train")
+    num_targets = int(train_ds[0].y.view(-1).numel()) if len(train_ds) > 0 else 1
+    split_datasets = {"train": train_ds}
+    split_datasets["val"] = LRGBDataset(root=str(root), name="Peptides-func", split="val")
+    split_datasets["test"] = LRGBDataset(root=str(root), name="Peptides-func", split="test")
+
+    for s, dataset in split_datasets.items():
+        idxs = list(range(len(dataset)))
+        idxs = _limit_split(idxs, getattr(args, "max_graphs", 0))
+        out[s] = _cached_transform_split(
+            args,
+            cache_tag="stage3_peptides_func",
+            split_name=s,
+            dataset=dataset,
+            indices=idxs,
+            y_mode="multilabel",
+            preserve_nan_mask=True,
+        )
+    return out, num_targets
 
 
 def _load_stage4_tu(args) -> Tuple[List[Dict[str, torch.Tensor]], int]:
@@ -587,11 +898,18 @@ def _load_stage4_tu(args) -> Tuple[List[Dict[str, torch.Tensor]], int]:
 
     root = Path(getattr(args, "dataset_root", "data")).expanduser() / "pyg"
     ds = TUDataset(root=str(root), name=getattr(args, "tu_name", "MUTAG"), use_node_attr=True)
-    items = list(ds)
-    if getattr(args, "max_graphs", 0) > 0:
-        items = items[: args.max_graphs]
-    samples = [graph_to_sample(d, args.in_dim, args.max_motifs_per_anchor, y_mode="multiclass", pos_k=getattr(args, "pos_k", 0)) for d in items]
-    nclass = int(max(int(s["y"].item()) for s in samples) + 1)
+    idxs = list(range(len(ds)))
+    idxs = _limit_split(idxs, getattr(args, "max_graphs", 0))
+    samples = _cached_transform_split(
+        args,
+        cache_tag=f"stage4_tu_{getattr(args, 'tu_name', 'MUTAG').lower()}",
+        split_name="all",
+        dataset=ds,
+        indices=idxs,
+        y_mode="multiclass",
+    )
+    labels = [ref.label0 for ref in samples if ref.label0 is not None]
+    nclass = int(max(int(round(float(y))) for y in labels) + 1) if labels else 1
     return samples, nclass
 
 
@@ -682,8 +1000,9 @@ def _load_stage4_anomaly(args, name: str) -> Tuple[Dict[str, List[Dict[str, torc
     n = x.size(0)
     feat = x[:, : args.in_dim] if x.size(1) >= args.in_dim else torch.cat([x, torch.zeros((n, args.in_dim - x.size(1)))], dim=1)
     yy = torch.tensor([1.0 if int(yi) > 0 else 0.0 for yi in y.tolist()])
+    edge_attr = getattr(data, "edge_attr", None)
 
-    sample = sample_from_edge_index(edge_index, n, feat, yy, args.max_motifs_per_anchor)
+    sample = sample_from_edge_index(edge_index, n, feat, yy, args.max_motifs_per_anchor, edge_attr=edge_attr)
     
     train_sample = sample.clone()
     train_sample.mask = train_mask
@@ -720,6 +1039,8 @@ def build_dataset(task: str, args) -> Tuple[Union[List[Dict[str, torch.Tensor]],
         res = _load_stage3_zinc(args)
     elif task == "stage3_molhiv":
         res = _load_stage3_molhiv(args)
+    elif task == "stage3_molpcba":
+        res = _load_stage3_molpcba(args)
     elif task == "stage3_peptides_struct_probe":
         res = _load_stage3_peptides(args)
     elif task == "stage3_peptides_func_probe":

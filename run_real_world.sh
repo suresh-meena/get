@@ -4,9 +4,12 @@
 
 ANOMALY_TASKS=("stage4_amazon_anomaly")
 TU_TASKS=("stage4_tu_proteins" "stage4_tu_nci1" "stage4_tu_nci109" "stage4_tu_enzymes" "stage4_tu_mutagenicity")
-OTHER_TASKS=("stage2_csl" "stage3_zinc" "stage3_molhiv" "stage3_peptides_struct_probe" "stage3_peptides_func_probe")
+MOLECULAR_TASKS=("stage3_zinc" "stage3_molhiv" "stage3_molpcba" "stage3_peptides_struct_probe" "stage3_peptides_func_probe")
+EXPRESSIVITY_TASKS=("stage2_csl")
 
-MODELS=("et" "fullget" "gt")
+# Focus default: sparse local higher-order vs pairwise on molecule-heavy tasks.
+MODELS=("pairwiseget" "fullget")
+RUN_MODE="${RUN_MODE:-molecular}"  # molecular | full
 
 # Define GPUs to use
 GPUS=(0 1)
@@ -47,27 +50,36 @@ run_task() {
     --epochs "$EPOCHS" \
     --patience "$PATIENCE" \
     "${EXTRA_ARGS[@]}" \
-    --output "$OUTPUT_FILE"
+    --output_file "$OUTPUT_FILE"
 }
 
 # Generate all task combinations
 ALL_TASKS=()
 for model in "${MODELS[@]}"; do
-  # Anomaly tasks with 1% and 40% splits (standard for PyGOD/anomaly benchmarks)
-  for task in "${ANOMALY_TASKS[@]}"; do
-    ALL_TASKS+=("$task $model 0.01 1 _split1")
-    ALL_TASKS+=("$task $model 0.40 1 _split40")
-  done
-  
-  # TU tasks with 10-fold CV (standard research protocol)
-  for task in "${TU_TASKS[@]}"; do
-    ALL_TASKS+=("$task $model 0.70 10 _cv10")
-  done
+  if [[ "$RUN_MODE" == "full" ]]; then
+    # Anomaly tasks with 1% and 40% splits (standard for PyGOD/anomaly benchmarks)
+    for task in "${ANOMALY_TASKS[@]}"; do
+      ALL_TASKS+=("$task $model 0.01 1 _split1")
+      ALL_TASKS+=("$task $model 0.40 1 _split40")
+    done
+    
+    # TU tasks with 10-fold CV (standard research protocol)
+    for task in "${TU_TASKS[@]}"; do
+      ALL_TASKS+=("$task $model 0.70 10 _cv10")
+    done
+  fi
 
-  # Other tasks with standard single splits
-  for task in "${OTHER_TASKS[@]}"; do
+  # Molecule-centric stage.
+  for task in "${MOLECULAR_TASKS[@]}"; do
     ALL_TASKS+=("$task $model 0.70 1 _none")
   done
+
+  # Optional broader protocol.
+  if [[ "$RUN_MODE" == "full" ]]; then
+    for task in "${EXPRESSIVITY_TASKS[@]}"; do
+      ALL_TASKS+=("$task $model 0.70 1 _none")
+    done
+  fi
 done
 
 # Task distributor logic

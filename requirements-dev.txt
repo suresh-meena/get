@@ -1,0 +1,9 @@
+# Development and test dependencies.
+# Install after requirements.txt:
+#   python -m pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+pytest
+ruff
+pytest-benchmark

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import pytest
 from torch import nn
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
@@ -38,6 +39,17 @@ def _make_sample(y):
     adj = torch.zeros((1, 1), dtype=torch.bool)
     x = torch.zeros((1, 2), dtype=torch.float32)
     return sample_from_adj(adj, x, torch.tensor(y, dtype=torch.float32), max_motifs_per_anchor=0)
+
+
+class _FixedNodeLogitHead(nn.Module):
+    def __init__(self, logits: torch.Tensor) -> None:
+        super().__init__()
+        self.register_buffer("fixed_logits", logits.clone().float())
+        self.bias = nn.Parameter(torch.zeros(1))
+
+    def forward(self, batch):
+        num_nodes = int(batch["y"].numel())
+        return self.fixed_logits[:num_nodes].to(batch["y"].device) + self.bias * 0.0
 
 
 def test_unified_trainer_supports_multilabel_targets():
@@ -89,3 +101,42 @@ def test_unified_trainer_supports_vector_regression_targets():
 
     assert "mae" in metrics
     assert metrics["mae"] >= 0.0
+
+
+def test_unified_trainer_masks_node_binary_loss_and_pos_weight():
+    masked_sample = _make_sample([1.0, 1.0, 0.0, 0.0])
+    masked_sample.mask = torch.tensor([True, True, False, False])
+    plain_sample = _make_sample([1.0, 1.0, 0.0, 0.0])
+
+    masked_loader = DataLoader(_TinyGraphDataset([masked_sample]), batch_size=1, shuffle=False, collate_fn=collate_graph_samples)
+    plain_loader = DataLoader(_TinyGraphDataset([plain_sample]), batch_size=1, shuffle=False, collate_fn=collate_graph_samples)
+
+    trainer_cfg = {
+        "task_type": "node_binary",
+        "num_classes": 1,
+        "lr": 1e-2,
+        "weight_decay": 0.01,
+        "epochs": 1,
+    }
+
+    masked_trainer = UnifiedTrainer(
+        model=_FixedNodeLogitHead(torch.tensor([5.0, 5.0, 5.0, 5.0])),
+        device=torch.device("cpu"),
+        trainer_cfg=trainer_cfg,
+    )
+    masked_pos_weight, _ = masked_trainer._collect_train_stats(masked_loader)
+    masked_metrics = masked_trainer._run_epoch(masked_loader, train=False)
+
+    plain_trainer = UnifiedTrainer(
+        model=_FixedNodeLogitHead(torch.tensor([5.0, 5.0, 5.0, 5.0])),
+        device=torch.device("cpu"),
+        trainer_cfg=trainer_cfg,
+    )
+    plain_pos_weight, _ = plain_trainer._collect_train_stats(plain_loader)
+    plain_metrics = plain_trainer._run_epoch(plain_loader, train=False)
+
+    assert masked_pos_weight is None
+    assert masked_metrics["loss"] < 0.05
+    assert plain_pos_weight is not None
+    assert plain_pos_weight.item() == pytest.approx(1.0)
+    assert plain_metrics["loss"] > 1.0

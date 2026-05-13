@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from sklearn.model_selection import KFold, StratifiedKFold
 from torch_geometric.loader import DataLoader
-from torch_geometric.utils import to_dense_adj
+
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -20,10 +20,11 @@ if str(ROOT) not in sys.path:
 
 from external.graph_baselines.torch_baselines import ExternalGraphBaseline  # noqa: E402
 from get.data import SyntheticGraphDataset  # noqa: E402
+from get.data.synthetic import sample_from_edge_index  # noqa: E402
 from get.models import EnergyGraphClassifier  # noqa: E402
 from get.trainers import UnifiedTrainer  # noqa: E402
 from get.utils.seed import seed_everything  # noqa: E402
-from experiments.protocol.data import split_items, summarize_splits  # noqa: E402
+from get.data import infer_edge_attr_dim, split_items, summarize_splits  # noqa: E402
 
 
 def _apply_task_preset(args: argparse.Namespace) -> argparse.Namespace:
@@ -109,13 +110,14 @@ def _apply_benchmark_preset(args: argparse.Namespace) -> argparse.Namespace:
 
 
 def _loader_kwargs(args: argparse.Namespace) -> Dict[str, object]:
+    num_workers = int(getattr(args, "num_workers", 0))
     kwargs: Dict[str, object] = {
-        "num_workers": args.num_workers,
+        "num_workers": num_workers,
         "pin_memory": torch.cuda.is_available(),
-        "persistent_workers": False,
+        "persistent_workers": num_workers > 0,
     }
-    if args.num_workers > 0:
-        kwargs["prefetch_factor"] = 1
+    if num_workers > 0:
+        kwargs["prefetch_factor"] = 2
     return kwargs
 
 
@@ -229,7 +231,6 @@ def _build_loaders(args: argparse.Namespace):
 
 
 def _pyg_data_to_sample(data, in_dim: int, max_motifs_per_anchor: int, task_type: str = "binary") -> Dict[str, torch.Tensor]:
-    from get.data.synthetic import sample_from_adj
     n = int(data.num_nodes)
     edge_index = data.edge_index.long()
     x = data.x
@@ -242,9 +243,6 @@ def _pyg_data_to_sample(data, in_dim: int, max_motifs_per_anchor: int, task_type
     elif x.size(1) > in_dim:
         x = x[:, :in_dim]
 
-    adj = to_dense_adj(edge_index, max_num_nodes=n).squeeze(0).to(dtype=torch.bool)
-    adj.fill_diagonal_(False)
-
     y = data.y
     if y is None:
         y = torch.tensor(0.0)
@@ -255,7 +253,7 @@ def _pyg_data_to_sample(data, in_dim: int, max_motifs_per_anchor: int, task_type
     else:
         yy = torch.tensor([1.0 if float(y.item()) > 0 else 0.0], dtype=torch.float32)
 
-    return sample_from_adj(adj, x, yy, max_motifs_per_anchor)
+    return sample_from_edge_index(edge_index=edge_index, num_nodes=n, x=x, y=yy, max_motifs_per_anchor=max_motifs_per_anchor)
 
 
 class _ListGraphDataset(torch.utils.data.Dataset):
@@ -336,7 +334,7 @@ def _run_single_fit(
     num_classes: int,
 ) -> Dict[str, Dict[str, float]]:
     from get.utils.compile import maybe_compile_model
-    model = _build_model(args, task_type=task_type, num_classes=num_classes)
+    model = _build_model(args, task_type=task_type, num_classes=num_classes, edge_attr_dim=getattr(args, "edge_attr_dim", 0))
     
     compile_cfg = {
         "enabled": getattr(args, "compile", False),
@@ -379,7 +377,7 @@ def _run_single_fit(
     return trainer.fit(train_loader, val_loader, test_loader)
 
 
-def _build_model(args: argparse.Namespace, task_type: str, num_classes: int) -> torch.nn.Module:
+def _build_model(args: argparse.Namespace, task_type: str, num_classes: int, edge_attr_dim: int = 0) -> torch.nn.Module:
     name = args.model_name.lower()
     out_dim = num_classes if task_type == "multiclass" else 1
     if name == "external_baseline":
@@ -468,6 +466,7 @@ def _build_model(args: argparse.Namespace, task_type: str, num_classes: int) -> 
         beta_2=args.beta_2,
         beta_3=args.beta_3,
         beta_m=args.beta_m,
+        edge_attr_dim=edge_attr_dim,
         update_damping=args.update_damping,
         fixed_step_size=args.fixed_step_size,
         armijo_eta0=args.armijo_eta0,
@@ -638,6 +637,7 @@ def main() -> None:
                 test_items = [all_samples[int(i)] for i in test_idx.tolist()]
 
                 train_items, val_items, _ = split_items(trainval_items, seed=current_seed + fold_idx, train_ratio=0.85, val_ratio=0.15, task_type=task_type)
+                args.edge_attr_dim = infer_edge_attr_dim({"train": train_items, "val": val_items, "test": test_items})
 
                 train_loader, val_loader, test_loader, fold_split_stats = _build_loaders_from_samples(
                     train_items=train_items, val_items=val_items, test_items=test_items, args=args, task_type=task_type
@@ -668,6 +668,13 @@ def main() -> None:
             }
         else:
             train_loader, val_loader, test_loader, split_stats, task_type, num_classes = _build_loaders(args)
+            if hasattr(train_loader, "dataset") and len(train_loader.dataset) > 0:
+                probe_items = {
+                    "train": [train_loader.dataset[i] for i in range(min(3, len(train_loader.dataset)))],
+                    "val": [val_loader.dataset[i] for i in range(min(3, len(val_loader.dataset)))],
+                    "test": [test_loader.dataset[i] for i in range(min(3, len(test_loader.dataset)))],
+                }
+                args.edge_attr_dim = infer_edge_attr_dim(probe_items)
             metrics = _run_single_fit(
                 args=args,
                 device=device,

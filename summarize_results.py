@@ -1,67 +1,67 @@
 import json
-import os
 from pathlib import Path
 from collections import defaultdict
+
+
+def _extract_score(res: dict) -> str:
+    # Standardized schema: task > model_name > seed > {train, val, test, history, ...}
+    for key in ("test", "summary"):
+        block = res.get(key, {})
+        if isinstance(block, dict):
+            for metric in ("auc", "acc", "mae"):
+                val = block.get(metric)
+                if val is not None:
+                    name = "AUC" if metric == "auc" else ("Acc" if metric == "acc" else "MAE")
+                    return f"{float(val):.4f} ({name})"
+    # Multi-run summary
+    summary = res.get("summary", {})
+    for metric in ("test_auc_mean", "test_acc_mean", "test_mae_mean"):
+        val = summary.get(metric)
+        if val is not None:
+            std = summary.get(metric.replace("mean", "std"), 0.0)
+            name = metric.split("_")[-2].upper()
+            return f"{float(val):.4f} +/- {float(std):.4f} ({name})"
+    return "N/A"
+
 
 def summarize_results():
     results_dir = Path("outputs/protocol")
     if not results_dir.exists():
-        print("No results directory found.")
+        print("No results directory found at outputs/protocol/")
         return
 
-    # task -> model -> result_dict
     data = defaultdict(dict)
-    
-    for f in results_dir.glob("*.json"):
-        if f.name == "last_metrics.json":
+
+    for f in sorted(results_dir.glob("*.json")):
+        if f.name == "manifest.json":
             continue
         try:
-            with open(f, "r") as json_file:
-                res = json.load(json_file)
-                task = res.get("task")
-                runtime = res.get("runtime_config", {})
-                model = runtime.get("model_name", "unknown")
-                
-                # Handle splits for anomaly
-                if "_split1" in f.name:
-                    model = f"{model} (1%)"
-                elif "_split40" in f.name:
-                    model = f"{model} (40%)"
-                
-                metrics = res.get("metrics", {}).get("test", {})
-                if not metrics:
-                    metrics = res.get("metrics", {}).get("final_test", {})
-                
-                score = "N/A"
-                if "auc" in metrics:
-                    score = f"{metrics['auc']:.4f} (AUC)"
-                elif "acc" in metrics:
-                    score = f"{metrics['acc']:.4f} (Acc)"
-                elif "mae" in metrics:
-                    score = f"{metrics['mae']:.4f} (MAE)"
-                
-                data[task][model] = score
+            res = json.loads(f.read_text())
+            task = res.get("task", "unknown")
+            model = res.get("model_name", "unknown")
+            seed = res.get("seed", "?")
+            key = f"{model}_seed{seed}" if res.get("num_runs", 1) > 1 else model
+            data[task][key] = _extract_score(res)
         except Exception as e:
             print(f"Error parsing {f}: {e}")
 
     tasks = sorted(data.keys())
-    models = sorted({str(m) for task in data for m in data[task] if m is not None})
-    
-    # Write to markdown
+    models = sorted({m for task in data for m in data[task]})
+
     with open("results_summary.md", "w") as md:
-        md.write("# 📊 Graph Energy Transformer Benchmark Results\n\n")
-        
-        # Header
+        md.write("# Graph Energy Transformer Benchmark Results\n\n")
         header = "| Task | " + " | ".join(models) + " |\n"
-        separator = "| :--- | " + " | ".join(["---"] * len(models)) + " |\n"
+        sep = "| :--- | " + " | ".join(["---"] * len(models)) + " |\n"
         md.write(header)
-        md.write(separator)
-        
+        md.write(sep)
         for task in tasks:
             row = f"| {task} | "
-            row += " | ".join([data[task].get(m, "-") for m in models])
+            row += " | ".join(data[task].get(m, "-") for m in models)
             row += " |\n"
             md.write(row)
+
+    print(f"\nSummarized {len(data)} tasks, {len(models)} model variants to results_summary.md")
+
 
 if __name__ == "__main__":
     summarize_results()

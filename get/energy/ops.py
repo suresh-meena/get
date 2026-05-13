@@ -7,6 +7,11 @@ ts_scatter_add = None
 ts_scatter_max = None
 ts_scatter_logsumexp = None
 
+try:
+    from torch_scatter import scatter_logsumexp as ts_scatter_logsumexp  # type: ignore
+except Exception:
+    ts_scatter_logsumexp = None
+
 
 def segment_reduce_1d(src: torch.Tensor, segment_ids: torch.Tensor, num_segments: int, reduce="sum", dim: int = -1):
     """
@@ -36,6 +41,17 @@ def segment_logsumexp(x: torch.Tensor, segment_ids: torch.Tensor, num_segments: 
     if dim < 0:
         dim = x.dim() + dim
 
+    # Fast path for non-compiled execution when torch_scatter is available.
+    if (
+        ts_scatter_logsumexp is not None
+        and dim == 0
+        and x.dim() >= 1
+        and segment_ids.dim() == 1
+        and segment_ids.numel() == x.size(0)
+        and not (hasattr(torch, "compiler") and torch.compiler.is_compiling())
+    ):
+        return ts_scatter_logsumexp(x, segment_ids, dim=0, dim_size=num_segments)
+
     def _logsumexp_fwd(x_val, ids, num_seg, d):
         out_max = scatter(x_val, ids, dim=d, dim_size=num_seg, reduce="max")
 
@@ -54,11 +70,7 @@ def segment_logsumexp(x: torch.Tensor, segment_ids: torch.Tensor, num_segments: 
         out = torch.where(out_sum_exp == 0, neg_inf, torch.log(out_sum_exp.clamp_min(1e-12)) + out_max)
         return out
 
-    from torch.utils.checkpoint import checkpoint
-    if x.requires_grad:
-        return checkpoint(_logsumexp_fwd, x, segment_ids, num_segments, dim, use_reentrant=False)
-    else:
-        return _logsumexp_fwd(x, segment_ids, num_segments, dim)
+    return _logsumexp_fwd(x, segment_ids, num_segments, dim)
 
 
 def scatter_add_nd(grad_buffer: torch.Tensor, indices: torch.Tensor, src: torch.Tensor, dim: int):

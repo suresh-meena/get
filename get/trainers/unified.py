@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import os
 from typing import Any, Dict, Iterable, List
+import numpy as np
 
 # Avoid matplotlib/fontconfig cache warnings in restricted environments.
 if "MPLCONFIGDIR" not in os.environ:
@@ -10,23 +11,19 @@ if "MPLCONFIGDIR" not in os.environ:
 
 import torch
 from torch.amp import GradScaler, autocast
-from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score, roc_auc_score
-from torchmetrics.classification import BinaryAccuracy, MulticlassAccuracy
+from torchmetrics.classification import (
+    BinaryAccuracy,
+    BinaryAUROC,
+    BinaryAveragePrecision,
+    BinaryF1Score,
+    BinaryPrecision,
+    BinaryRecall,
+    MulticlassAccuracy,
+)
 from torchmetrics.regression import MeanAbsoluteError
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
 
-
-def _move_batch_to_device(batch: Any, device: torch.device) -> Any:
-    """Recursive move of tensors to device, handling dicts, lists, and objects with .to()."""
-    if torch.is_tensor(batch):
-        return batch.to(device, non_blocking=True)
-    if isinstance(batch, dict):
-        return {k: _move_batch_to_device(v, device) for k, v in batch.items()}
-    if isinstance(batch, list):
-        return [_move_batch_to_device(v, device) for v in batch]
-    if hasattr(batch, "to") and callable(batch.to):
-        return batch.to(device)
-    return batch
+from get.utils.device import move_batch_to_device, assert_cuda_batch
 
 
 def _set_global_avg_degree(model: torch.nn.Module, avg_degree: float | None) -> None:
@@ -58,8 +55,11 @@ class UnifiedTrainer:
         self.max_grad_norm = float(trainer_cfg.get("max_grad_norm", 1.0))
         self.log_every_steps = int(trainer_cfg.get("log_every_steps", 10))
         self.patience = int(trainer_cfg.get("patience", 10))
+        self.use_tqdm = bool(trainer_cfg.get("use_tqdm", False))
         self.use_amp = bool(trainer_cfg.get("use_amp", False)) and device.type == "cuda"
-        self.amp_dtype = str(trainer_cfg.get("amp_dtype", "fp16")).lower()
+        self.amp_dtype = str(trainer_cfg.get("amp_dtype", "auto")).lower()
+        if self.amp_dtype == "auto" and device.type == "cuda":
+            self.amp_dtype = "bf16" if torch.cuda.is_bf16_supported() else "fp16"
         self.task_type = str(trainer_cfg.get("task_type", "binary")).lower()
         self.num_classes = int(trainer_cfg.get("num_classes", 1))
 
@@ -69,10 +69,25 @@ class UnifiedTrainer:
         elif self.task_type == "regression":
             self.criterion = torch.nn.MSELoss()
             self.metric = MeanAbsoluteError().to(device)
+        elif self.task_type in {"multilabel", "node_binary"}:
+            self.criterion = torch.nn.BCEWithLogitsLoss(reduction="none")
+            self.metric = BinaryAccuracy().to(device)
         else:
-            # Covers binary, multilabel, node_binary
+            # Covers binary
             self.criterion = torch.nn.BCEWithLogitsLoss()
             self.metric = BinaryAccuracy().to(device)
+        if self.task_type in {"binary", "node_binary", "multilabel"}:
+            self.metric_auc = BinaryAUROC().to(device)
+            self.metric_pr_auc = BinaryAveragePrecision().to(device)
+            self.metric_precision = BinaryPrecision().to(device)
+            self.metric_recall = BinaryRecall().to(device)
+            self.metric_f1 = BinaryF1Score().to(device)
+        else:
+            self.metric_auc = None
+            self.metric_pr_auc = None
+            self.metric_precision = None
+            self.metric_recall = None
+            self.metric_f1 = None
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=float(trainer_cfg["lr"]),
@@ -94,6 +109,38 @@ class UnifiedTrainer:
             eta_min=float(trainer_cfg.get("min_lr", 5e-6))
         )
 
+    def _binary_targets_and_mask(self, batch: Dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.task_type == "multilabel":
+            targets = batch["y"].float().reshape(-1, self.num_classes)
+            label_mask = batch.get("y_mask")
+            if label_mask is None:
+                return targets, torch.ones_like(targets, dtype=torch.bool)
+            return targets, label_mask.to(device=targets.device).reshape_as(targets).bool()
+        if self.task_type == "node_binary":
+            targets = batch["y"].view(-1).float()
+            node_mask = batch.get("mask")
+            if node_mask is None:
+                return targets, torch.ones_like(targets, dtype=torch.bool)
+            return targets, node_mask.to(device=targets.device).reshape_as(targets).bool()
+        targets = batch["y"].view(-1).float()
+        return targets, None
+
+    def _masked_bce_loss(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, int]:
+        raw_loss = self.criterion(logits, targets)
+        if mask is None:
+            return raw_loss, int(targets.numel())
+        mask = mask.to(device=raw_loss.device).bool().reshape_as(raw_loss)
+        supervised = int(mask.sum().item())
+        if supervised == 0:
+            return raw_loss.new_zeros(()), 0
+        loss = raw_loss.masked_select(mask).sum() / float(supervised)
+        return loss, supervised
+
     def _autocast_dtype(self) -> torch.dtype:
         if self.amp_dtype == "bf16":
             return torch.bfloat16
@@ -108,21 +155,50 @@ class UnifiedTrainer:
             self.eval_model.eval()
 
         self.metric.reset()
+        if self.metric_auc is not None:
+            self.metric_auc.reset()
+            self.metric_pr_auc.reset()
+            self.metric_precision.reset()
+            self.metric_recall.reset()
+            self.metric_f1.reset()
         loss_accum = torch.zeros(1, device=self.device)
         seen = 0
-        all_y_true: list[torch.Tensor] = []
-        all_y_score: list[torch.Tensor] = []
+        cls_pos = torch.zeros(1, device=self.device)
+        cls_total = torch.zeros(1, device=self.device)
 
-        from tqdm import tqdm
-        
-        pbar = tqdm(loader, desc=f"{'Train' if train else 'Val'}", leave=False)
-        for batch in pbar:
-            batch = _move_batch_to_device(batch, self.device)
+        if self.use_tqdm:
+            from tqdm import tqdm
+            iterator = tqdm(loader, desc=f"{'Train' if train else 'Val'}", leave=False)
+        else:
+            iterator = loader
+
+        def _update_binary_family_metrics(probs: torch.Tensor, targets01: torch.Tensor) -> None:
+            if probs.numel() == 0:
+                return
+            probs = probs.reshape(-1)
+            targets01 = targets01.reshape(-1).int()
+            self.metric.update(probs, targets01)
+            if self.metric_auc is not None:
+                self.metric_auc.update(probs, targets01)
+                self.metric_pr_auc.update(probs, targets01)
+                self.metric_precision.update(probs, targets01)
+                self.metric_recall.update(probs, targets01)
+                self.metric_f1.update(probs, targets01)
+            cls_pos.add_(targets01.float().sum())
+            cls_total.add_(targets01.numel())
+
+        for batch in iterator:
+            batch = move_batch_to_device(batch, self.device)
+            if getattr(self, "_debug_assert_cuda", False) and self.device.type == "cuda":
+                assert_cuda_batch(batch, warn_only=True)
+            mask = None
             if self.task_type == "multiclass":
                 targets = batch["y"].view(-1).long()
+            elif self.task_type in {"multilabel", "node_binary"}:
+                targets, mask = self._binary_targets_and_mask(batch)
             else:
                 targets = batch["y"].view(-1).float()
-            bsz = int(targets.shape[0])
+            loss_weight = int(targets.numel())
 
             if train:
                 self.optimizer.zero_grad(set_to_none=True)
@@ -139,9 +215,9 @@ class UnifiedTrainer:
                     elif self.task_type == "regression":
                         logits = logits.reshape_as(targets)
                         loss = self.criterion(logits, targets)
-                    elif self.task_type == "node_binary":
+                    elif self.task_type in {"node_binary", "multilabel"}:
                         logits = logits.reshape_as(targets)
-                        loss = self.criterion(logits, targets)
+                        loss, loss_weight = self._masked_bce_loss(logits, targets, mask)
                     else:
                         loss = self.criterion(logits, targets)
 
@@ -155,48 +231,32 @@ class UnifiedTrainer:
             if self.task_type == "multiclass":
                 preds = logits.detach()
                 self.metric.update(preds, targets)
-                all_y_true.append(targets.detach())
-                all_y_score.append(preds.argmax(dim=-1).detach())
             elif self.task_type == "regression":
                 preds = logits.detach()
                 self.metric.update(preds, targets)
-                all_y_true.append(targets.detach())
-                all_y_score.append(preds.detach())
             elif self.task_type == "node_binary":
                 preds = torch.sigmoid(logits.detach())
-                mask = batch.get("mask", torch.ones_like(targets, dtype=torch.bool)).reshape(-1)
-                if mask.sum() > 0:
-                    self.metric.update(preds[mask], targets[mask].int())
-                    all_y_true.append(targets[mask].detach())
-                    all_y_score.append(preds[mask].detach())
-            else:
-                # binary or multilabel
+                if mask is not None and mask.any():
+                    _update_binary_family_metrics(preds[mask], targets[mask])
+            elif self.task_type == "multilabel":
                 probs = torch.sigmoid(logits.detach())
-                self.metric.update(probs.reshape(-1), targets.reshape(-1).int())
-                all_y_true.append(targets.detach())
-                all_y_score.append(probs.detach())
+                if mask is not None and mask.any():
+                    _update_binary_family_metrics(probs[mask], targets[mask])
+                else:
+                    _update_binary_family_metrics(probs, targets)
+            else:
+                # binary
+                probs = torch.sigmoid(logits.detach())
+                _update_binary_family_metrics(probs, targets)
             
-            loss_val = loss.detach()
-            loss_accum += loss_val * bsz
-            seen += bsz
-            
-            # Update progress bar
-            pbar.set_postfix({
-                "loss": f"{loss_val.item():.4f}",
-                "acc": f"{self.metric.compute().item():.4f}"
-            })
+            loss_accum += loss.detach() * loss_weight
+            seen += loss_weight
 
         if seen == 0:
             return {"loss": 0.0, "acc": 0.0}
 
         mean_loss = (loss_accum / seen).item()
         acc = self.metric.compute().item()
-
-        y_true_ts = torch.cat(all_y_true).cpu()
-        y_score_ts = torch.cat(all_y_score).cpu()
-        y_true = y_true_ts.tolist()
-        y_score = y_score_ts.tolist()
-
         metrics: Dict[str, float] = {"loss": float(mean_loss), "acc" if self.task_type != "regression" else "mae": float(acc)}
         if self.task_type in {"multiclass", "regression"}:
             metrics["binary_ranking_available"] = 0.0
@@ -206,23 +266,21 @@ class UnifiedTrainer:
             metrics["recall"] = 0.0
             metrics["f1"] = 0.0
         else:
-            binary_ranking_available = len(set(y_true)) > 1
+            pos_val = float(cls_pos.item())
+            total_val = float(cls_total.item())
+            binary_ranking_available = total_val > 0.0 and pos_val > 0.0 and pos_val < total_val
             metrics["binary_ranking_available"] = float(binary_ranking_available)
             if binary_ranking_available:
-                try:
-                    metrics["auc"] = float(roc_auc_score(y_true, y_score))
-                    metrics["pr_auc"] = float(average_precision_score(y_true, y_score))
-                    y_pred = [1 if s >= 0.5 else 0 for s in y_score]
-                    metrics["precision"] = float(precision_score(y_true, y_pred, zero_division=0))
-                    metrics["recall"] = float(recall_score(y_true, y_pred, zero_division=0))
-                    metrics["f1"] = float(f1_score(y_true, y_pred, zero_division=0))
-                except Exception:
-                    metrics["binary_ranking_available"] = 0.0
-                    metrics["auc"] = 0.5
-                    metrics["pr_auc"] = 0.0
-                    metrics["precision"] = 0.0
-                    metrics["recall"] = 0.0
-                    metrics["f1"] = 0.0
+                auc = float(self.metric_auc.compute().item()) if self.metric_auc is not None else 0.5
+                pr_auc = float(self.metric_pr_auc.compute().item()) if self.metric_pr_auc is not None else 0.0
+                precision = float(self.metric_precision.compute().item()) if self.metric_precision is not None else 0.0
+                recall = float(self.metric_recall.compute().item()) if self.metric_recall is not None else 0.0
+                f1 = float(self.metric_f1.compute().item()) if self.metric_f1 is not None else 0.0
+                metrics["auc"] = 0.5 if not np.isfinite(auc) else auc
+                metrics["pr_auc"] = 0.0 if not np.isfinite(pr_auc) else pr_auc
+                metrics["precision"] = 0.0 if not np.isfinite(precision) else precision
+                metrics["recall"] = 0.0 if not np.isfinite(recall) else recall
+                metrics["f1"] = 0.0 if not np.isfinite(f1) else f1
             else:
                 metrics["auc"] = 0.5
                 metrics["pr_auc"] = 0.0
@@ -239,8 +297,13 @@ class UnifiedTrainer:
         node_sum = torch.zeros(1, device=self.device)
 
         for batch in train_loader:
-            batch = _move_batch_to_device(batch, self.device)
+            batch = move_batch_to_device(batch, self.device)
             if self.task_type == "multiclass":
+                saw_targets = True
+            elif self.task_type in {"multilabel", "node_binary"}:
+                targets, mask = self._binary_targets_and_mask(batch)
+                pos += targets.masked_select(mask).sum()
+                total += mask.sum()
                 saw_targets = True
             else:
                 y = batch["y"].float().view(batch["y"].size(0), -1)
@@ -255,10 +318,11 @@ class UnifiedTrainer:
         pos_weight = None
         pos_val = float(pos.item())
         total_val = float(total.item())
-        if self.task_type != "multiclass" and saw_targets and pos_val > 0.0 and pos_val < total_val:
+        if self.task_type in {"binary", "node_binary"} and saw_targets and pos_val > 0.0 and pos_val < total_val:
             neg_val = total_val - pos_val
             pos_weight = torch.tensor([neg_val / pos_val], device=self.device)
-            self.criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            reduction = "none" if self.task_type == "node_binary" else "mean"
+            self.criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction=reduction)
 
         node_sum_val = float(node_sum.item())
         avg_degree = (float(degree_sum.item()) / node_sum_val) if node_sum_val > 0 else None
@@ -270,34 +334,7 @@ class UnifiedTrainer:
         val_loader: Iterable[Dict[str, torch.Tensor]],
         test_loader: Iterable[Dict[str, torch.Tensor]],
     ) -> Dict[str, Dict[str, float]]:
-        from tqdm import tqdm
-        
-        # Stats collection with pbar
-        degree_sum = torch.zeros(1, device=self.device)
-        node_sum = torch.zeros(1, device=self.device)
-        pos = torch.zeros(1, device=self.device)
-        total = torch.zeros(1, device=self.device)
-        
-        pbar_stats = tqdm(train_loader, desc="Collecting Stats", leave=False)
-        for batch in pbar_stats:
-            batch = _move_batch_to_device(batch, self.device)
-            if self.task_type != "multiclass":
-                y = batch["y"].float().view(batch["y"].size(0), -1)
-                pos += y.sum()
-                total += y.numel()
-            if "c_2" in batch and "x" in batch:
-                degree_sum += batch["c_2"].numel()
-                node_sum += batch["x"].size(0)
-        
-        pos_val = float(pos.item())
-        total_val = float(total.item())
-        if self.task_type != "multiclass" and pos_val > 0.0 and pos_val < total_val:
-            neg_val = total_val - pos_val
-            pos_weight = torch.tensor([neg_val / pos_val], device=self.device)
-            self.criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-            
-        node_sum_val = float(node_sum.item())
-        avg_degree = (float(degree_sum.item()) / node_sum_val) if node_sum_val > 0 else None
+        _, avg_degree = self._collect_train_stats(train_loader)
         _set_global_avg_degree(self.model, avg_degree)
 
         best_score = -float("inf")
@@ -307,8 +344,12 @@ class UnifiedTrainer:
         history = {"train": [], "val": []}
         warmup_epochs = int(self.warmup_scheduler.lr_lambdas[0].__code__.co_consts[1]) if hasattr(self.warmup_scheduler, "lr_lambdas") else 50
         
-        epoch_pbar = tqdm(range(self.epochs), desc="Training")
-        for epoch in epoch_pbar:
+        if self.use_tqdm:
+            from tqdm import tqdm
+            epoch_iter = tqdm(range(self.epochs), desc="Training")
+        else:
+            epoch_iter = range(self.epochs)
+        for epoch in epoch_iter:
             train_stats = self._run_epoch(train_loader, train=True)
             val_stats = self._run_epoch(val_loader, train=False)
             
@@ -337,14 +378,16 @@ class UnifiedTrainer:
             else:
                 bad_epochs += 1
                 if bad_epochs >= self.patience:
-                    epoch_pbar.write(f"Early stopping at epoch {epoch}")
+                    if self.use_tqdm and hasattr(epoch_iter, "write"):
+                        epoch_iter.write(f"Early stopping at epoch {epoch}")
                     break
             
-            epoch_pbar.set_postfix({
-                "tr_loss": f"{train_stats['loss']:.3f}",
-                "val_auc": f"{val_stats.get('auc', 0.0):.3f}",
-                "val_acc": f"{val_stats['acc']:.3f}"
-            })
+            if self.use_tqdm and hasattr(epoch_iter, "set_postfix"):
+                epoch_iter.set_postfix({
+                    "tr_loss": f"{train_stats['loss']:.3f}",
+                    "val_auc": f"{val_stats.get('auc', 0.0):.3f}",
+                    "val_acc": f"{val_stats['acc']:.3f}"
+                })
 
         self.model.load_state_dict(best_state)
         test_stats = self._run_epoch(test_loader, train=False)
@@ -355,4 +398,5 @@ class UnifiedTrainer:
             "final_val": history["val"][-1],
             "test": test_stats,
             "epochs_ran": len(history["train"]),
+            "history": history,
         }

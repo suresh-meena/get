@@ -5,6 +5,7 @@ import torch
 from torch_geometric.data import Batch
 
 from get.data import SyntheticGraphDataset, collate_graph_samples
+from get.data.synthetic import sample_from_edge_index
 from get.energy import ENERGY_SPECS, build_energy
 from get.models import EnergyGraphClassifier
 from get.models.energy_norm import EnergyLayerNorm
@@ -72,6 +73,44 @@ def test_model_forward_supports_swappable_energy_functions(energy_name: str):
     logits = model(batch, inference_mode="fixed")
     assert logits.shape == (int(batch["num_graphs"].item()),)
     assert torch.isfinite(logits).all()
+
+
+def test_full_get_gradient_combines_multiple_energy_terms():
+    edge_index = torch.tensor(
+        [[0, 1, 2, 0, 2, 3], [1, 2, 0, 2, 3, 0]],
+        dtype=torch.long,
+    )
+    sample = sample_from_edge_index(
+        edge_index=edge_index,
+        num_nodes=4,
+        x=torch.randn(4, 8),
+        y=torch.tensor([1.0]),
+        max_motifs_per_anchor=8,
+    )
+    assert sample.c_3.numel() > 0
+    batch = collate_graph_samples([sample])
+    model = _make_model("get_full").train()
+    x = model.encoder(batch["x"]).detach().requires_grad_(True)
+    block = model.blocks[0]
+    num_graphs = int(batch["num_graphs"].item())
+
+    def grad_vec(lambda_2: float, lambda_3: float, lambda_m: float) -> torch.Tensor:
+        cfg = model._build_params()
+        cfg["lambda_2"] = lambda_2
+        cfg["lambda_3"] = lambda_3
+        cfg["lambda_m"] = lambda_m
+        energy = block.energy_from_g(x, batch, cfg, scaler=None, num_graphs=num_graphs)
+        grad, = torch.autograd.grad(energy, x, retain_graph=True)
+        return grad.detach()
+
+    grad_quad = grad_vec(0.0, 0.0, 0.0)
+    grad_pair = grad_vec(1.0, 0.0, 0.0)
+    grad_pair_motif = grad_vec(1.0, 0.5, 0.0)
+    grad_full = grad_vec(1.0, 0.5, 1.0)
+
+    assert not torch.allclose(grad_quad, grad_pair)
+    assert not torch.allclose(grad_pair, grad_pair_motif)
+    assert not torch.allclose(grad_pair_motif, grad_full)
 
 
 def test_fixed_step_solver_applies_update_damping():

@@ -1,0 +1,24 @@
+# GET-HAM full: all stable branches (no dynamic edges)
+model_name: "get_ham_full"
+hidden_dim: 192
+num_heads: 6
+head_dim: 32
+num_steps: 8
+num_blocks: 1
+R: 3
+K: 48
+num_motif_types: 2
+lambda_2: 1.0
+lambda_3: 10.0
+lambda_m: 1.0
+lambda_g: 1.0
+beta_2: 1.0
+beta_3: 1.0
+beta_m: 1.0
+beta_g: 1.0
+update_damping: 0.0
+use_energy_norm: true
+agg_mode: "softmax"
+use_cls_token: true
+max_global_nodes: 512
+edge_attr_dim: 0

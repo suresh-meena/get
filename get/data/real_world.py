@@ -144,6 +144,9 @@ class RealWorldGraphDataset(Dataset):
         # Adjacency
         edge_index, _ = remove_self_loops(data.edge_index.long())
 
+        # Edge features
+        edge_attr = getattr(data, "edge_attr", None)
+
         # Label
         y = data.y
         if y is None:
@@ -159,4 +162,4 @@ class RealWorldGraphDataset(Dataset):
         else:
             label = torch.tensor([float(y_val)], dtype=torch.float32)
 
-        return sample_from_edge_index(edge_index, n, x, label, self.max_motifs_per_anchor)
+        return sample_from_edge_index(edge_index, n, x, label, self.max_motifs_per_anchor, edge_attr=edge_attr)

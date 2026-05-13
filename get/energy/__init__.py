@@ -16,6 +16,20 @@ from .memory import MemoryEnergy, compute_memory_energy
 from .linear_agg import LinearAggregationEnergy, compute_linear_aggregation_energy
 from .core import GETEnergy, compute_energy_GET
 from .factory import ENERGY_SPECS, build_energy
+from . import branch
+from .branch import (
+    EnergyBranch,
+    ComposedEnergy,
+    ENERGY_BRANCHES,
+    register_branch,
+    get_branch,
+    enabled_branches_from_config,
+    QuadraticBranch,
+    PairwiseBranch,
+    MotifBranch,
+    MemoryBranch,
+    GlobalAttentionBranch,
+)
 
 __all__ = [
     "segment_reduce_1d",
@@ -40,4 +54,16 @@ __all__ = [
     "compute_energy_GET",
     "build_energy",
     "ENERGY_SPECS",
+    "EnergyBranch",
+    "ComposedEnergy",
+    "ENERGY_BRANCHES",
+    "register_branch",
+    "get_branch",
+    "enabled_branches_from_config",
+    "QuadraticBranch",
+    "PairwiseBranch",
+    "MotifBranch",
+    "MemoryBranch",
+    "GlobalAttentionBranch",
+    "branch",
 ]

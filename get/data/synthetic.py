@@ -11,7 +11,6 @@ import numba
 from torch_geometric.data import Batch, Data
 
 from get.energy.ops import positional_embeddings_from_edge_index
-import scipy.sparse as sp
 
 
 @dataclass
@@ -108,11 +107,28 @@ def sample_from_edge_index(
     y: torch.Tensor, 
     max_motifs_per_anchor: int,
     pos_k: int = 0,
+    edge_attr: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
-    edge_index_np = edge_index.cpu().numpy()
-    vals = np.ones(edge_index_np.shape[1], dtype=bool)
-    adj_csr = sp.csr_matrix((vals, (edge_index_np[0], edge_index_np[1])), shape=(num_nodes, num_nodes))
-    c3, u3, v3, tau = _extract_motifs_csr_jit(adj_csr.indptr, adj_csr.indices, max_motifs_per_anchor)
+    edge_index_cpu = edge_index.detach().to("cpu", non_blocking=False)
+    src_np = edge_index_cpu[0].numpy().astype(np.int64, copy=False)
+    dst_np = edge_index_cpu[1].numpy().astype(np.int64, copy=False)
+
+    # Build sorted CSR directly from edge_index to avoid SciPy object overhead.
+    if src_np.size > 0:
+        order = np.lexsort((dst_np, src_np))
+        src_sorted = src_np[order]
+        dst_sorted = dst_np[order]
+    else:
+        src_sorted = src_np
+        dst_sorted = dst_np
+
+    counts = np.bincount(src_sorted, minlength=num_nodes)
+    indptr = np.empty(num_nodes + 1, dtype=np.int64)
+    indptr[0] = 0
+    np.cumsum(counts, out=indptr[1:])
+    indices = dst_sorted
+
+    c3, u3, v3, tau = _extract_motifs_csr_jit(indptr, indices, max_motifs_per_anchor)
     y = y.float().reshape(-1)
     if y.numel() == 0:
         y = torch.zeros(1, dtype=torch.float32)
@@ -128,6 +144,14 @@ def sample_from_edge_index(
         t_tau=torch.tensor(tau, dtype=torch.long),
     )
     
+    if edge_attr is not None:
+        edge_attr = edge_attr.float()
+        if edge_attr.dim() == 1:
+            edge_attr = edge_attr.unsqueeze(-1)
+        elif edge_attr.dim() > 2:
+            edge_attr = edge_attr.reshape(edge_attr.size(0), -1)
+        sample.edge_attr = edge_attr
+        
     if pos_k > 0:
         sample.pos = positional_embeddings_from_edge_index(edge_index, num_nodes, k=pos_k)
         

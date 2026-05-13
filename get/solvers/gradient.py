@@ -22,10 +22,11 @@ class FixedStepSolver:
         energy_fn: EnergyClosure,
         energy_and_grad_fn: EnergyAndGradClosure | None = None,
         create_graph: bool = False,
+        collect_stats: bool = True,
     ) -> Tuple[torch.Tensor, List[float], Dict[str, List[float]]]:
         x = x0
-        energy_trace_tensors: List[torch.Tensor] = []
-        grad_norm_tensors: List[torch.Tensor] = []
+        energy_trace_tensors: List[torch.Tensor] | None = [] if collect_stats else None
+        grad_norm_tensors: List[torch.Tensor] | None = [] if collect_stats else None
         damping = min(max(float(self.update_damping), 0.0), 1.0)
         step_scale = 1.0 - damping
 
@@ -36,18 +37,20 @@ class FixedStepSolver:
                 grad, = torch.autograd.grad(e, x, create_graph=create_graph)
             else:
                 e, grad = energy_and_grad_fn(x, create_graph)
-            
-            grad_norm_tensors.append(torch.linalg.vector_norm(grad).detach())
+
+            if collect_stats and grad_norm_tensors is not None:
+                grad_norm_tensors.append(torch.linalg.vector_norm(grad).detach())
             x = x - (self.step_size * step_scale) * grad
-            energy_trace_tensors.append(e.detach())
+            if collect_stats and energy_trace_tensors is not None:
+                energy_trace_tensors.append(e.detach())
 
         stats = {
             "mode": "fixed",
             "update_damping": self.update_damping,
-            "step_sizes": [self.step_size * step_scale for _ in range(self.num_steps)],
-            "grad_norms": torch.stack(grad_norm_tensors).tolist() if grad_norm_tensors else [],
+            "step_sizes": [self.step_size * step_scale for _ in range(self.num_steps)] if collect_stats else [],
+            "grad_norms": torch.stack(grad_norm_tensors).tolist() if (collect_stats and grad_norm_tensors) else [],
         }
-        return x, torch.stack(energy_trace_tensors).tolist() if energy_trace_tensors else [], stats
+        return x, torch.stack(energy_trace_tensors).tolist() if (collect_stats and energy_trace_tensors) else [], stats
 
 
 @dataclass
@@ -65,13 +68,14 @@ class ArmijoSolver:
         energy_fn: EnergyClosure,
         energy_and_grad_fn: EnergyAndGradClosure | None = None,
         max_backtracks: int | None = None,
+        collect_stats: bool = True,
     ) -> Tuple[torch.Tensor, List[float], Dict[str, List[float]]]:
         x = x0.detach()
-        energy_trace_tensors: List[torch.Tensor] = []
-        step_sizes_tensors: List[torch.Tensor] = []
-        backtracks: List[int] = []
-        accepted: List[bool] = []
-        grad_norm_tensors: List[torch.Tensor] = []
+        energy_trace_tensors: List[torch.Tensor] | None = [] if collect_stats else None
+        step_sizes_tensors: List[torch.Tensor] | None = [] if collect_stats else None
+        backtracks: List[int] | None = [] if collect_stats else None
+        accepted: List[bool] | None = [] if collect_stats else None
+        grad_norm_tensors: List[torch.Tensor] | None = [] if collect_stats else None
         damping = min(max(float(self.update_damping), 0.0), 1.0)
         step_scale = 1.0 - damping
         backtrack_limit = self.max_backtracks if max_backtracks is None else max(0, int(max_backtracks))
@@ -85,7 +89,8 @@ class ArmijoSolver:
                 e, grad = energy_and_grad_fn(x, False)
             
             grad_norm_sq = (grad * grad).sum().detach()
-            grad_norm_tensors.append(torch.sqrt(grad_norm_sq).detach())
+            if collect_stats and grad_norm_tensors is not None:
+                grad_norm_tensors.append(torch.sqrt(grad_norm_sq).detach())
 
             eta = self.eta0
             found = False
@@ -102,26 +107,31 @@ class ArmijoSolver:
                     found = True
                     chosen = cand
                     e_current = e_cand.detach()
-                    backtracks.append(bt)
+                    if collect_stats and backtracks is not None:
+                        backtracks.append(bt)
                     break
                 eta *= self.gamma
 
             if not found:
-                backtracks.append(backtrack_limit)
+                if collect_stats and backtracks is not None:
+                    backtracks.append(backtrack_limit)
 
             x = chosen
-            energy_trace_tensors.append(e_current.detach())
-            step_sizes_tensors.append(torch.tensor(eta * step_scale if found else 0.0, device=x.device))
-            accepted.append(found)
+            if collect_stats and energy_trace_tensors is not None:
+                energy_trace_tensors.append(e_current.detach())
+            if collect_stats and step_sizes_tensors is not None:
+                step_sizes_tensors.append(torch.tensor(eta * step_scale if found else 0.0, device=x.device))
+            if collect_stats and accepted is not None:
+                accepted.append(found)
 
         stats = {
             "mode": "armijo",
             "update_damping": self.update_damping,
             "step_scale": step_scale,
             "max_backtracks": backtrack_limit,
-            "step_sizes": torch.stack(step_sizes_tensors).tolist() if step_sizes_tensors else [],
-            "backtracks": [float(v) for v in backtracks],
-            "accepted": [1.0 if v else 0.0 for v in accepted],
-            "grad_norms": torch.stack(grad_norm_tensors).tolist() if grad_norm_tensors else [],
+            "step_sizes": torch.stack(step_sizes_tensors).tolist() if (collect_stats and step_sizes_tensors) else [],
+            "backtracks": [float(v) for v in backtracks] if (collect_stats and backtracks is not None) else [],
+            "accepted": [1.0 if v else 0.0 for v in accepted] if (collect_stats and accepted is not None) else [],
+            "grad_norms": torch.stack(grad_norm_tensors).tolist() if (collect_stats and grad_norm_tensors) else [],
         }
-        return x, torch.stack(energy_trace_tensors).tolist() if energy_trace_tensors else [], stats
+        return x, torch.stack(energy_trace_tensors).tolist() if (collect_stats and energy_trace_tensors) else [], stats

@@ -5,6 +5,7 @@ from .real_world import RealWorldGraphDataset
 from .protocol import (
     build_dataset,
     ListGraphDataset,
+    infer_edge_attr_dim,
     split_items,
     summarize_splits,
     TASK_SPECS,
@@ -17,6 +18,7 @@ __all__ = [
     "RealWorldGraphDataset",
     "build_dataset",
     "ListGraphDataset",
+    "infer_edge_attr_dim",
     "split_items",
     "summarize_splits",
     "TASK_SPECS",

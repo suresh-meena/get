@@ -1,41 +1,31 @@
-# Single-file environment setup for the GET repository.
-# Create a fresh virtual environment, then run:
+# Development requirements for the GET repository.
+# CUDA 12.6 is the preferred GPU stack for current experiments.
+# Install with:
 #   python -m pip install -U pip
 #   python -m pip install -r requirements.txt
 
-# Use the public PyPI index directly so this file does not depend on local pip config.
---index-url https://pypi.org/simple
+--index-url https://download.pytorch.org/whl/cu126
+--extra-index-url https://pypi.org/simple
+--find-links https://data.pyg.org/whl/torch-2.10.0+cu126.html
 
-# CUDA 12.4 wheels for the PyTorch stack.
---extra-index-url https://download.pytorch.org/whl/cu124
-# PyG wheels matched to the torch/cuda build.
---find-links https://data.pyg.org/whl/torch-2.4.0+cu124.html
-
-# DGL wheels matched to PyTorch 2.4 and CUDA 12.4.
---find-links https://data.dgl.ai/wheels/torch-2.4/cu124/repo.html
-
+torch==2.10.0
+torch-geometric>=2.7
+pyg-lib
+torch-scatter
+torch-sparse
 numpy
+scipy
 numba
 networkx
 scikit-learn
-scipy
-tqdm
-matplotlib
-seaborn
-pytest
-torch==2.4.0
-torch-geometric==2.7.0
-torch-scatter==2.1.2+pt24cu124
-torch-sparse==0.6.18+pt24cu124
-torchdata==0.7.1
-dgl==2.4.0
-PyYAML
-pydantic
-pygod==1.1.0
-ogb==1.3.6
-ruff
-
-# Refactoring additions
+torchmetrics
+ogb
+pygod
 hydra-core
 omegaconf
-torchmetrics
+einops
+opt-einsum
+tqdm
+pytest
+ruff
+pytest-benchmark
