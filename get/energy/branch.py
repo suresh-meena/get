@@ -231,9 +231,10 @@ class GlobalAttentionBranch(EnergyBranch):
 
         from torch_geometric.utils import to_dense_batch
 
+        max_n = int(counts.max())
         if Qg.dim() == 2:
-            Q_dense, mask = to_dense_batch(Qg, batch_idx, max_num_nodes=self.max_global_nodes)
-            K_dense, _ = to_dense_batch(Kg, batch_idx, max_num_nodes=self.max_global_nodes)
+            Q_dense, mask = to_dense_batch(Qg, batch_idx, max_num_nodes=max_n)
+            K_dense, _ = to_dense_batch(Kg, batch_idx, max_num_nodes=max_n)
             attn = torch.bmm(Q_dense, K_dense.transpose(1, 2)) / scale
             attn = attn.masked_fill(~mask[:, :, None] | ~mask[:, None, :], float("-inf"))
             bg = beta_g.mean() if (torch.is_tensor(beta_g) and beta_g.dim() == 1) else beta_g
@@ -243,8 +244,8 @@ class GlobalAttentionBranch(EnergyBranch):
             per_graph = lse.sum(dim=-1)
             return (lambda_g / bg) * per_graph
         elif Qg.dim() == 3:
-            Q_dense, mask = to_dense_batch(Qg, batch_idx, max_num_nodes=self.max_global_nodes)
-            K_dense, _ = to_dense_batch(Kg, batch_idx, max_num_nodes=self.max_global_nodes)
+            Q_dense, mask = to_dense_batch(Qg, batch_idx, max_num_nodes=max_n)
+            K_dense, _ = to_dense_batch(Kg, batch_idx, max_num_nodes=max_n)
             attn = torch.einsum("bnhd,bmhd->bnmh", Q_dense, K_dense) / scale
             attn = attn.masked_fill(~mask[:, None, :, None] | ~mask[:, :, None, None], float("-inf"))
             lse = torch.logsumexp(beta_g * attn, dim=2)

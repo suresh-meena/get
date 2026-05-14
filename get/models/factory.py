@@ -57,6 +57,7 @@ def build_model(cfg: Any) -> torch.nn.Module:
             R=int(get_val("R", 3)), K=int(get_val("K", 48)),
             num_motif_types=int(get_val("num_motif_types", 2)),
             lambda_2=float(get_val("lambda_2", 1.0)), lambda_3=lambda_3_val, lambda_m=lambda_m_val,
+            lambda_g=float(get_val("lambda_g", 0.0)),
             update_damping=float(get_val("update_damping", 0.0)),
             fixed_step_size=float(get_val("fixed_step_size", 0.1)),
             armijo_eta0=float(get_val("armijo_eta0", 0.2)), armijo_gamma=float(get_val("armijo_gamma", 0.5)),

@@ -15,10 +15,15 @@ from .energy_norm import EnergyLayerNorm
 
 def _make_block_energy(block: GETBlock):
     """Pre-compiled per-block energy function for torch.compile caching."""
-    @torch.compile(dynamic=True, fullgraph=False)
-    def _energy(x, batch_data, cfg_params, scaler, num_graphs):
+    def _energy_eager(x, batch_data, cfg_params, scaler, num_graphs):
         return block.energy_from_g(x, batch_data, cfg_params, scaler, num_graphs)
-    return _energy
+
+    try:
+        compiled = torch.compile(_energy_eager, dynamic=True, fullgraph=False)
+        compiled(torch.randn(1, block.hidden_dim), {}, {}, None, 1)
+        return compiled
+    except Exception:
+        return _energy_eager
 
 
 class GETBlock(nn.Module):
