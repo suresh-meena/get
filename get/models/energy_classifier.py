@@ -275,13 +275,11 @@ class EnergyGraphClassifier(nn.Module):
                 return block.energy_from_g(curr_x, batch_data, params_cache, scaler, num_graphs)
 
             energy_fn = torch.compile(_energy_fn, dynamic=True, fullgraph=False)
-            grad_energy_fn = torch.func.grad(energy_fn)
 
             def energy_and_grad_fn(curr_x: torch.Tensor, create_graph: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
-                e = energy_fn(curr_x)
-                del create_graph
-                grad = grad_energy_fn(curr_x)
-                return e.detach(), grad
+                e, vjp_fn = torch.func.vjp(energy_fn, curr_x)
+                grad, = vjp_fn(torch.ones_like(e))
+                return (e.detach() if not create_graph else e), grad
 
             if mode == "fixed":
                 x, energy_trace, solver_stats = self.fixed_solver.run(

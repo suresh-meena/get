@@ -219,14 +219,10 @@ class GlobalAttentionBranch(EnergyBranch):
         beta_g = inverse_temperature(params, "beta_g")
 
         counts = torch.bincount(batch_idx, minlength=num_graphs)
-        if counts.numel() == 0:
-            return H.new_zeros(num_graphs)
-        max_nodes_per_graph = int(counts.max().item())
-        if max_nodes_per_graph > self.max_global_nodes:
+        if counts.max() > self.max_global_nodes:
             raise RuntimeError(
-                f"Global attention graph size {max_nodes_per_graph} exceeds "
-                f"max_global_nodes={self.max_global_nodes}. Use sparse global "
-                "attention or reduce per-graph size."
+                f"Graph size {int(counts.max())} exceeds max_global_nodes="
+                f"{self.max_global_nodes}. Use sparse global attention."
             )
 
         if batch_idx.numel() > 1 and not torch.all(batch_idx[:-1] <= batch_idx[1:]):
@@ -316,13 +312,11 @@ def enabled_branches_from_config(model_cfg: Any) -> Dict[str, bool]:
 class _QuadraticBranchCached(QuadraticBranch):
     pass
 
-_quad_branch = _QuadraticBranchCached()
-
-
 class ComposedEnergy(nn.Module):
     def __init__(self, enabled_names: List[str], **branch_kwargs):
         super().__init__()
         self.enabled_names = list(enabled_names)
+        self.quad_branch = _QuadraticBranchCached()
         self.branches = nn.ModuleDict()
         for name in enabled_names:
             if name == "global_attention":
@@ -336,7 +330,7 @@ class ComposedEnergy(nn.Module):
     def forward(self, state: Dict[str, torch.Tensor], batch: Any, context: Dict[str, Any]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         total = None
         branch_energies = {}
-        quad_term = _quad_branch(state, batch, context)
+        quad_term = self.quad_branch(state, batch, context)
         for name, branch in self.branches.items():
             e = branch(state, batch, context)
             if e.dim() > quad_term.dim():

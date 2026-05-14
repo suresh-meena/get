@@ -106,6 +106,7 @@ class UnifiedTrainer:
 
         # Warmup Cosine Scheduler
         warmup_epochs = int(trainer_cfg.get("warmup_epochs", 50))
+        self._warmup_epochs = warmup_epochs
         def lr_lambda(epoch):
             if epoch < warmup_epochs:
                 return float(epoch) / float(max(1, warmup_epochs))
@@ -139,16 +140,16 @@ class UnifiedTrainer:
         logits: torch.Tensor,
         targets: torch.Tensor,
         mask: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, int]:
+    ) -> tuple[torch.Tensor, torch.Tensor | int]:
         raw_loss = self.criterion(logits, targets)
         if mask is None:
             return raw_loss, int(targets.numel())
         mask = mask.to(device=raw_loss.device).bool().reshape_as(raw_loss)
-        supervised = int(mask.sum().item())
-        if supervised == 0:
+        loss = raw_loss.masked_select(mask).sum()
+        supervised = mask.sum()
+        if supervised.item() == 0:
             return raw_loss.new_zeros(()), 0
-        loss = raw_loss.masked_select(mask).sum() / float(supervised)
-        return loss, supervised
+        return loss / supervised, supervised
 
     def _autocast_dtype(self) -> torch.dtype:
         if self.amp_dtype == "bf16":
@@ -171,7 +172,7 @@ class UnifiedTrainer:
             self.metric_recall.reset()
             self.metric_f1.reset()
         loss_accum = torch.zeros(1, device=self.device)
-        seen = 0
+        seen = torch.zeros(1, device=self.device)
         cls_pos = torch.zeros(1, device=self.device)
         cls_total = torch.zeros(1, device=self.device)
 
@@ -259,7 +260,7 @@ class UnifiedTrainer:
             loss_accum += loss.detach() * loss_weight
             seen += loss_weight
 
-        if seen == 0:
+        if seen.item() == 0:
             return {"loss": 0.0, "acc": 0.0}
 
         mean_loss = (loss_accum / seen).item()
@@ -348,7 +349,7 @@ class UnifiedTrainer:
         bad_epochs = 0
 
         history = {"train": [], "val": []}
-        warmup_epochs = int(self.warmup_scheduler.lr_lambdas[0].__code__.co_consts[1]) if hasattr(self.warmup_scheduler, "lr_lambdas") else 50
+        warmup_epochs = getattr(self, "_warmup_epochs", 50)
         
         if self.use_tqdm:
             from tqdm import tqdm

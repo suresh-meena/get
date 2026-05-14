@@ -24,11 +24,11 @@ def resolve_device(device_name: str) -> torch.device:
     return torch.device(device_name)
 
 
-def make_loader_kwargs(num_workers: int) -> Dict[str, object]:
+def make_loader_kwargs(num_workers: int, device: torch.device | None = None) -> Dict[str, object]:
     num_workers = int(num_workers)
     kwargs: Dict[str, object] = {
         "num_workers": num_workers,
-        "pin_memory": torch.cuda.is_available(),
+        "pin_memory": device.type == "cuda" if device is not None else torch.cuda.is_available(),
         "persistent_workers": num_workers > 0,
     }
     if num_workers > 0:
