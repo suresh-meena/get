@@ -48,7 +48,3 @@ class MotifEnergy(nn.Module):
                 lse_3 = lse_3 * degree_scaler.unsqueeze(-1)
             graph_lse = scatter(lse_3, batch, dim=0, dim_size=num_graphs, reduce="sum")
             return (lambda_3 / beta_3) * graph_lse
-
-
-def compute_motif_energy(G, c_3, u_3, v_3, t_tau, batch, num_graphs, params, projections, num_nodes, degree_scaler=None):
-    return MotifEnergy()(G, c_3, u_3, v_3, t_tau, batch, num_graphs, params, projections, num_nodes, degree_scaler=degree_scaler)

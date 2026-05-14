@@ -4,7 +4,7 @@ import json
 import statistics
 import time
 from pathlib import Path
-from typing import Dict, Tuple, List, Any
+from typing import Dict, Tuple, List
 
 import hydra
 import torch
@@ -29,7 +29,7 @@ from get.data import (
 )
 from get.models import build_model
 from get.trainers import UnifiedTrainer
-from get.utils import seed_everything, move_batch_to_device
+from get.utils import seed_everything, move_batch_to_device, maybe_compile_model
 from experiments.common import resolve_device, score_key_for_task
 
 
@@ -41,18 +41,20 @@ def _build_loaders_from_items(
     task_type: str,
     device: torch.device | None = None,
 ) -> Tuple[DataLoader, DataLoader, DataLoader, Dict]:
-    num_workers = int(tr_cfg.get("num_workers", 0))
-    if device is not None and device.type != "cuda":
-        # CPU runs (including unit-test subprocess runs) are typically slower
-        # and less stable with multiprocessing DataLoaders.
-        num_workers = 0
+    num_workers = int(tr_cfg.get("num_workers", 8))
     pin_memory = bool(device is not None and device.type == "cuda")
     persistent_workers = num_workers > 0
     prefetch_factor = 2 if num_workers > 0 else None
     batch_size = int(tr_cfg.batch_size)
     eval_batch_size = int(tr_cfg.get("eval_batch_size", batch_size))
     use_prefetch = bool(tr_cfg.get("use_pyg_prefetch_loader", False)) and _has_prefetch_loader and device is not None and device.type == "cuda"
-    dataset_on_gpu = bool(tr_cfg.get("dataset_on_gpu", False)) and device is not None and device.type == "cuda"
+    dataset_on_gpu = tr_cfg.get("dataset_on_gpu")
+    if dataset_on_gpu is None and device is not None and device.type == "cuda":
+        total_nodes = sum(item["x"].size(0) for item in train_items[:256])
+        total_edges = sum(item["c_2"].size(0) for item in train_items[:256])
+        estimated_mb = (total_nodes * 128 * 4 + total_edges * 2 * 8) / (1024 * 1024)
+        dataset_on_gpu = estimated_mb < 2048
+    dataset_on_gpu = bool(dataset_on_gpu) and device is not None and device.type == "cuda"
 
     train_ds = ListGraphDataset(train_items)
     val_ds = ListGraphDataset(val_items)
@@ -112,8 +114,14 @@ def _run_single_experiment(
     run_cfg["edge_attr_dim"] = int(edge_attr_dim)
 
     model = build_model(DictConfig(run_cfg)).to(device)
+    compile_cfg = OmegaConf.to_container(cfg.get("experiment", {}).get("compile", {}), resolve=True) if cfg else None
+    scope = str(compile_cfg.get("scope", "all")) if compile_cfg else "all"
+    if scope == "all":
+        model = maybe_compile_model(model, compile_cfg)
+        eval_model = model
+    else:
+        eval_model = maybe_compile_model(model, compile_cfg)
     parameter_count = sum(p.numel() for p in model.parameters())
-    eval_model = model
 
     trainer_cfg = OmegaConf.to_container(cfg.trainer, resolve=True)
     trainer_cfg["task_type"] = task_type
@@ -135,7 +143,6 @@ def _run_single_experiment(
         peak_memory = torch.cuda.max_memory_allocated() / (1024 * 1024)
 
     model_name = str(run_cfg.get("model_name", "fullget")).lower()
-    is_ham = model_name.startswith("get_ham_")
     enabled_branches = {
         "pairwise": True,
         "motif": model_name in ("fullget", "get_ham_global"),

@@ -12,7 +12,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from get.energy.ops import segment_logsumexp
 from .energy_norm import EnergyLayerNorm
 from .et_utils import build_et_batch_context
 
@@ -73,6 +72,8 @@ class _AttentionEnergy(nn.Module):
             return g.new_zeros(1).squeeze()
 
         chunk_size = 500_000
+        Hw = self.Hw  # [H, H] head mixing matrix
+
         scores_max = torch.full((N, H), float('-inf'), device=g.device, dtype=g.dtype)
         for i in range(0, E, chunk_size):
             end = min(i + chunk_size, E)
@@ -82,7 +83,8 @@ class _AttentionEnergy(nn.Module):
             if compute_corr:
                 corr = (g[c_chunk] * g[u_chunk]).sum(dim=-1, keepdim=True)
                 s_chunk = s_chunk * corr
-            s_final = s_chunk * betas.unsqueeze(0)
+            s_mixed = torch.einsum("eh,hg->eg", s_chunk, Hw)
+            s_final = s_mixed * betas.unsqueeze(0)
             scores_max.scatter_reduce_(0, c_chunk.unsqueeze(-1).expand(-1, H), s_final, reduce="amax", include_self=True)
 
         exp_sum = g.new_zeros(N, H)
@@ -94,7 +96,8 @@ class _AttentionEnergy(nn.Module):
             if compute_corr:
                 corr = (g[c_chunk] * g[u_chunk]).sum(dim=-1, keepdim=True)
                 s_chunk = s_chunk * corr
-            s_final = s_chunk * betas.unsqueeze(0)
+            s_mixed = torch.einsum("eh,hg->eg", s_chunk, Hw)
+            s_final = s_mixed * betas.unsqueeze(0)
             s_shifted = s_final - scores_max[c_chunk]
             exp_sum.scatter_add_(0, c_chunk.unsqueeze(-1).expand(-1, H), torch.exp(s_shifted))
 

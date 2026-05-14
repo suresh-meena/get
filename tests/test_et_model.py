@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import pytest
 import torch
 import argparse
-from pathlib import Path
 
 from get.data import SyntheticGraphDataset, collate_graph_samples
 from get.models import ETGraphClassifier
@@ -177,9 +175,6 @@ def test_graph_tasks_build_model_accepts_etfaithful_alias():
         lambda_2=1.0,
         lambda_3=0.5,
         lambda_m=0.0,
-        beta_2=1.0,
-        beta_3=1.0,
-        beta_m=1.0,
         armijo_eta0=0.2,
         armijo_gamma=0.5,
         armijo_c=1e-4,

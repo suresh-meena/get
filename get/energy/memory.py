@@ -19,7 +19,3 @@ class MemoryEnergy(nn.Module):
         lse_m = torch.logsumexp(beta_m * Lm, dim=-1)
 
         return (lambda_m / beta_m) * scatter(lse_m, batch, dim=0, dim_size=num_graphs, reduce="sum")
-
-
-def compute_memory_energy(G, batch, num_graphs, params, projections):
-    return MemoryEnergy()(G, batch, num_graphs, params, projections)

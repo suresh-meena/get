@@ -2,10 +2,10 @@ import torch
 import pytest
 from torch.autograd import gradcheck
 
-from get.energy.quadratic import compute_quadratic_energy
-from get.energy.pairwise import compute_pairwise_energy
-from get.energy.motif import compute_motif_energy
-from get.energy.memory import compute_memory_energy
+from get.energy.quadratic import QuadraticEnergy
+from get.energy.pairwise import PairwiseEnergy
+from get.energy.motif import MotifEnergy
+from get.energy.memory import MemoryEnergy
 
 @pytest.fixture
 def device():
@@ -63,7 +63,7 @@ def test_quadratic_energy_gradcheck(dummy_data):
     X, batch, num_graphs, _, _, _, _, _, _, _, _, _ = dummy_data
     
     def func(x):
-        return compute_quadratic_energy(x, batch, num_graphs)
+        return QuadraticEnergy()(x, batch, num_graphs)
         
     assert gradcheck(func, (X,), eps=1e-6, atol=1e-4)
 
@@ -71,7 +71,7 @@ def test_quadratic_energy_gradcheck(dummy_data):
 def test_quadratic_energy_is_graph_size_normalized():
     X = torch.tensor([[1.0], [2.0], [3.0]], dtype=torch.float32)
     batch = torch.tensor([0, 0, 1], dtype=torch.long)
-    out = compute_quadratic_energy(X, batch, num_graphs=2)
+    out = QuadraticEnergy()(X, batch, num_graphs=2)
     expected = torch.tensor([1.25, 4.5], dtype=torch.float32)
     assert torch.allclose(out, expected)
 
@@ -86,7 +86,7 @@ def test_pairwise_energy_gradcheck(dummy_data):
         proj = projections.copy()
         proj['Q2'] = q
         proj['K2'] = k
-        return compute_pairwise_energy(X, c_2, u_2, batch, num_graphs, params, proj, num_nodes)
+        return PairwiseEnergy()(X, c_2, u_2, batch, num_graphs, params, proj, num_nodes)
         
     assert gradcheck(func, (Q2, K2), eps=1e-6, atol=1e-4)
 
@@ -100,7 +100,7 @@ def test_motif_energy_gradcheck(dummy_data):
         proj = projections.copy()
         proj['Q3'] = q
         proj['K3'] = k
-        return compute_motif_energy(X, c_3, u_3, v_3, t_tau, batch, num_graphs, params, proj, num_nodes)
+        return MotifEnergy()(X, c_3, u_3, v_3, t_tau, batch, num_graphs, params, proj, num_nodes)
         
     assert gradcheck(func, (Q3, K3), eps=1e-6, atol=1e-4)
 
@@ -114,6 +114,6 @@ def test_memory_energy_gradcheck(dummy_data):
         proj = projections.copy()
         proj['Qm'] = q
         proj['Km'] = k
-        return compute_memory_energy(X, batch, num_graphs, params, proj)
+        return MemoryEnergy()(X, batch, num_graphs, params, proj)
         
     assert gradcheck(func, (Qm, Km), eps=1e-6, atol=1e-4)

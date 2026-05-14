@@ -1,13 +1,6 @@
 import torch
 import torch.nn.functional as F
-from torch_geometric.utils import degree
-
-
-def scatter_sum(src: torch.Tensor, index: torch.Tensor, dim: int, dim_size: int) -> torch.Tensor:
-    index = index.view(-1, *([1] * (src.dim() - 1))).expand_as(src)
-    size = list(src.shape)
-    size[dim] = dim_size
-    return torch.scatter_reduce(src.new_zeros(size), dim, index, src, "sum", include_self=False)
+from torch_geometric.utils import degree, scatter
 
 
 def segment_logsumexp(x: torch.Tensor, segment_ids: torch.Tensor, num_segments: int, dim: int = -1):
@@ -25,7 +18,7 @@ def segment_logsumexp(x: torch.Tensor, segment_ids: torch.Tensor, num_segments: 
     max_expanded = torch.where(torch.isneginf(max_expanded), torch.zeros_like(max_expanded), max_expanded)
     x_shifted = x - max_expanded
 
-    out_sum = scatter_sum(torch.exp(x_shifted), segment_ids, dim, num_segments)
+    out_sum = scatter(torch.exp(x_shifted), segment_ids, dim=dim, dim_size=num_segments, reduce="sum")
     return torch.log(out_sum.clamp_min(1e-12)) + out_max
 
 

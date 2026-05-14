@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+from torch_geometric.utils import scatter
 
 from get.energy.ops import (
     positive_param, inverse_temperature,
-    segment_logsumexp, fused_motif_dot, scatter_sum,
+    segment_logsumexp, fused_motif_dot,
 )
 
 
@@ -75,11 +76,11 @@ class PairwiseBranch(EnergyBranch):
         mode = params.get("agg_mode", "softmax")
         if mode == "sum":
             scores = torch.exp(beta_2 * ell_2) if params.get("sum_exp", False) else ell_2
-            agg_2 = scatter_sum(scores, c_2, 0, num_nodes)
+            agg_2 = scatter(scores, c_2, dim=0, dim_size=num_nodes, reduce="sum")
             scaler = context.get("degree_scaler")
             if scaler is not None:
                 agg_2 = agg_2 * scaler.unsqueeze(-1)
-            graph_agg = scatter_sum(agg_2, batch_idx, 0, num_graphs)
+            graph_agg = scatter(agg_2, batch_idx, dim=0, dim_size=num_graphs, reduce="sum")
             return lambda_2 * graph_agg
         else:
             lse_2 = segment_logsumexp(beta_2 * ell_2, c_2, num_nodes, dim=0)
@@ -91,7 +92,7 @@ class PairwiseBranch(EnergyBranch):
             scaler = context.get("degree_scaler")
             if scaler is not None:
                 lse_2 = lse_2 * scaler.unsqueeze(-1)
-            graph_lse = scatter_sum(lse_2, batch_idx, 0, num_graphs)
+            graph_lse = scatter(lse_2, batch_idx, dim=0, dim_size=num_graphs, reduce="sum")
             return (lambda_2 / beta_2) * graph_lse
 
 
@@ -138,11 +139,11 @@ class MotifBranch(EnergyBranch):
         mode = params.get("agg_mode", "softmax")
         if mode == "sum":
             scores = torch.exp(beta_3 * ell_3) if params.get("sum_exp", False) else ell_3
-            agg_3 = scatter_sum(scores, c_3, 0, num_nodes)
+            agg_3 = scatter(scores, c_3, dim=0, dim_size=num_nodes, reduce="sum")
             scaler = context.get("degree_scaler")
             if scaler is not None:
                 agg_3 = agg_3 * scaler.unsqueeze(-1)
-            graph_agg = scatter_sum(agg_3, batch_idx, 0, num_graphs)
+            graph_agg = scatter(agg_3, batch_idx, dim=0, dim_size=num_graphs, reduce="sum")
             return lambda_3 * graph_agg
         else:
             lse_3 = segment_logsumexp(beta_3 * ell_3, c_3, num_nodes, dim=0)
@@ -154,7 +155,7 @@ class MotifBranch(EnergyBranch):
             scaler = context.get("degree_scaler")
             if scaler is not None:
                 lse_3 = lse_3 * scaler.unsqueeze(-1)
-            graph_lse = scatter_sum(lse_3, batch_idx, 0, num_graphs)
+            graph_lse = scatter(lse_3, batch_idx, dim=0, dim_size=num_graphs, reduce="sum")
             return (lambda_3 / beta_3) * graph_lse
 
 
@@ -184,9 +185,12 @@ class MemoryBranch(EnergyBranch):
 
         beta_max = params.get("beta_max", None)
         beta_m = inverse_temperature(params, "beta_m", beta_max=beta_max)
+        if torch.is_tensor(beta_m) and beta_m.dim() == 1:
+            beta_m = beta_m.view(1, -1, 1)
         lse_m = torch.logsumexp(beta_m * ell_m, dim=-1)
-        per_node = (lambda_m / beta_m) * lse_m
-        per_graph = scatter_sum(per_node, batch_idx, 0, num_graphs)
+        bm = beta_m.squeeze() if torch.is_tensor(beta_m) else beta_m
+        per_node = (lambda_m / bm) * lse_m
+        per_graph = scatter(per_node, batch_idx, dim=0, dim_size=num_graphs, reduce="sum")
         return per_graph
 
 
@@ -225,60 +229,28 @@ class GlobalAttentionBranch(EnergyBranch):
                 f"{self.max_global_nodes}. Use sparse global attention."
             )
 
-        if batch_idx.numel() > 1 and not torch.all(batch_idx[:-1] <= batch_idx[1:]):
-            same_graph = batch_idx[:, None].eq(batch_idx[None, :])
-            if Qg.dim() == 2:
-                attn = torch.mm(Qg, Kg.t()) / scale
-                attn = attn.masked_fill(~same_graph, float("-inf"))
-                lse_g = torch.logsumexp(beta_g * attn, dim=-1)
-                per_graph = H.new_zeros(num_graphs)
-                per_graph.scatter_add_(0, batch_idx, lse_g)
-            else:
-                attn = torch.einsum("nhd,mhd->nhm", Qg, Kg) / scale
-                attn = attn.masked_fill(~same_graph[:, None, :], float("-inf"))
-                lse_g = torch.logsumexp(beta_g * attn, dim=-1)
-                per_graph = H.new_zeros((num_graphs, lse_g.size(-1)))
-                per_graph.scatter_add_(0, batch_idx[:, None].expand_as(lse_g), lse_g)
-            return (lambda_g / beta_g) * per_graph
+        from torch_geometric.utils import to_dense_batch
 
-        chunk_size = int(params.get("global_chunk_size", 256))
-        chunk_size = max(16, chunk_size)
-
-        starts = torch.cumsum(counts, dim=0) - counts
         if Qg.dim() == 2:
-            per_graph = H.new_zeros(num_graphs)
-            for gidx in range(num_graphs):
-                ng = int(counts[gidx].item())
-                if ng == 0:
-                    continue
-                s = int(starts[gidx].item())
-                e = s + ng
-                qg = Qg[s:e]
-                kg = Kg[s:e]
-                lse_g = qg.new_full((ng,), float("-inf"))
-                for ks in range(0, ng, chunk_size):
-                    ke = min(ks + chunk_size, ng)
-                    scores = torch.mm(qg, kg[ks:ke].t()) / scale
-                    chunk_lse = torch.logsumexp(beta_g * scores, dim=-1)
-                    lse_g = torch.logaddexp(lse_g, chunk_lse)
-                per_graph[gidx] = lse_g.sum()
+            Q_dense, mask = to_dense_batch(Qg, batch_idx, max_num_nodes=self.max_global_nodes)
+            K_dense, _ = to_dense_batch(Kg, batch_idx, max_num_nodes=self.max_global_nodes)
+            attn = torch.bmm(Q_dense, K_dense.transpose(1, 2)) / scale
+            attn = attn.masked_fill(~mask[:, :, None] | ~mask[:, None, :], float("-inf"))
+            bg = beta_g.mean() if (torch.is_tensor(beta_g) and beta_g.dim() == 1) else beta_g
+            lse = torch.logsumexp(bg * attn, dim=-1)
+            mask_2d = ~mask if lse.dim() == mask.dim() else ~mask.unsqueeze(-1)
+            lse = lse.masked_fill(mask_2d, 0.0)
+            per_graph = lse.sum(dim=-1)
+            return (lambda_g / bg) * per_graph
         elif Qg.dim() == 3:
-            per_graph = H.new_zeros((num_graphs, Qg.size(1)))
-            for gidx in range(num_graphs):
-                ng = int(counts[gidx].item())
-                if ng == 0:
-                    continue
-                s = int(starts[gidx].item())
-                e = s + ng
-                qg = Qg[s:e]
-                kg = Kg[s:e]
-                lse_g = qg.new_full((ng, qg.size(1)), float("-inf"))
-                for ks in range(0, ng, chunk_size):
-                    ke = min(ks + chunk_size, ng)
-                    scores = torch.einsum("nhd,mhd->nhm", qg, kg[ks:ke]) / scale
-                    chunk_lse = torch.logsumexp(beta_g * scores, dim=-1)
-                    lse_g = torch.logaddexp(lse_g, chunk_lse)
-                per_graph[gidx] = lse_g.sum(dim=0)
+            Q_dense, mask = to_dense_batch(Qg, batch_idx, max_num_nodes=self.max_global_nodes)
+            K_dense, _ = to_dense_batch(Kg, batch_idx, max_num_nodes=self.max_global_nodes)
+            attn = torch.einsum("bnhd,bmhd->bnmh", Q_dense, K_dense) / scale
+            attn = attn.masked_fill(~mask[:, None, :, None] | ~mask[:, :, None, None], float("-inf"))
+            lse = torch.logsumexp(beta_g * attn, dim=2)
+            mask_2d = ~mask if lse.dim() == mask.dim() else ~mask.unsqueeze(-1)
+            lse = lse.masked_fill(mask_2d, 0.0)
+            per_graph = lse.sum(dim=1)
         else:
             raise ValueError(f"Expected Qg/Kg to be 2D or 3D, got Qg.dim()={Qg.dim()}")
         return (lambda_g / beta_g) * per_graph
@@ -331,10 +303,14 @@ class ComposedEnergy(nn.Module):
         total = None
         branch_energies = {}
         quad_term = self.quad_branch(state, batch, context)
+        hw = context.get("hw")
         for name, branch in self.branches.items():
             e = branch(state, batch, context)
             if e.dim() > quad_term.dim():
-                e = e.mean(dim=tuple(range(quad_term.dim(), e.dim())))
+                if hw is not None:
+                    e = (e @ hw.T).sum(dim=-1)
+                else:
+                    e = e.mean(dim=tuple(range(quad_term.dim(), e.dim())))
             branch_energies[name] = e.detach()
             if total is None:
                 total = e

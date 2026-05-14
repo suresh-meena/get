@@ -51,7 +51,3 @@ class PairwiseEnergy(nn.Module):
                 lse_2 = lse_2 * degree_scaler.unsqueeze(-1)
             graph_lse = scatter(lse_2, batch, dim=0, dim_size=num_graphs, reduce="sum")
             return (lambda_2 / beta_2) * graph_lse
-
-
-def compute_pairwise_energy(G, c_2, u_2, batch, num_graphs, params, projections, num_nodes, degree_scaler=None):
-    return PairwiseEnergy()(G, c_2, u_2, batch, num_graphs, params, projections, num_nodes, degree_scaler=degree_scaler)

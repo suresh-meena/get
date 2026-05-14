@@ -16,9 +16,13 @@ def maybe_compile_model(model: torch.nn.Module, compile_cfg: Dict[str, Any] | No
         return model
     if getattr(model, "requires_double_backward", False):
         return model
-    if all(p.device.type == "cpu" for p in model.parameters()):
-        return model
     try:
-        return compile_fn(model, dynamic=True, fullgraph=False)
+        backend = str(compile_cfg.get("backend", "inductor"))
+        dynamic = bool(compile_cfg.get("dynamic", True))
+        fullgraph = bool(compile_cfg.get("fullgraph", False))
+        mode = compile_cfg.get("mode", None)
+        if mode is not None:
+            mode = str(mode)
+        return compile_fn(model, dynamic=dynamic, fullgraph=fullgraph, backend=backend, mode=mode)
     except Exception:
         return model

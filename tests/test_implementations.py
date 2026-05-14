@@ -82,8 +82,8 @@ def test_collate_preserves_sparse_motif_indices():
 
 def test_result_schema_smoke(tmp_path):
     """Run a tiny experiment and assert output JSON contains required fields."""
-    from experiments.run_protocol import build_arg_parser, run_experiment, TASK_SPECS
-    from get.data import build_dataset, split_items, summarize_splits
+    from experiments.run_protocol import run_experiment, TASK_SPECS
+    from get.data import build_dataset, split_items
     import torch
     # Build a minimal synthetic dataset
     from argparse import Namespace
@@ -94,8 +94,7 @@ def test_result_schema_smoke(tmp_path):
             min_nodes=6, max_nodes=12, edge_prob=0.3,
             train_ratio=0.7, val_ratio=0.15,
             hidden_dim=64, num_heads=2, head_dim=32, num_steps=2, num_blocks=1,
-            R=2, K=4, lambda_2=1.0, lambda_3=0.0, lambda_m=0.0,
-            beta_2=1.0, beta_3=1.0, beta_m=1.0,
+            R=2, K=4,             lambda_2=1.0, lambda_3=0.0, lambda_m=0.0,
             alpha=0.1, multiplier=4.0, pos_k=0,
             epochs=1, batch_size=4, lr=1e-3, weight_decay=1e-4,
             use_amp=False, patience=1, num_workers=0, output_dir=str(tmp_path),
@@ -138,7 +137,6 @@ def test_compile_scope_all_accepts_get_model(tmp_path):
 
 def test_compile_guard_eval_only_accepted(tmp_path):
     """compile_scope='eval_only' must be accepted for GET models (smoke)."""
-    import json
     cmd = [
         sys.executable, str(ROOT / "main.py"),
         "dataset.name=stage1_wedge_triangle",
@@ -258,7 +256,7 @@ def test_prefetch_loader_smoke():
 
     from get.models.factory import build_model
     from omegaconf import DictConfig
-    cfg = DictConfig({"model_name": "pairwiseget", "in_dim": 4, "hidden_dim": 64, "num_heads": 2, "head_dim": 32, "num_steps": 1, "num_classes": 1, "task_type": "binary", "lambda_2": 1.0, "lambda_3": 0.0, "lambda_m": 0.0, "beta_2": 1.0, "beta_3": 1.0, "beta_m": 1.0, "update_damping": 0.0, "agg_mode": "softmax", "readout_mode": "graph"})
+    cfg = DictConfig({"model_name": "pairwiseget", "in_dim": 4, "hidden_dim": 64, "num_heads": 2, "head_dim": 32, "num_steps": 1, "num_classes": 1, "task_type": "binary", "lambda_2": 1.0, "lambda_3": 0.0, "lambda_m": 0.0, "update_damping": 0.0, "agg_mode": "softmax", "readout_mode": "graph"})
     model = build_model(cfg).to(device)
 
     for batch in loader:
@@ -399,10 +397,6 @@ def test_get_ham_global_integrated_forward_is_finite():
         lambda_3=1.0,
         lambda_m=1.0,
         lambda_g=1.0,
-        beta_2=1.0,
-        beta_3=1.0,
-        beta_m=1.0,
-        beta_g=1.0,
         update_damping=0.0,
         fixed_step_size=0.01,
         inference_mode_train="fixed",
@@ -450,10 +444,6 @@ def test_get_ham_global_multi_graph_multi_head_forward_is_finite():
         lambda_3=1.0,
         lambda_m=1.0,
         lambda_g=1.0,
-        beta_2=1.0,
-        beta_3=1.0,
-        beta_m=1.0,
-        beta_g=1.0,
         update_damping=0.0,
         fixed_step_size=0.01,
         inference_mode_train="fixed",
@@ -467,17 +457,6 @@ def test_get_ham_global_multi_graph_multi_head_forward_is_finite():
 
 
 
-
-
-# ---------------------------------------------------------------------------
-# 10. Readout [mean; sum; max]
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# 11. Readout [mean; sum; max]
-# ---------------------------------------------------------------------------
-
 def test_readout_concat_mean_sum_max():
     from get.models.energy_classifier import EnergyGraphClassifier
     import torch
@@ -485,7 +464,6 @@ def test_readout_concat_mean_sum_max():
         in_dim=4, hidden_dim=64, num_classes=2, num_steps=1,
         num_heads=2, head_dim=32, R=2, K=4, num_motif_types=2,
         lambda_2=1.0, lambda_3=0.0, lambda_m=0.0,
-        beta_2=1.0, beta_3=1.0, beta_m=1.0,
         update_damping=0.0, readout_mode="graph",
     ).eval()
     x = torch.randn(6, 64)
@@ -495,12 +473,12 @@ def test_readout_concat_mean_sum_max():
 
 
 # ---------------------------------------------------------------------------
-# 12. Static edge features
+# 10. Static edge features
 # ---------------------------------------------------------------------------
 
 def test_edge_attr_preserved_through_collation():
     """Test edge_attr is preserved through collation."""
-    from get.data.synthetic import sample_from_edge_index, collate_graph_samples, GraphSampleData
+    from get.data.synthetic import sample_from_edge_index, collate_graph_samples
     import torch
     n = 3
     edge_index = torch.tensor([[0, 1, 2], [1, 2, 0]], dtype=torch.long)
@@ -531,7 +509,7 @@ def test_edge_attr_vector_is_promoted_to_matrix():
 
 
 # ---------------------------------------------------------------------------
-# 12. PE/SE policy
+# 11. PE/SE policy
 # ---------------------------------------------------------------------------
 
 def test_pe_se_tensors_on_batch(tmp_path):
@@ -552,11 +530,4 @@ def test_pe_se_tensors_on_batch(tmp_path):
     assert batch.pos.size(0) == n * 2
 
 
-# ---------------------------------------------------------------------------
-# 13. Multi-state solver (future stub)
-# ---------------------------------------------------------------------------
 
-def test_dict_state_solver_is_future():
-    """Multi-state dict solver is marked as future/extension."""
-    import pytest
-    pytest.skip("Multi-state solver is a future extension (Phase D). Not yet implemented.")

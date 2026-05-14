@@ -18,13 +18,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from external.graph_baselines.torch_baselines import ExternalGraphBaseline  # noqa: E402
 from get.data import SyntheticGraphDataset, ListGraphDataset  # noqa: E402
-from get.data.synthetic import sample_from_edge_index  # noqa: E402
-from get.models import EnergyGraphClassifier  # noqa: E402
+from get.models import build_model  # noqa: E402
 from get.utils.seed import seed_everything  # noqa: E402
+from get.utils.compile import maybe_compile_model  # noqa: E402
 from get.data import infer_edge_attr_dim, split_items, summarize_splits  # noqa: E402
-from experiments.common import fit_unified_trainer, make_loader_kwargs, resolve_device  # noqa: E402
+from experiments.common import fit_unified_trainer, make_loader_kwargs, resolve_device, build_data_loaders  # noqa: E402
 
 
 def _apply_task_preset(args: argparse.Namespace) -> argparse.Namespace:
@@ -177,18 +176,11 @@ def _build_tudataset_loaders(args: argparse.Namespace):
 
 
 def _build_loaders_from_samples(train_items, val_items, test_items, args, task_type):
-    train_ds = ListGraphDataset(train_items)
-    val_ds = ListGraphDataset(val_items)
-    test_ds = ListGraphDataset(test_items)
-
-    loader_kwargs = make_loader_kwargs(getattr(args, "num_workers", 0))
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
-    eval_bs = args.eval_batch_size or args.batch_size
-    val_loader = DataLoader(val_ds, batch_size=eval_bs, shuffle=False, **loader_kwargs)
-    test_loader = DataLoader(test_ds, batch_size=eval_bs, shuffle=False, **loader_kwargs)
-    
-    split_stats = summarize_splits({"train": train_items, "val": val_items, "test": test_items}, task_type=task_type)
-    return train_loader, val_loader, test_loader, split_stats
+    return build_data_loaders(
+        train_items, val_items, test_items,
+        batch_size=args.batch_size, eval_batch_size=getattr(args, "eval_batch_size", args.batch_size),
+        num_workers=args.num_workers, task_type=task_type,
+    )
 
 
 def _build_loaders(args: argparse.Namespace):
@@ -220,29 +212,9 @@ def _build_loaders(args: argparse.Namespace):
 
 
 def _pyg_data_to_sample(data, in_dim: int, max_motifs_per_anchor: int, task_type: str = "binary") -> Dict[str, torch.Tensor]:
-    n = int(data.num_nodes)
-    edge_index = data.edge_index.long()
-    x = data.x
-    if x is None:
-        x = torch.ones((n, 1), dtype=torch.float32)
-    x = x.float()
-    if x.size(1) < in_dim:
-        pad = torch.zeros((n, in_dim - x.size(1)), dtype=x.dtype)
-        x = torch.cat([x, pad], dim=1)
-    elif x.size(1) > in_dim:
-        x = x[:, :in_dim]
-
-    y = data.y
-    if y is None:
-        y = torch.tensor(0.0)
-    y = y.view(-1).float()
-    y = y[0] if y.numel() > 0 else torch.tensor(0.0)
-    if task_type == "multiclass":
-        yy = torch.tensor([float(int(y.item()))], dtype=torch.float32)
-    else:
-        yy = torch.tensor([1.0 if float(y.item()) > 0 else 0.0], dtype=torch.float32)
-
-    return sample_from_edge_index(edge_index=edge_index, num_nodes=n, x=x, y=yy, max_motifs_per_anchor=max_motifs_per_anchor)
+    from get.data.protocol import graph_to_sample
+    y_mode = "multiclass" if task_type == "multiclass" else "binary"
+    return graph_to_sample(data, in_dim=in_dim, max_motifs_per_anchor=max_motifs_per_anchor, y_mode=y_mode)
 
 
 def _load_csl_samples(args: argparse.Namespace) -> tuple[List[Dict[str, torch.Tensor]], int]:
@@ -311,8 +283,27 @@ def _run_single_fit(
     task_type: str,
     num_classes: int,
 ) -> Dict[str, Dict[str, float]]:
-    model = _build_model(args, task_type=task_type, num_classes=num_classes, edge_attr_dim=getattr(args, "edge_attr_dim", 0))
-    eval_model = model
+    cfg_dict = dict(vars(args))
+    cfg_dict["task_type"] = task_type
+    cfg_dict["num_classes"] = num_classes
+    cfg_dict["edge_attr_dim"] = getattr(args, "edge_attr_dim", 0)
+    from omegaconf import DictConfig
+    model = build_model(DictConfig(cfg_dict)).to(device)
+    compile_cfg = {
+        "enabled": bool(getattr(args, "compile", True)),
+        "scope": str(getattr(args, "compile_scope", "all")),
+        "backend": str(getattr(args, "compile_backend", "inductor")),
+        "dynamic": bool(getattr(args, "compile_dynamic", True)),
+        "fullgraph": bool(getattr(args, "compile_fullgraph", False)),
+        "mode": getattr(args, "compile_mode", None),
+    }
+    scope = compile_cfg.get("scope", "all")
+    if scope == "all":
+        model = maybe_compile_model(model, compile_cfg)
+        eval_model = model
+    else:
+        eval_model = maybe_compile_model(model, compile_cfg)
+    parameter_count = sum(p.numel() for p in model.parameters())
 
     trainer_cfg: Dict[str, object] = {
         "epochs": args.epochs,
@@ -325,7 +316,7 @@ def _run_single_fit(
         "task_type": task_type,
         "num_classes": num_classes,
     }
-    _, fit_result, _, _, _ = fit_unified_trainer(
+    _, fit_result, _, _, peak_memory_mb = fit_unified_trainer(
         model=model,
         eval_model=eval_model,
         device=device,
@@ -334,110 +325,12 @@ def _run_single_fit(
         val_loader=val_loader,
         test_loader=test_loader,
     )
+    fit_result["parameter_count"] = parameter_count
+    fit_result["peak_cuda_memory_mb"] = peak_memory_mb
     return fit_result
 
 
-def _build_model(args: argparse.Namespace, task_type: str, num_classes: int, edge_attr_dim: int = 0) -> torch.nn.Module:
-    name = args.model_name.lower()
-    out_dim = num_classes if task_type == "multiclass" else 1
-    if name == "external_baseline":
-        return ExternalGraphBaseline(in_dim=args.in_dim, hidden_dim=args.hidden_dim, out_dim=out_dim)
-    if name == "gcn":
-        from external.graph_baselines.torch_baselines import GCNGraphBaseline
-        return GCNGraphBaseline(in_dim=args.in_dim, hidden_dim=args.hidden_dim, out_dim=out_dim)
-    if name == "gat":
-        from external.graph_baselines.torch_baselines import GATGraphBaseline
-        return GATGraphBaseline(in_dim=args.in_dim, hidden_dim=args.hidden_dim, out_dim=out_dim)
-    if name == "gin":
-        from external.graph_baselines.torch_baselines import GINGraphBaseline
-        return GINGraphBaseline(in_dim=args.in_dim, hidden_dim=args.hidden_dim, out_dim=out_dim)
 
-    if name in {"et", "etfaithful"}:
-        from get.models import ETGraphClassifier
-        return ETGraphClassifier(
-            in_dim=args.in_dim,
-            hidden_dim=getattr(args, "et_hidden_dim", args.hidden_dim),
-            num_classes=out_dim,
-            num_steps=getattr(args, "et_num_steps", 1),
-            num_heads=getattr(args, "et_num_heads", args.num_heads),
-            head_dim=getattr(args, "et_head_dim", args.head_dim),
-            num_blocks=getattr(args, "et_num_blocks", 4),
-            alpha=getattr(args, "et_alpha", args.fixed_step_size),
-            multiplier=getattr(args, "et_multiplier", 4.0),
-            chn_type=getattr(args, "et_chn_type", "relu"),
-            use_bias_attn=getattr(args, "et_use_bias_attn", False),
-            use_bias_chn=getattr(args, "et_use_bias_chn", False),
-            use_bias_norm=getattr(args, "et_use_bias_norm", True),
-            use_cls_token=getattr(args, "et_use_cls_token", True),
-            pos_k=getattr(args, "et_pos_k", 15),
-            embed_type=getattr(args, "et_embed_type", "eigen"),
-            flip_sign=getattr(args, "et_flip_sign", False),
-            compute_corr=getattr(args, "et_compute_corr", True),
-            noise_std=getattr(args, "et_noise_std", 0.02),
-            vary_noise=getattr(args, "et_vary_noise", False),
-            readout_mode=getattr(args, "et_readout_mode", "cls"),
-            update_damping=args.update_damping,
-            inference_mode_train=args.inference_mode_train,
-            inference_mode_eval=args.inference_mode_eval,
-        )
-    if name == "bwgnn":
-        from get.models.baselines import BWGNNBaseline
-        return BWGNNBaseline(
-            in_dim=args.in_dim,
-            hidden_dim=args.hidden_dim,
-            num_classes=out_dim,
-            d=getattr(args, "bwgnn_order", 3)
-        )
-    if name in {"graphtransformer", "gt"}:
-        from get.models.baselines import GraphTransformerBaseline
-        return GraphTransformerBaseline(
-            in_dim=args.in_dim,
-            hidden_dim=args.hidden_dim,
-            num_classes=out_dim,
-            num_heads=getattr(args, "gt_num_heads", getattr(args, "num_heads", 4)),
-            n_layers=getattr(args, "gt_num_layers", getattr(args, "num_steps", 8)),
-            dropout=getattr(args, "gt_dropout", 0.2),
-            ffn_ratio=getattr(args, "gt_ffn_ratio", 4),
-            layer_norm=getattr(args, "gt_layer_norm", True),
-            residual=getattr(args, "gt_residual", True)
-        )
-    if name == "pairwiseget":
-        energy_name = "pairwise_only"
-    elif name == "quadratic_only":
-        energy_name = "quadratic_only"
-    elif name == "fullget":
-        energy_name = "get_full"
-    else:
-        raise ValueError(f"Unknown model_name: {args.model_name}")
-
-    return EnergyGraphClassifier(
-        in_dim=args.in_dim,
-        hidden_dim=args.hidden_dim,
-        num_classes=out_dim,
-        num_steps=args.num_steps,
-        num_heads=args.num_heads,
-        head_dim=args.head_dim,
-        R=args.R,
-        K=args.K,
-        num_motif_types=2,
-        lambda_2=args.lambda_2,
-        lambda_3=args.lambda_3 if energy_name == "get_full" else 0.0,
-        lambda_m=args.lambda_m if energy_name == "get_full" else 0.0,
-        beta_2=args.beta_2,
-        beta_3=args.beta_3,
-        beta_m=args.beta_m,
-        edge_attr_dim=edge_attr_dim,
-        update_damping=args.update_damping,
-        fixed_step_size=args.fixed_step_size,
-        armijo_eta0=args.armijo_eta0,
-        armijo_gamma=args.armijo_gamma,
-        armijo_c=args.armijo_c,
-        armijo_max_backtracks=args.armijo_max_backtracks,
-        armijo_eval_max_backtracks=args.armijo_eval_max_backtracks,
-        inference_mode_train=args.inference_mode_train,
-        inference_mode_eval=args.inference_mode_eval,
-        energy_name=energy_name,
-    )
 
 
 def main() -> None:
@@ -477,9 +370,6 @@ def main() -> None:
     p.add_argument("--lambda_2", type=float, default=1.0)
     p.add_argument("--lambda_3", type=float, default=10.0)
     p.add_argument("--lambda_m", type=float, default=1.0)
-    p.add_argument("--beta_2", type=float, default=1.0)
-    p.add_argument("--beta_3", type=float, default=1.0)
-    p.add_argument("--beta_m", type=float, default=1.0)
     p.add_argument("--update_damping", type=float, default=0.0)
 
     p.add_argument("--fixed_step_size", type=float, default=0.1)
@@ -540,9 +430,10 @@ def main() -> None:
     p.add_argument("--no_compile", action="store_false", dest="compile")
     p.add_argument("--compile_backend", type=str, default="inductor")
     p.add_argument("--compile_dynamic", action="store_true", default=True)
-    p.add_argument("--compile_mode", type=str, default="default")
-    p.add_argument("--compile_allow_double_backward", action="store_true")
+    p.add_argument("--compile_fullgraph", action="store_true", default=False)
     p.add_argument("--compile_scope", type=str, default="all", choices=["all", "eval_only"])
+    p.add_argument("--compile_mode", type=str, default=None)
+    p.add_argument("--compile_allow_double_backward", action="store_true")
 
     p.add_argument("--output", type=str, default="outputs/graph_tasks/last_metrics.json")
     p.add_argument("--num_runs", type=int, default=1, help="Number of independent runs with different seeds")

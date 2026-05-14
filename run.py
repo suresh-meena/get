@@ -12,32 +12,21 @@ import argparse
 import subprocess
 import sys
 
+from get.data.protocol import TASK_SPECS
 
-STAGE1_TASKS = [
-    "stage1_wedge_triangle", "stage1_triangle_regression", "stage1_cycle_parity",
-    "stage1_max3sat", "stage1_xorsat", "stage1_srg_discrimination",
-]
-STAGE2_TASKS = ["stage2_csl", "stage2_brec"]
-STAGE3_TASKS = ["stage3_zinc", "stage3_molhiv", "stage3_molpcba",
-                "stage3_peptides_struct_probe", "stage3_peptides_func_probe"]
-STAGE4_TASKS = [
-    "stage4_tu_proteins", "stage4_tu_nci1", "stage4_tu_enzymes",
-    "stage4_tu_mutagenicity", "stage4_yelpchi_anomaly",
-]
-
-ALL_TASKS = STAGE1_TASKS + STAGE2_TASKS + STAGE3_TASKS + STAGE4_TASKS
+ALL_TASKS = sorted(TASK_SPECS.keys())
 
 ALL_MODELS = [
     "fullget", "pairwiseget", "quadratic_only",
     "get_ham_global",
-    "et", "gt", "bwgnn", "gin", "gcn", "gat",
+    "et", "etfaithful", "gt", "bwgnn", "gin", "gcn", "gat",
 ]
 
 
 def main():
     parser = argparse.ArgumentParser(description="GET Experiment Runner")
-    parser.add_argument("--task", help=f"Task name (e.g. stage1_wedge_triangle)")
-    parser.add_argument("--model", default="fullget", help=f"Model name (e.g. fullget, pairwiseget)")
+    parser.add_argument("--task", help="Task name (e.g. stage1_wedge_triangle)")
+    parser.add_argument("--model", default="fullget", help="Model name (e.g. fullget, pairwiseget)")
     parser.add_argument("--compare", help="Compare models: comma-separated (e.g. fullget,pairwiseget)")
     parser.add_argument("--seeds", type=int, default=1, help="Number of random seeds")
     parser.add_argument("--epochs", type=int, default=100)
@@ -62,7 +51,6 @@ def main():
         return
 
     if args.compare:
-        models = [m.strip() for m in args.compare.split(",")]
         cmd = [
             sys.executable, "scripts/compare.py",
             "--task", args.task or "stage1_wedge_triangle",

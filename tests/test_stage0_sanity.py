@@ -1,7 +1,6 @@
 import torch
 
-from get.energy.core import GETEnergy
-from get.energy.quadratic import compute_quadratic_energy
+from get.energy import ComposedEnergy, QuadraticEnergy
 
 
 def _make_problem(device: torch.device, dtype: torch.dtype = torch.float64):
@@ -86,29 +85,22 @@ def _energy_scalar(
     R: int,
 ):
     projections = _projections_from_x(x, km=km, R=R)
-    energy_vec = GETEnergy()(
-        x,
-        x,
-        c_2,
-        u_2,
-        c_3,
-        u_3,
-        v_3,
-        t_tau,
-        batch,
-        num_graphs,
-        params,
-        projections,
-    )
-    return energy_vec.sum()
+    state = {"H": x}
+    context = {"params": params, "projections": projections, "num_graphs": num_graphs, "batch": batch}
+    composed = ComposedEnergy(["pairwise", "motif", "memory"])
+    total, _ = composed(state, type("Batch", (), {"batch": batch, "c_2": c_2, "u_2": u_2, "c_3": c_3, "u_3": u_3, "v_3": v_3, "t_tau": t_tau})(), context)
+    return total
 
 
 def test_core_energy_returns_per_graph_values():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     x, batch, num_graphs, c_2, u_2, c_3, u_3, v_3, t_tau, params, km, R = _make_problem(device)
     projections = _projections_from_x(x, km=km, R=R)
-    energy = GETEnergy()(x, x, c_2, u_2, c_3, u_3, v_3, t_tau, batch, num_graphs, params, projections)
-    assert energy.shape == (num_graphs,)
+    state = {"H": x}
+    mock_batch = type("Batch", (), {"batch": batch, "c_2": c_2, "u_2": u_2, "c_3": c_3, "u_3": u_3, "v_3": v_3, "t_tau": t_tau})()
+    context = {"params": params, "projections": projections, "num_graphs": num_graphs, "batch": batch}
+    total, _ = ComposedEnergy(["pairwise", "motif", "memory"])(state, mock_batch, context)
+    assert total.shape == (num_graphs,)
 
 
 def test_energy_permutation_invariance():
@@ -189,30 +181,12 @@ def test_pairwise_only_special_case_matches_definition():
     params_pairwise_only["lambda_3"] = 0.0
     params_pairwise_only["lambda_m"] = 0.0
 
-    energy_total = GETEnergy()(
-        x,
-        x,
-        c_2,
-        u_2,
-        c_3,
-        u_3,
-        v_3,
-        t_tau,
-        batch,
-        num_graphs,
-        params_pairwise_only,
-        projections,
-    )
-    pairwise = GETEnergy().pairwise(
-        x,
-        c_2,
-        u_2,
-        batch,
-        num_graphs,
-        params_pairwise_only,
-        projections,
-        x.size(0),
-    ).mean(dim=-1)
-    quadratic = compute_quadratic_energy(x, batch, num_graphs)
+    state = {"H": x}
+    mock_batch = type("Batch", (), {"batch": batch, "c_2": c_2, "u_2": u_2, "c_3": c_3, "u_3": u_3, "v_3": v_3, "t_tau": t_tau})()
+    context = {"params": params_pairwise_only, "projections": projections, "num_graphs": num_graphs, "batch": batch}
+    total, branch_energies = ComposedEnergy(["pairwise", "motif", "memory"])(state, mock_batch, context)
 
-    assert torch.allclose(energy_total, quadratic - pairwise, atol=1e-8, rtol=1e-6)
+    pairwise = branch_energies["pairwise"]
+    quadratic = QuadraticEnergy()(x, batch, num_graphs)
+
+    assert torch.allclose(total, quadratic - pairwise, atol=1e-8, rtol=1e-6)

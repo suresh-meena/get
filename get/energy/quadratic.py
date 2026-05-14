@@ -8,7 +8,3 @@ class QuadraticEnergy(nn.Module):
         graph_energy = scatter(node_energies, batch, dim=0, dim_size=num_graphs, reduce="sum")
         counts = torch.bincount(batch, minlength=num_graphs).to(dtype=X.dtype, device=X.device)
         return graph_energy / counts.clamp_min(1.0)
-
-
-def compute_quadratic_energy(X, batch, num_graphs):
-    return QuadraticEnergy()(X, batch, num_graphs)

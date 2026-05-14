@@ -4,9 +4,8 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List
 
-import numpy as np
 import torch
 try:
     from torch_geometric.loader import PrefetchLoader
@@ -18,21 +17,21 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import statistics
+
 from get.utils.seed import seed_everything
-from get.utils.device import move_batch_to_device
+from get.utils.compile import maybe_compile_model
 from experiments.common import score_key_for_task as _score_key_for_task
 from get.data import (
-    ListGraphDataset,
     build_dataset,
     infer_edge_attr_dim,
     summarize_splits,
     TASK_SPECS,
     get_k_fold_splits,
-    collate_graph_samples,
     split_items,
 )
 from get.models import build_model
-from experiments.common import fit_unified_trainer, make_loader_kwargs, resolve_device
+from experiments.common import fit_unified_trainer, resolve_device, build_data_loaders
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -77,10 +76,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--lambda_3", type=float, default=10.0)
     p.add_argument("--lambda_m", type=float, default=1.0)
     p.add_argument("--lambda_g", type=float, default=0.0)
-    p.add_argument("--beta_2", type=float, default=1.0)
-    p.add_argument("--beta_3", type=float, default=1.0)
-    p.add_argument("--beta_m", type=float, default=1.0)
-    p.add_argument("--beta_g", type=float, default=1.0)
     p.add_argument("--max_global_nodes", type=int, default=512)
 
     # ET specific
@@ -97,8 +92,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no_amp", action="store_false", dest="use_amp")
     p.add_argument("--patience", type=int, default=20)
 
-    p.add_argument("--num_workers", type=int, default=0)
+    p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--use_pyg_prefetch_loader", action="store_true")
+    p.add_argument("--compile", action="store_true", default=True)
+    p.add_argument("--no-compile", action="store_false", dest="compile")
+    p.add_argument("--compile-scope", type=str, default="all", choices=["all", "eval_only"])
+    p.add_argument("--compile-backend", type=str, default="inductor")
+    p.add_argument("--compile-dynamic", action="store_true", default=True)
+    p.add_argument("--compile-fullgraph", action="store_true", default=False)
+    p.add_argument("--compile-mode", type=str, default=None)
     p.add_argument("--output_file", type=str, default="")
     p.add_argument("--output", type=str, default="")
     p.add_argument("--output_dir", type=str, default="outputs/protocol")
@@ -129,18 +131,14 @@ def _evaluate_brec_by_category(
 
     id_to_name = getattr(args, "_brec_category_names", {}) or {}
     out: Dict[str, Dict[str, float]] = {}
-    loader_kwargs = make_loader_kwargs(getattr(args, "num_workers", 0))
 
     for cat_id, samples in grouped.items():
         name = str(id_to_name.get(cat_id, f"category_{cat_id}"))
-        loader = torch.utils.data.DataLoader(
-            ListGraphDataset(samples),
-            batch_size=args.batch_size,
-            shuffle=False,
-            collate_fn=collate_graph_samples,
-            **loader_kwargs,
+        val_loader, _, _, _ = build_data_loaders(
+            [], samples, [], batch_size=args.batch_size,
+            num_workers=args.num_workers, task_type="binary",
         )
-        stats = trainer._run_epoch(loader, train=False)
+        stats = trainer._run_epoch(val_loader, train=False)
         out[name] = {k: float(v) for k, v in stats.items() if isinstance(v, (int, float))}
     return out
 
@@ -156,7 +154,20 @@ def run_experiment(args: argparse.Namespace, tr_items, va_items, te_items, task_
 
     model = build_model(cfg).to(device)
     parameter_count = _count_params(model)
-    eval_model = model
+    compile_cfg = {
+        "enabled": bool(getattr(args, "compile", True)),
+        "scope": str(getattr(args, "compile_scope", "all")),
+        "backend": str(getattr(args, "compile_backend", "inductor")),
+        "dynamic": bool(getattr(args, "compile_dynamic", True)),
+        "fullgraph": bool(getattr(args, "compile_fullgraph", False)),
+        "mode": getattr(args, "compile_mode", None),
+    }
+    scope = compile_cfg.get("scope", "all")
+    if scope == "all":
+        model = maybe_compile_model(model, compile_cfg)
+        eval_model = model
+    else:
+        eval_model = maybe_compile_model(model, compile_cfg)
 
     trainer_cfg = {
         "epochs": args.epochs,
@@ -168,19 +179,10 @@ def run_experiment(args: argparse.Namespace, tr_items, va_items, te_items, task_
         "num_classes": num_classes,
     }
 
-    loader_kwargs = make_loader_kwargs(getattr(args, "num_workers", 0))
-
-    train_loader = torch.utils.data.DataLoader(
-        ListGraphDataset(tr_items), batch_size=args.batch_size, shuffle=True,
-        collate_fn=collate_graph_samples, **loader_kwargs,
-    )
-    val_loader = torch.utils.data.DataLoader(
-        ListGraphDataset(va_items), batch_size=args.batch_size, shuffle=False,
-        collate_fn=collate_graph_samples, **loader_kwargs,
-    )
-    test_loader = torch.utils.data.DataLoader(
-        ListGraphDataset(te_items), batch_size=args.batch_size, shuffle=False,
-        collate_fn=collate_graph_samples, **loader_kwargs,
+    train_loader, val_loader, test_loader, _ = build_data_loaders(
+        tr_items, va_items, te_items,
+        batch_size=args.batch_size, eval_batch_size=args.batch_size,
+        num_workers=args.num_workers, device=device, task_type=task_type,
     )
 
     use_prefetch = bool(getattr(args, "use_pyg_prefetch_loader", False))
@@ -200,8 +202,6 @@ def run_experiment(args: argparse.Namespace, tr_items, va_items, te_items, task_
     )
 
     model_name = str(getattr(args, "model_name", "fullget")).lower()
-    is_ham = model_name.startswith("get_ham_")
-    energy_trace = []
     enabled_branches = {
         "pairwise": True,
         "motif": model_name in ("fullget", "get_ham_global"),
@@ -216,7 +216,6 @@ def run_experiment(args: argparse.Namespace, tr_items, va_items, te_items, task_
         "best_val_score": fit_result["best_val_score"],
         "epochs_ran": fit_result["epochs_ran"],
         "history": history,
-        "energy_trace": energy_trace,
         "parameter_count": parameter_count,
         "runtime_seconds": elapsed,
         "peak_cuda_memory_mb": peak_memory_mb,
@@ -263,7 +262,6 @@ def main():
                 metrics["fold"] = fold_idx + 1
                 fold_results.append(metrics)
 
-            import statistics
             score_key = _score_key_for_task(task_type)
             scores = [r["test"][score_key] for r in fold_results]
 
@@ -335,7 +333,6 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     if args.num_runs > 1:
-        import statistics
         score_key = _score_key_for_task(task_type)
         run_scores = []
         for r in all_run_results:

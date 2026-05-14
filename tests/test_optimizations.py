@@ -1,6 +1,5 @@
 import torch
 import numpy as np
-import pytest
 from get.energy.ops import positional_embeddings_from_edge_index
 from get.data.synthetic import _extract_motifs_csr_jit
 import scipy.sparse as sp

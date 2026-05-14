@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -10,6 +11,14 @@ from get.energy import ComposedEnergy
 from get.energy.ops import get_degree_from_incidence, compute_degree_scaler
 from get.solvers import ArmijoSolver, FixedStepSolver
 from .energy_norm import EnergyLayerNorm
+
+
+def _make_block_energy(block: GETBlock):
+    """Pre-compiled per-block energy function for torch.compile caching."""
+    @torch.compile(dynamic=True, fullgraph=False)
+    def _energy(x, batch_data, cfg_params, scaler, num_graphs):
+        return block.energy_from_g(x, batch_data, cfg_params, scaler, num_graphs)
+    return _energy
 
 
 class GETBlock(nn.Module):
@@ -24,7 +33,6 @@ class GETBlock(nn.Module):
         use_bias_norm: bool = True,
         edge_attr_dim: int = 0,
         lambda_g: float = 0.0,
-        beta_g: float = 1.0,
         max_global_nodes: int = 512,
         branch_names: Optional[List[str]] = None,
     ) -> None:
@@ -36,7 +44,6 @@ class GETBlock(nn.Module):
         self.K = K
         self.num_motif_types = num_motif_types
         self.lambda_g = lambda_g
-        self.beta_g = beta_g
         self.max_global_nodes = max_global_nodes
 
         self.norm = EnergyLayerNorm(hidden_dim, use_bias=use_bias_norm)
@@ -51,6 +58,13 @@ class GETBlock(nn.Module):
 
         self.km = nn.Parameter(torch.randn(num_heads, K, head_dim) * 0.05)
         self.t_tau = nn.Parameter(torch.randn(num_motif_types, num_heads, R, head_dim) * 0.05)
+
+        beta_init = 1.0 / math.sqrt(head_dim)
+        self.hw = nn.Parameter(torch.randn(num_heads, num_heads) * 0.002)
+        self.beta_2 = nn.Parameter(torch.full((num_heads,), beta_init))
+        self.beta_3 = nn.Parameter(torch.full((num_heads,), beta_init))
+        self.beta_m = nn.Parameter(torch.full((num_heads,), beta_init))
+        self.beta_g = nn.Parameter(torch.full((num_heads,), beta_init))
 
         if edge_attr_dim > 0:
             self.edge_proj = nn.Linear(edge_attr_dim, num_heads)
@@ -96,8 +110,11 @@ class GETBlock(nn.Module):
             "d": self.hidden_dim, "R": self.R, "K": self.K,
             "lambda_2": cfg_params["lambda_2"], "lambda_3": cfg_params["lambda_3"],
             "lambda_m": cfg_params["lambda_m"], "lambda_g": self.lambda_g,
-            "beta_2": cfg_params["beta_2"], "beta_3": cfg_params["beta_3"],
-            "beta_m": cfg_params["beta_m"], "beta_g": self.beta_g,
+            "beta_2": self.beta_2,
+            "beta_3": self.beta_3,
+            "beta_m": self.beta_m,
+            "beta_g": self.beta_g,
+            "beta_max": cfg_params.get("beta_max", None),
             "global_chunk_size": cfg_params.get("global_chunk_size", 256),
             "use_pairwise": cfg_params["lambda_2"] > 0.0,
             "use_motif": cfg_params["lambda_3"] > 0.0,
@@ -109,7 +126,10 @@ class GETBlock(nn.Module):
 
         context = {"params": params, "projections": projections,
                    "num_graphs": num_graphs, "degree_scaler": scaler,
-                   "batch": batch_data["batch"]}
+                   "batch": batch_data["batch"], "hw": self.hw,
+                   "c_2": batch_data["c_2"], "u_2": batch_data["u_2"],
+                   "c_3": batch_data["c_3"], "u_3": batch_data["u_3"],
+                   "v_3": batch_data["v_3"], "t_tau": batch_data["t_tau"]}
 
         state = {"H": g}
         total, _branch_energies = self.composed(state, batch_data, context)
@@ -131,9 +151,6 @@ class EnergyGraphClassifier(nn.Module):
         lambda_2: float,
         lambda_3: float,
         lambda_m: float,
-        beta_2: float,
-        beta_3: float,
-        beta_m: float,
         update_damping: float,
         fixed_step_size: float = 0.1,
         armijo_eta0: float = 0.2,
@@ -150,7 +167,6 @@ class EnergyGraphClassifier(nn.Module):
         readout_mode: str = "graph",
         edge_attr_dim: int = 0,
         lambda_g: float = 0.0,
-        beta_g: float = 1.0,
         max_global_nodes: int = 512,
         global_chunk_size: int = 256,
         branch_names: Optional[List[str]] = None,
@@ -173,11 +189,7 @@ class EnergyGraphClassifier(nn.Module):
         self.lambda_2 = float(lambda_2)
         self.lambda_3 = float(lambda_3)
         self.lambda_m = float(lambda_m)
-        self.beta_2 = float(beta_2)
-        self.beta_3 = float(beta_3)
-        self.beta_m = float(beta_m)
         self.lambda_g = float(lambda_g)
-        self.beta_g = float(beta_g)
         self.global_chunk_size = int(global_chunk_size)
         self.update_damping = float(update_damping)
         self.inference_mode_train = inference_mode_train
@@ -205,7 +217,7 @@ class EnergyGraphClassifier(nn.Module):
                 hidden_dim=hidden_dim, num_heads=num_heads, head_dim=head_dim,
                 R=R, K=K, num_motif_types=num_motif_types,
                 use_bias_norm=use_energy_norm,
-                edge_attr_dim=edge_attr_dim, lambda_g=self.lambda_g, beta_g=self.beta_g,
+                edge_attr_dim=edge_attr_dim, lambda_g=self.lambda_g,
                 max_global_nodes=max_global_nodes,
                 branch_names=branch_names,
             )
@@ -214,6 +226,8 @@ class EnergyGraphClassifier(nn.Module):
 
         self.graph_readout = nn.Linear(hidden_dim * 3, num_classes)
         self.node_readout = nn.Linear(hidden_dim, num_classes)
+
+        self._compiled_energy_fns = [_make_block_energy(blk) for blk in self.blocks]
 
         self.fixed_solver = FixedStepSolver(
             num_steps=num_steps, step_size=fixed_step_size,
@@ -238,7 +252,6 @@ class EnergyGraphClassifier(nn.Module):
         return {
             "lambda_2": self.lambda_2, "lambda_3": self.lambda_3,
             "lambda_m": self.lambda_m,
-            "beta_2": self.beta_2, "beta_3": self.beta_3, "beta_m": self.beta_m,
             "global_chunk_size": self.global_chunk_size,
             "agg_mode": self.agg_mode,
         }
@@ -270,27 +283,27 @@ class EnergyGraphClassifier(nn.Module):
 
         x = x0
         collect_solver_stats = bool(return_solver_stats)
-        for block in self.blocks:
-            def _energy_fn(curr_x: torch.Tensor) -> torch.Tensor:
-                return block.energy_from_g(curr_x, batch_data, params_cache, scaler, num_graphs)
+        for idx, block in enumerate(self.blocks):
+            compiled_energy = self._compiled_energy_fns[idx]
 
-            energy_fn = torch.compile(_energy_fn, dynamic=True, fullgraph=False)
+            def _energy_fn(curr_x: torch.Tensor) -> torch.Tensor:
+                return compiled_energy(curr_x, batch_data, params_cache, scaler, num_graphs)
 
             def energy_and_grad_fn(curr_x: torch.Tensor, create_graph: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
-                e, vjp_fn = torch.func.vjp(energy_fn, curr_x)
+                e, vjp_fn = torch.func.vjp(_energy_fn, curr_x)
                 grad, = vjp_fn(torch.ones_like(e))
                 return (e.detach() if not create_graph else e), grad
 
             if mode == "fixed":
                 x, energy_trace, solver_stats = self.fixed_solver.run(
-                    x, energy_fn, energy_and_grad_fn,
+                    x, _energy_fn, energy_and_grad_fn,
                     create_graph=self.training,
                     collect_stats=collect_solver_stats,
                 )
             elif mode == "armijo":
                 max_backtracks = self.armijo_solver.max_backtracks if self.training else min(self.armijo_solver.max_backtracks, self.armijo_eval_max_backtracks)
                 x, energy_trace, solver_stats = self.armijo_solver.run(
-                    x, energy_fn, energy_and_grad_fn,
+                    x, _energy_fn, energy_and_grad_fn,
                     max_backtracks=max_backtracks,
                     collect_stats=collect_solver_stats,
                 )

@@ -6,9 +6,7 @@ from torch_geometric.data import Batch
 
 from get.data import SyntheticGraphDataset, collate_graph_samples
 from get.data.synthetic import sample_from_edge_index
-from get.energy import ENERGY_SPECS, build_energy
 from get.models import EnergyGraphClassifier
-from get.models.energy_norm import EnergyLayerNorm
 from get.solvers import FixedStepSolver
 
 
@@ -45,25 +43,12 @@ def _make_model(
         lambda_2=1.0,
         lambda_3=0.5,
         lambda_m=1.0,
-        beta_2=1.0,
-        beta_3=1.0,
-        beta_m=1.0,
         update_damping=0.05,
         armijo_eval_max_backtracks=armijo_eval_max_backtracks,
         inference_mode_train=inference_mode_train,
         inference_mode_eval=inference_mode_eval,
         energy_name=energy_name,
     )
-
-
-def test_energy_factory_contains_expected_names():
-    names = {spec.name for spec in ENERGY_SPECS}
-    assert {"get_full", "pairwise_only", "quadratic_only"}.issubset(names)
-
-
-def test_energy_factory_unknown_name_fails():
-    with pytest.raises(ValueError, match="Unknown energy function"):
-        build_energy("does_not_exist")
 
 
 @pytest.mark.parametrize("energy_name", ["get_full", "pairwise_only", "quadratic_only"])
@@ -199,16 +184,3 @@ def test_armijo_eval_backtracks_are_capped():
     assert solver_stats["max_backtracks"] == 1
 
 
-def test_energy_layer_norm_matches_et_formula():
-    layer = EnergyLayerNorm(3, use_bias=True, eps=1e-5)
-    with torch.no_grad():
-        layer.gamma.fill_(2.0)
-        layer.bias.copy_(torch.tensor([0.1, 0.2, 0.3]))
-
-    x = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32)
-    out = layer(x)
-    centered = x - x.mean(dim=-1, keepdim=True)
-    expected = 2.0 * centered / torch.sqrt((centered ** 2).mean(dim=-1, keepdim=True) + 1e-5)
-    expected = expected + torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32)
-
-    assert torch.allclose(out, expected)

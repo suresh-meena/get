@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import copy
 import os
-from typing import Any, Dict, Iterable, List
+from typing import Dict, Iterable
 import numpy as np
 
 # Avoid matplotlib/fontconfig cache warnings in restricted environments.
