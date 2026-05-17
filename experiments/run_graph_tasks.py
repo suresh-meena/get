@@ -20,10 +20,11 @@ if str(ROOT) not in sys.path:
 
 from get.data import SyntheticGraphDataset, ListGraphDataset  # noqa: E402
 from get.models import build_model  # noqa: E402
+from get.models.factory import canonicalize_model_name  # noqa: E402
 from get.utils.seed import seed_everything  # noqa: E402
 from get.utils.compile import maybe_compile_model  # noqa: E402
 from get.data import infer_edge_attr_dim, split_items, summarize_splits  # noqa: E402
-from experiments.common import fit_unified_trainer, make_loader_kwargs, resolve_device, build_data_loaders  # noqa: E402
+from experiments.common import collect_energy_diagnostics, fit_unified_trainer, make_loader_kwargs, resolve_device, build_data_loaders  # noqa: E402
 
 
 def _apply_task_preset(args: argparse.Namespace) -> argparse.Namespace:
@@ -110,14 +111,17 @@ def _apply_benchmark_preset(args: argparse.Namespace) -> argparse.Namespace:
 
 def _runtime_config(args: argparse.Namespace) -> dict:
     model_name = str(args.model_name).lower()
+    canonical_model_name = canonicalize_model_name(model_name)
     return {
         "task_preset": args.task_preset,
         "benchmark_preset": args.benchmark_preset,
         "dataset_name": args.dataset_name,
         "model_name": args.model_name,
+        "canonical_model_name": canonical_model_name,
+        "model_alias": model_name,
         "use_amp": bool(args.use_amp),
         "amp_dtype": args.amp_dtype,
-        "lambda_m": float(args.lambda_m) if model_name == "fullget" else 0.0,
+        "lambda_m": float(args.lambda_m),
         "raw_lambda_m": float(args.lambda_m),
         "lambda_2": float(args.lambda_2),
         "lambda_3": float(args.lambda_3),
@@ -289,6 +293,7 @@ def _run_single_fit(
     cfg_dict["edge_attr_dim"] = getattr(args, "edge_attr_dim", 0)
     from omegaconf import DictConfig
     model = build_model(DictConfig(cfg_dict)).to(device)
+    energy_metadata = model.energy_metadata() if hasattr(model, "energy_metadata") else {}
     compile_cfg = {
         "enabled": bool(getattr(args, "compile", True)),
         "scope": str(getattr(args, "compile_scope", "all")),
@@ -325,8 +330,15 @@ def _run_single_fit(
         val_loader=val_loader,
         test_loader=test_loader,
     )
+    energy_diagnostics = collect_energy_diagnostics(
+        model if eval_model is None else eval_model,
+        {"val": val_loader, "test": test_loader},
+        device=device,
+    )
     fit_result["parameter_count"] = parameter_count
     fit_result["peak_cuda_memory_mb"] = peak_memory_mb
+    fit_result["energy_metadata"] = energy_metadata
+    fit_result["energy_diagnostics"] = energy_diagnostics
     return fit_result
 
 
@@ -347,7 +359,7 @@ def main() -> None:
     p.add_argument("--brec_file", type=str, default="")
     p.add_argument("--max_graphs", type=int, default=0)
     p.add_argument("--cv_folds", type=int, default=1)
-    p.add_argument("--model_name", type=str, default="fullget", choices=["fullget", "pairwiseget", "quadratic_only", "get_ham_global", "et", "etfaithful", "bwgnn", "graphtransformer", "gcn", "gat", "gin", "external_baseline"])
+    p.add_argument("--model_name", type=str, default="fullget", choices=["quadratic_only", "pairwise_only", "pairwiseget", "memory_only", "motif_only", "nomotif_local", "no_memory_local", "fullget_local", "fullget", "nomotif_global", "no_memory_global", "fullget_global", "get_ham_global", "get_ham_full", "et", "etfaithful", "bwgnn", "graphtransformer", "gcn", "gat", "gin", "external_baseline"])
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--seed", type=int, default=123)
 

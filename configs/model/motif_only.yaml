@@ -1,16 +1,16 @@
-name: "FullGET"
-model_name: "fullget_local"
-energy_name: "fullget_local"
-in_dim: 1  # To be overridden by dataset
+name: "MotifOnly"
+model_name: "motif_only"
+energy_name: "motif_only"
+in_dim: 1
 hidden_dim: 192
 num_classes: 1
 num_blocks: 4
 num_steps: 1
 num_heads: 6
 head_dim: 32
-lambda_2: 1.0
+lambda_2: 0.0
 lambda_3: 0.5
-lambda_m: 1.0
+lambda_m: 0.0
 beta_2: 1.0
 beta_3: 1.0
 beta_m: 1.0
@@ -19,7 +19,7 @@ R: 3
 K: 48
 dropout: 0.0
 update_damping: 0.05
-fixed_step_size: 0.08
+fixed_step_size: 0.1
 armijo_eta0: 0.2
 armijo_gamma: 0.5
 armijo_c: 1e-4

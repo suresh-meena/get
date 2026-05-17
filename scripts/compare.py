@@ -19,7 +19,7 @@ def _run(task, model, seed, epochs, device):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--task", default="stage1_wedge_triangle")
-    p.add_argument("--models", default="fullget,pairwiseget")
+    p.add_argument("--models", default="fullget_local,pairwise_only")
     p.add_argument("--seeds", type=int, default=3)
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--device", default="auto")

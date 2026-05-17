@@ -57,7 +57,7 @@ def get_degree_from_incidence(c_2: torch.Tensor, num_nodes: int):
 
 def compute_degree_scaler(degrees: torch.Tensor, avg_degree: float | torch.Tensor, mode="pna"):
     if mode == "pna":
-        avg = avg_degree if isinstance(avg_degree, torch.Tensor) else torch.tensor(avg_degree, device=degrees.device, dtype=degrees.dtype)
+        avg = avg_degree if isinstance(avg_degree, torch.Tensor) else degrees.new_tensor(avg_degree)
         return torch.log(degrees + 1.0) / torch.log(avg.clamp_min(1e-6) + 1.0)
     return torch.ones_like(degrees)
 

@@ -1,7 +1,7 @@
 defaults:
   - _self_
   - experiment: synthetic_graph
-  - model: fullget
+  - model: fullget_local
   - dataset: synthetic_graph
   - trainer: default
 

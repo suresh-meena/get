@@ -1,6 +1,6 @@
 # GET-HAM with global attention (no CLS)
 # FullGET + dense all-pairs global attention
-model_name: "get_ham_global"
+model_name: "fullget_global"
 hidden_dim: 192
 num_heads: 6
 head_dim: 32
@@ -12,12 +12,13 @@ num_motif_types: 2
 lambda_2: 1.0
 lambda_3: 10.0
 lambda_m: 1.0
-lambda_g: 1.0
+lambda_g: 0.1
 beta_2: 1.0
 beta_3: 1.0
 beta_m: 1.0
 beta_g: 1.0
 update_damping: 0.0
+fixed_step_size: 0.01
 use_energy_norm: true
 agg_mode: "softmax"
 readout_mode: "graph"

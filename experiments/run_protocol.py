@@ -31,7 +31,8 @@ from get.data import (
     split_items,
 )
 from get.models import build_model
-from experiments.common import fit_unified_trainer, resolve_device, build_data_loaders
+from get.models.factory import canonicalize_model_name
+from experiments.common import collect_energy_diagnostics, fit_unified_trainer, resolve_device, build_data_loaders
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -42,8 +43,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="fullget",
         choices=[
-            "fullget", "pairwiseget", "quadratic_only",
-            "get_ham_global",
+            "quadratic_only",
+            "pairwise_only", "pairwiseget",
+            "memory_only",
+            "motif_only",
+            "nomotif_local", "no_memory_local", "fullget_local", "fullget",
+            "nomotif_global", "no_memory_global", "fullget_global", "get_ham_global", "get_ham_full",
             "et", "etfaithful", "gt", "bwgnn", "external_baseline",
             "gin", "gcn", "gat",
         ],
@@ -111,6 +116,28 @@ def _count_params(model: torch.nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
+def _get_energy_metadata(model: torch.nn.Module, fallback_model_name: str) -> Dict[str, object]:
+    if hasattr(model, "energy_metadata"):
+        metadata = model.energy_metadata()
+        if isinstance(metadata, dict):
+            return metadata
+    canonical_model_name = canonicalize_model_name(fallback_model_name)
+    fixed_solver = getattr(model, "fixed_solver", None)
+    num_steps = int(getattr(fixed_solver, "num_steps", 0)) if fixed_solver is not None else 0
+    return {
+        "canonical_model_name": canonical_model_name,
+        "model_alias": fallback_model_name,
+        "branch_names": [],
+        "enabled_branches": {},
+        "energy_lambdas": {},
+        "readout_mode": "graph",
+        "num_blocks": 0,
+        "num_inference_steps": num_steps,
+        "inference_mode_train": getattr(model, "inference_mode_train", "fixed"),
+        "inference_mode_eval": getattr(model, "inference_mode_eval", "armijo"),
+    }
+
+
 def _evaluate_brec_by_category(
     trainer,
     args: argparse.Namespace,
@@ -153,6 +180,7 @@ def run_experiment(args: argparse.Namespace, tr_items, va_items, te_items, task_
     cfg = DictConfig(cfg_dict)
 
     model = build_model(cfg).to(device)
+    energy_metadata = _get_energy_metadata(model, str(getattr(args, "model_name", "fullget")))
     parameter_count = _count_params(model)
     compile_cfg = {
         "enabled": bool(getattr(args, "compile", True)),
@@ -201,13 +229,14 @@ def run_experiment(args: argparse.Namespace, tr_items, va_items, te_items, task_
         test_loader=test_loader,
     )
 
-    model_name = str(getattr(args, "model_name", "fullget")).lower()
-    enabled_branches = {
-        "pairwise": True,
-        "motif": model_name in ("fullget", "get_ham_global"),
-        "memory": model_name in ("fullget", "get_ham_global"),
-        "global_attention": model_name in ("get_ham_global"),
-    }
+    energy_diagnostics = collect_energy_diagnostics(
+        trainer.eval_model,
+        {"val": val_loader, "test": test_loader},
+        device=device,
+    )
+
+    canonical_model_name = str(energy_metadata.get("canonical_model_name", canonicalize_model_name(str(getattr(args, "model_name", "fullget")))))
+    model_alias = str(energy_metadata.get("model_alias", str(getattr(args, "model_name", "fullget")).lower()))
 
     result = {
         "train": fit_result.get("final_train", {}),
@@ -219,10 +248,16 @@ def run_experiment(args: argparse.Namespace, tr_items, va_items, te_items, task_
         "parameter_count": parameter_count,
         "runtime_seconds": elapsed,
         "peak_cuda_memory_mb": peak_memory_mb,
-        "enabled_branches": enabled_branches,
-        "readout_mode": "graph",
+        "canonical_model_name": canonical_model_name,
+        "model_alias": model_alias,
+        "branch_names": energy_metadata.get("branch_names", []),
+        "enabled_branches": energy_metadata.get("enabled_branches", {}),
+        "energy_lambdas": energy_metadata.get("energy_lambdas", {}),
+        "readout_mode": energy_metadata.get("readout_mode", "graph"),
         "solver_state_keys": ["H"],
-        "num_inference_steps": int(getattr(args, "num_steps", 8)),
+        "num_inference_steps": int(energy_metadata.get("num_inference_steps", getattr(args, "num_steps", 8))),
+        "energy_metadata": energy_metadata,
+        "energy_diagnostics": energy_diagnostics,
     }
     if str(getattr(args, "task", "")) == "stage2_brec":
         by_cat = _evaluate_brec_by_category(trainer, args, te_items)
@@ -280,6 +315,13 @@ def main():
                 "runtime_config": {"device": str(device), **vars(args)},
                 "parameter_count": fold_results[0]["parameter_count"],
                 "fold_results": fold_results,
+                "canonical_model_name": fold_results[0].get("canonical_model_name"),
+                "model_alias": fold_results[0].get("model_alias"),
+                "branch_names": fold_results[0].get("branch_names", []),
+                "enabled_branches": fold_results[0].get("enabled_branches", {}),
+                "energy_lambdas": fold_results[0].get("energy_lambdas", {}),
+                "readout_mode": fold_results[0].get("readout_mode", "graph"),
+                "energy_metadata": fold_results[0].get("energy_metadata", {}),
                 "summary": {
                     f"test_{score_key}_mean": statistics.mean(scores),
                     f"test_{score_key}_std": statistics.stdev(scores) if len(scores) > 1 else 0.0,
@@ -313,8 +355,15 @@ def main():
                 "test": metrics["test"],
                 "test_by_category": metrics.get("test_by_category", {}),
                 "history": metrics["history"],
-                "energy_trace": metrics.get("energy_trace", []),
                 "num_inference_steps": metrics.get("num_inference_steps", 0),
+                "canonical_model_name": metrics.get("canonical_model_name"),
+                "model_alias": metrics.get("model_alias"),
+                "branch_names": metrics.get("branch_names", []),
+                "enabled_branches": metrics.get("enabled_branches", {}),
+                "energy_lambdas": metrics.get("energy_lambdas", {}),
+                "readout_mode": metrics.get("readout_mode", "graph"),
+                "energy_metadata": metrics.get("energy_metadata", {}),
+                "energy_diagnostics": metrics.get("energy_diagnostics", {}),
                 "runtime_seconds": metrics["runtime_seconds"],
                 "peak_cuda_memory_mb": metrics["peak_cuda_memory_mb"],
             }

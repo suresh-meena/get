@@ -1,19 +1,20 @@
-name: "FullGET"
-model_name: "fullget_local"
-energy_name: "fullget_local"
+name: "QuadraticOnly"
+model_name: "quadratic_only"
+energy_name: "quadratic_only"
 in_dim: 1  # To be overridden by dataset
 hidden_dim: 192
 num_classes: 1
-num_blocks: 4
 num_steps: 1
 num_heads: 6
 head_dim: 32
-lambda_2: 1.0
-lambda_3: 0.5
-lambda_m: 1.0
+lambda_2: 0.0
+lambda_3: 0.0
+lambda_m: 0.0
+lambda_g: 0.0
 beta_2: 1.0
 beta_3: 1.0
 beta_m: 1.0
+beta_g: 1.0
 num_motif_types: 2
 R: 3
 K: 48

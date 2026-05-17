@@ -32,7 +32,7 @@ def _task_type(task):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--tasks", default="", help="comma-sep tasks (default: Stage 1)")
-    p.add_argument("--models", default="fullget,pairwiseget")
+    p.add_argument("--models", default="fullget_local,pairwise_only")
     p.add_argument("--seeds", type=int, default=3)
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--device", default="auto")

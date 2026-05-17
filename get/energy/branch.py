@@ -84,8 +84,11 @@ class PairwiseBranch(EnergyBranch):
             return lambda_2 * graph_agg
         else:
             lse_2 = segment_logsumexp(beta_2 * ell_2, c_2, num_nodes, dim=0)
+            empty_mask = context.get("empty_2")
+            if empty_mask is None:
+                empty_mask = (torch.bincount(c_2, minlength=num_nodes) == 0)
             lse_2 = torch.where(
-                torch.bincount(c_2, minlength=num_nodes).eq(0).view(-1, *([1] * (lse_2.dim() - 1))),
+                empty_mask.view(-1, *([1] * (lse_2.dim() - 1))),
                 torch.zeros_like(lse_2),
                 lse_2,
             )
@@ -147,8 +150,11 @@ class MotifBranch(EnergyBranch):
             return lambda_3 * graph_agg
         else:
             lse_3 = segment_logsumexp(beta_3 * ell_3, c_3, num_nodes, dim=0)
+            empty_mask = context.get("empty_3")
+            if empty_mask is None:
+                empty_mask = (torch.bincount(c_3, minlength=num_nodes) == 0)
             lse_3 = torch.where(
-                torch.bincount(c_3, minlength=num_nodes).eq(0).view(-1, *([1] * (lse_3.dim() - 1))),
+                empty_mask.view(-1, *([1] * (lse_3.dim() - 1))),
                 torch.zeros_like(lse_3),
                 lse_3,
             )
@@ -231,26 +237,29 @@ class GlobalAttentionBranch(EnergyBranch):
 
         from torch_geometric.utils import to_dense_batch
 
+        def _masked_logsumexp(scores: torch.Tensor, valid_mask: torch.Tensor, dim: int) -> torch.Tensor:
+            neg_fill = torch.finfo(scores.dtype).min
+            masked_scores = torch.where(valid_mask, scores, torch.full_like(scores, neg_fill))
+            return torch.logsumexp(masked_scores, dim=dim)
+
         max_n = int(counts.max())
         if Qg.dim() == 2:
             Q_dense, mask = to_dense_batch(Qg, batch_idx, max_num_nodes=max_n)
             K_dense, _ = to_dense_batch(Kg, batch_idx, max_num_nodes=max_n)
             attn = torch.bmm(Q_dense, K_dense.transpose(1, 2)) / scale
-            attn = attn.masked_fill(~mask[:, :, None] | ~mask[:, None, :], float("-inf"))
             bg = beta_g.mean() if (torch.is_tensor(beta_g) and beta_g.dim() == 1) else beta_g
-            lse = torch.logsumexp(bg * attn, dim=-1)
-            mask_2d = ~mask if lse.dim() == mask.dim() else ~mask.unsqueeze(-1)
-            lse = lse.masked_fill(mask_2d, 0.0)
+            valid = mask[:, :, None] & mask[:, None, :]
+            lse = _masked_logsumexp(bg * attn, valid, dim=-1)
+            lse = torch.where(mask, lse, torch.zeros_like(lse))
             per_graph = lse.sum(dim=-1)
             return (lambda_g / bg) * per_graph
         elif Qg.dim() == 3:
             Q_dense, mask = to_dense_batch(Qg, batch_idx, max_num_nodes=max_n)
             K_dense, _ = to_dense_batch(Kg, batch_idx, max_num_nodes=max_n)
             attn = torch.einsum("bnhd,bmhd->bnmh", Q_dense, K_dense) / scale
-            attn = attn.masked_fill(~mask[:, None, :, None] | ~mask[:, :, None, None], float("-inf"))
-            lse = torch.logsumexp(beta_g * attn, dim=2)
-            mask_2d = ~mask if lse.dim() == mask.dim() else ~mask.unsqueeze(-1)
-            lse = lse.masked_fill(mask_2d, 0.0)
+            valid = mask[:, :, None, None] & mask[:, None, :, None]
+            lse = _masked_logsumexp(beta_g * attn, valid, dim=2)
+            lse = torch.where(mask.unsqueeze(-1), lse, torch.zeros_like(lse))
             per_graph = lse.sum(dim=1)
         else:
             raise ValueError(f"Expected Qg/Kg to be 2D or 3D, got Qg.dim()={Qg.dim()}")
@@ -271,15 +280,6 @@ def get_branch(name: str) -> EnergyBranch:
     if branch is None:
         raise KeyError(f"Unknown energy branch '{name}'. Available: {list(ENERGY_BRANCHES.keys())}")
     return branch
-
-
-def enabled_branches_from_config(model_cfg: Any) -> Dict[str, bool]:
-    return {
-        "pairwise": bool(getattr(model_cfg, "pairwise", True)),
-        "motif": bool(getattr(model_cfg, "motif", True)),
-        "memory": bool(getattr(model_cfg, "memory", True)),
-        "global_attention": bool(getattr(model_cfg, "global_attention", False)),
-    }
 
 
 class _QuadraticBranchCached(QuadraticBranch):

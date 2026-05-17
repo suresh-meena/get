@@ -28,9 +28,10 @@ from get.data import (
     get_k_fold_splits,
 )
 from get.models import build_model
+from get.models.factory import canonicalize_model_name
 from get.trainers import UnifiedTrainer
 from get.utils import seed_everything, move_batch_to_device, maybe_compile_model
-from experiments.common import resolve_device, score_key_for_task
+from experiments.common import collect_energy_diagnostics, resolve_device, score_key_for_task
 
 
 def _build_loaders_from_items(
@@ -114,6 +115,18 @@ def _run_single_experiment(
     run_cfg["edge_attr_dim"] = int(edge_attr_dim)
 
     model = build_model(DictConfig(run_cfg)).to(device)
+    energy_metadata = model.energy_metadata() if hasattr(model, "energy_metadata") else {
+        "canonical_model_name": canonicalize_model_name(str(run_cfg.get("model_name", "fullget"))),
+        "model_alias": str(run_cfg.get("model_name", "fullget")).lower(),
+        "branch_names": [],
+        "enabled_branches": {},
+        "energy_lambdas": {},
+        "readout_mode": "graph",
+        "num_blocks": 0,
+        "num_inference_steps": int(run_cfg.get("num_steps", 8)),
+        "inference_mode_train": str(run_cfg.get("inference_mode_train", "fixed")),
+        "inference_mode_eval": str(run_cfg.get("inference_mode_eval", "armijo")),
+    }
     compile_cfg = OmegaConf.to_container(cfg.get("experiment", {}).get("compile", {}), resolve=True) if cfg else None
     scope = str(compile_cfg.get("scope", "all")) if compile_cfg else "all"
     if scope == "all":
@@ -136,19 +149,20 @@ def _run_single_experiment(
     fit_result = trainer.fit(train_loader, val_loader, test_loader)
     elapsed = time.time() - start_time
 
+    energy_diagnostics = collect_energy_diagnostics(
+        trainer.eval_model,
+        {"val": val_loader, "test": test_loader},
+        device=device,
+    )
+
     history = fit_result.pop("history", {"train": [], "val": []})
 
     peak_memory = 0.0
     if torch.cuda.is_available():
         peak_memory = torch.cuda.max_memory_allocated() / (1024 * 1024)
 
-    model_name = str(run_cfg.get("model_name", "fullget")).lower()
-    enabled_branches = {
-        "pairwise": True,
-        "motif": model_name in ("fullget", "get_ham_global"),
-        "memory": model_name in ("fullget", "get_ham_global"),
-        "global_attention": model_name in ("get_ham_global"),
-    }
+    canonical_model_name = str(energy_metadata.get("canonical_model_name", canonicalize_model_name(str(run_cfg.get("model_name", "fullget")))))
+    model_alias = str(energy_metadata.get("model_alias", str(run_cfg.get("model_name", "fullget")).lower()))
 
     return {
         "train": fit_result.get("final_train", {}),
@@ -160,9 +174,16 @@ def _run_single_experiment(
         "parameter_count": parameter_count,
         "runtime_seconds": elapsed,
         "peak_cuda_memory_mb": peak_memory,
-        "enabled_branches": enabled_branches,
+        "canonical_model_name": canonical_model_name,
+        "model_alias": model_alias,
+        "branch_names": energy_metadata.get("branch_names", []),
+        "enabled_branches": energy_metadata.get("enabled_branches", {}),
+        "energy_lambdas": energy_metadata.get("energy_lambdas", {}),
+        "readout_mode": energy_metadata.get("readout_mode", "graph"),
+        "energy_metadata": energy_metadata,
+        "energy_diagnostics": energy_diagnostics,
         "solver_state_keys": ["H"],
-        "num_inference_steps": int(run_cfg.get("num_steps", 8)),
+        "num_inference_steps": int(energy_metadata.get("num_inference_steps", run_cfg.get("num_steps", 8))),
     }
 
 

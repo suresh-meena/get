@@ -1,4 +1,4 @@
-name: "FullGET"
+name: "FullGET-Local"
 model_name: "fullget_local"
 energy_name: "fullget_local"
 in_dim: 1  # To be overridden by dataset

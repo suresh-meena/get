@@ -3,8 +3,8 @@
 Unified entry point for GET experiments.
 
 Quick start:
-    python run.py --task stage1_wedge_triangle --model fullget --epochs 50
-    python run.py --task stage1_wedge_triangle --compare fullget,pairwiseget --seeds 3
+    python run.py --task stage1_wedge_triangle --model fullget_local --epochs 50
+    python run.py --task stage1_wedge_triangle --compare fullget_local,pairwise_only --seeds 3
     python run.py --list-tasks
     python run.py --list-models
 """
@@ -17,8 +17,9 @@ from get.data.protocol import TASK_SPECS
 ALL_TASKS = sorted(TASK_SPECS.keys())
 
 ALL_MODELS = [
-    "fullget", "pairwiseget", "quadratic_only",
-    "get_ham_global",
+    "quadratic_only", "pairwise_only", "pairwiseget", "memory_only",
+    "nomotif_local", "fullget_local", "fullget",
+    "nomotif_global", "fullget_global", "get_ham_global", "get_ham_full",
     "et", "etfaithful", "gt", "bwgnn", "gin", "gcn", "gat",
 ]
 
@@ -26,8 +27,8 @@ ALL_MODELS = [
 def main():
     parser = argparse.ArgumentParser(description="GET Experiment Runner")
     parser.add_argument("--task", help="Task name (e.g. stage1_wedge_triangle)")
-    parser.add_argument("--model", default="fullget", help="Model name (e.g. fullget, pairwiseget)")
-    parser.add_argument("--compare", help="Compare models: comma-separated (e.g. fullget,pairwiseget)")
+    parser.add_argument("--model", default="fullget_local", help="Model name (e.g. fullget_local, pairwise_only)")
+    parser.add_argument("--compare", help="Compare models: comma-separated (e.g. fullget_local,pairwise_only)")
     parser.add_argument("--seeds", type=int, default=1, help="Number of random seeds")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--device", default="auto")

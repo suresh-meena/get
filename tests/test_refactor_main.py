@@ -15,7 +15,7 @@ def test_refactor_main_tiny_smoke(tmp_path: Path):
             "task": "binary_graph_classification",
             "experiment": OmegaConf.load(root / "configs" / "experiment" / "synthetic_graph.yaml"),
             "dataset": OmegaConf.load(root / "configs" / "dataset" / "synthetic_graph.yaml"),
-            "model": OmegaConf.load(root / "configs" / "model" / "fullget.yaml"),
+            "model": OmegaConf.load(root / "configs" / "model" / "fullget_local.yaml"),
             "trainer": OmegaConf.load(root / "configs" / "trainer" / "default.yaml"),
         }
     )
@@ -58,7 +58,7 @@ def test_refactor_main_quadratic_only_energy_smoke(tmp_path: Path):
             "task": "binary_graph_classification",
             "experiment": OmegaConf.load(root / "configs" / "experiment" / "synthetic_graph.yaml"),
             "dataset": OmegaConf.load(root / "configs" / "dataset" / "synthetic_graph.yaml"),
-            "model": OmegaConf.load(root / "configs" / "model" / "fullget.yaml"),
+            "model": OmegaConf.load(root / "configs" / "model" / "fullget_local.yaml"),
             "trainer": OmegaConf.load(root / "configs" / "trainer" / "default.yaml"),
         }
     )
@@ -84,7 +84,7 @@ def test_refactor_main_compile_eval_only_smoke(tmp_path: Path):
             "task": "binary_graph_classification",
             "experiment": OmegaConf.load(root / "configs" / "experiment" / "synthetic_graph.yaml"),
             "dataset": OmegaConf.load(root / "configs" / "dataset" / "synthetic_graph.yaml"),
-            "model": OmegaConf.load(root / "configs" / "model" / "fullget.yaml"),
+            "model": OmegaConf.load(root / "configs" / "model" / "fullget_local.yaml"),
             "trainer": OmegaConf.load(root / "configs" / "trainer" / "default.yaml"),
         }
     )
@@ -114,7 +114,7 @@ def test_refactor_main_compile_all_smoke(tmp_path: Path):
             "task": "binary_graph_classification",
             "experiment": OmegaConf.load(root / "configs" / "experiment" / "synthetic_graph.yaml"),
             "dataset": OmegaConf.load(root / "configs" / "dataset" / "synthetic_graph.yaml"),
-            "model": OmegaConf.load(root / "configs" / "model" / "fullget.yaml"),
+            "model": OmegaConf.load(root / "configs" / "model" / "fullget_local.yaml"),
             "trainer": OmegaConf.load(root / "configs" / "trainer" / "default.yaml"),
         }
     )

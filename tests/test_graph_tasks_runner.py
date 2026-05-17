@@ -5,9 +5,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+CODE_ROOT = Path(__file__).resolve().parents[1]
+
 
 def _run_cmd(args: list[str]) -> str:
-    proc = subprocess.run(args, capture_output=True, text=True, check=True)
+    proc = subprocess.run(args, capture_output=True, text=True, check=True, cwd=str(CODE_ROOT))
     return proc.stdout
 
 

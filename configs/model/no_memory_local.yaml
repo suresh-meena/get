@@ -1,7 +1,7 @@
-name: "FullGET"
-model_name: "fullget_local"
-energy_name: "fullget_local"
-in_dim: 1  # To be overridden by dataset
+name: "NoMemory-Local"
+model_name: "no_memory_local"
+energy_name: "no_memory_local"
+in_dim: 1
 hidden_dim: 192
 num_classes: 1
 num_blocks: 4
@@ -10,7 +10,7 @@ num_heads: 6
 head_dim: 32
 lambda_2: 1.0
 lambda_3: 0.5
-lambda_m: 1.0
+lambda_m: 0.0
 beta_2: 1.0
 beta_3: 1.0
 beta_m: 1.0

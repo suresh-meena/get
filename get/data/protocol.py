@@ -14,6 +14,11 @@ import torch
 from sklearn.model_selection import StratifiedShuffleSplit, StratifiedKFold, KFold
 from torch.utils.data import Dataset
 from get.data.synthetic import sample_from_adj, sample_from_edge_index
+from get.data.leakage_control import (
+    create_matched_pairs,
+    similarity_aggregate,
+    similarity_euclidean_degree,
+)
 
 
 @dataclass
@@ -29,12 +34,28 @@ class CachedSampleRef:
 
 
 TASK_SPECS: Dict[str, TaskSpec] = {
+    # Original Stage 1 tasks
     "stage1_wedge_triangle": TaskSpec(task_type="binary", stage="1"),
     "stage1_triangle_regression": TaskSpec(task_type="regression", stage="1"),
     "stage1_cycle_parity": TaskSpec(task_type="binary", stage="1"),
     "stage1_max3sat": TaskSpec(task_type="binary", stage="1"),
     "stage1_xorsat": TaskSpec(task_type="binary", stage="1"),
     "stage1_srg_discrimination": TaskSpec(task_type="binary", stage="1"),
+    # Leakage-controlled Stage 1 tasks
+    "stage1_wedge_triangle_matched": TaskSpec(task_type="binary", stage="1"),
+    "stage1_cycle_parity_matched": TaskSpec(task_type="binary", stage="1"),
+    "stage1_max3sat_matched": TaskSpec(task_type="binary", stage="1"),
+    # Degree-only matching baselines
+    "stage1_wedge_triangle_degree_only": TaskSpec(task_type="binary", stage="1"),
+    "stage1_cycle_parity_degree_only": TaskSpec(task_type="binary", stage="1"),
+    "stage1_max3sat_degree_only": TaskSpec(task_type="binary", stage="1"),
+    # Edge-count-only matching baselines
+    "stage1_wedge_triangle_edge_only": TaskSpec(task_type="binary", stage="1"),
+    "stage1_cycle_parity_edge_only": TaskSpec(task_type="binary", stage="1"),
+    "stage1_max3sat_edge_only": TaskSpec(task_type="binary", stage="1"),
+    # Two-hop-only matching baselines
+    "stage1_wedge_triangle_twohop_only": TaskSpec(task_type="binary", stage="1"),
+    # Stage 2-4 tasks
     "stage2_csl": TaskSpec(task_type="multiclass", stage="2"),
     "stage2_brec": TaskSpec(task_type="binary", stage="2"),
     "stage3_zinc": TaskSpec(task_type="regression", stage="3"),
@@ -127,16 +148,6 @@ def _sample_label0(sample: Any) -> float | None:
         return float(y[0].item())
     return None
 
-
-def _infer_output_dim(splits: Dict[str, List[Any]]) -> int:
-    for items in splits.values():
-        if items:
-            first = items[0]
-            if isinstance(first, dict):
-                return int(first["y"].numel())
-            # For cached refs, output dim metadata is not available cheaply.
-            return 1
-    return 1
 
 
 def _iter_sample_items(items: Any):
@@ -1018,15 +1029,186 @@ def _load_stage4_anomaly(args, name: str) -> Tuple[Dict[str, List[Dict[str, torc
     return splits, 2
 
 
+def _apply_leakage_control(
+    graphs,  # List of graph samples (dict or GraphSampleData objects)
+    similarity_fn,
+):
+    """Apply matched pairing to graphs based on similarity function.
+    
+    Creates balanced pairs of positive and negative graphs with similar statistics,
+    keeping only the best-matched pairs.
+    """
+    graphs_with_idx_label = []
+    for i, g in enumerate(graphs):
+        # Handle both dict and object attribute access
+        if isinstance(g, dict):
+            label = float(g["y"][0].item())
+            num_nodes = g["x"].size(0)
+            # Convert sample dict to adjacency for statistics
+            if "edge_index" in g:
+                ei = g["edge_index"].long()
+                adj = torch.zeros((num_nodes, num_nodes), dtype=torch.bool)
+                if ei.size(1) > 0:
+                    adj[ei[0], ei[1]] = True
+            else:
+                adj = torch.zeros((num_nodes, num_nodes), dtype=torch.bool)
+        else:
+            # GraphSampleData or similar object
+            label = float(g.y[0].item())
+            num_nodes = g.x.size(0)
+            # Check for edge_index or c_2 (motif membership)
+            if hasattr(g, "edge_index"):
+                ei = g.edge_index.long()
+                adj = torch.zeros((num_nodes, num_nodes), dtype=torch.bool)
+                if ei.numel() > 0 and ei.size(1) > 0:
+                    adj[ei[0], ei[1]] = True
+            else:
+                # For motif-based representation, reconstruct from c_2, u_2, etc.
+                adj = torch.zeros((num_nodes, num_nodes), dtype=torch.bool)
+                if hasattr(g, "c_2") and hasattr(g, "u_2"):
+                    c_2, u_2 = g.c_2.long(), g.u_2.long()
+                    valid = (c_2 < num_nodes) & (u_2 < num_nodes)
+                    if valid.any():
+                        adj[c_2[valid], u_2[valid]] = True
+        
+        graphs_with_idx_label.append((i, adj, label))
+    
+    # Create matched pairs
+    pairs = create_matched_pairs(graphs_with_idx_label, similarity_fn=similarity_fn)
+    
+    # Keep only matched samples in order
+    result = []
+    seen = set()
+    for pos_idx, neg_idx, _, _ in pairs:
+        if pos_idx not in seen:
+            result.append(graphs[pos_idx])
+            seen.add(pos_idx)
+        if neg_idx not in seen:
+            result.append(graphs[neg_idx])
+            seen.add(neg_idx)
+    
+    return result
+
+
+def _make_stage1_wedge_triangle_matched(args) -> List[Dict[str, torch.Tensor]]:
+    """Wedge/triangle with full leakage control (matched degree, edge, and two-hop counts)."""
+    graphs = _make_stage1_wedge_triangle(args)
+    return _apply_leakage_control(graphs, similarity_fn=similarity_aggregate)
+
+
+def _make_stage1_wedge_triangle_degree_only(args) -> List[Dict[str, torch.Tensor]]:
+    """Wedge/triangle matched on degree histogram only (leakage baseline)."""
+    graphs = _make_stage1_wedge_triangle(args)
+    return _apply_leakage_control(graphs, similarity_fn=similarity_euclidean_degree)
+
+
+def _make_stage1_wedge_triangle_edge_only(args) -> List[Dict[str, torch.Tensor]]:
+    """Wedge/triangle matched on edge count only (leakage baseline)."""
+    graphs = _make_stage1_wedge_triangle(args)
+    
+    # Filter by edge count only
+    def edge_count_similarity(adj1, adj2):
+        from get.data.leakage_control import compute_edge_count
+        e1 = float(compute_edge_count(adj1))
+        e2 = float(compute_edge_count(adj2))
+        return abs(e1 - e2) / max(e1, e2, 1.0)
+    
+    return _apply_leakage_control(graphs, similarity_fn=edge_count_similarity)
+
+
+def _make_stage1_wedge_triangle_twohop_only(args) -> List[Dict[str, torch.Tensor]]:
+    """Wedge/triangle matched on two-hop count only (leakage baseline)."""
+    graphs = _make_stage1_wedge_triangle(args)
+    
+    # Filter by two-hop count only
+    def twohop_similarity(adj1, adj2):
+        from get.data.leakage_control import compute_two_hop_count
+        t1 = compute_two_hop_count(adj1)
+        t2 = compute_two_hop_count(adj2)
+        return abs(t1 - t2) / max(t1, t2, 1e-6)
+    
+    return _apply_leakage_control(graphs, similarity_fn=twohop_similarity)
+
+
+def _make_stage1_cycle_parity_matched(args) -> List[Dict[str, torch.Tensor]]:
+    """Cycle parity with full leakage control."""
+    graphs = _make_stage1_cycle_parity(args)
+    return _apply_leakage_control(graphs, similarity_fn=similarity_aggregate)
+
+
+def _make_stage1_cycle_parity_degree_only(args) -> List[Dict[str, torch.Tensor]]:
+    """Cycle parity matched on degree only."""
+    graphs = _make_stage1_cycle_parity(args)
+    return _apply_leakage_control(graphs, similarity_fn=similarity_euclidean_degree)
+
+
+def _make_stage1_cycle_parity_edge_only(args) -> List[Dict[str, torch.Tensor]]:
+    """Cycle parity matched on edge count only."""
+    graphs = _make_stage1_cycle_parity(args)
+    
+    def edge_count_similarity(adj1, adj2):
+        from get.data.leakage_control import compute_edge_count
+        e1 = float(compute_edge_count(adj1))
+        e2 = float(compute_edge_count(adj2))
+        return abs(e1 - e2) / max(e1, e2, 1.0)
+    
+    return _apply_leakage_control(graphs, similarity_fn=edge_count_similarity)
+
+
+def _make_stage1_max3sat_matched(args) -> List[Dict[str, torch.Tensor]]:
+    """Max-3-SAT with full leakage control."""
+    graphs = _make_stage1_max3sat(args)
+    return _apply_leakage_control(graphs, similarity_fn=similarity_aggregate)
+
+
+def _make_stage1_max3sat_degree_only(args) -> List[Dict[str, torch.Tensor]]:
+    """Max-3-SAT matched on degree only."""
+    graphs = _make_stage1_max3sat(args)
+    return _apply_leakage_control(graphs, similarity_fn=similarity_euclidean_degree)
+
+
+def _make_stage1_max3sat_edge_only(args) -> List[Dict[str, torch.Tensor]]:
+    """Max-3-SAT matched on edge count only."""
+    graphs = _make_stage1_max3sat(args)
+    
+    def edge_count_similarity(adj1, adj2):
+        from get.data.leakage_control import compute_edge_count
+        e1 = float(compute_edge_count(adj1))
+        e2 = float(compute_edge_count(adj2))
+        return abs(e1 - e2) / max(e1, e2, 1.0)
+    
+    return _apply_leakage_control(graphs, similarity_fn=edge_count_similarity)
+
+
 def build_dataset(task: str, args) -> Tuple[Union[List[Dict[str, torch.Tensor]], Dict[str, List[Dict[str, torch.Tensor]]]], int]:
     if task == "stage1_wedge_triangle":
         res = _make_stage1_wedge_triangle(args), 2
+    elif task == "stage1_wedge_triangle_matched":
+        res = _make_stage1_wedge_triangle_matched(args), 2
+    elif task == "stage1_wedge_triangle_degree_only":
+        res = _make_stage1_wedge_triangle_degree_only(args), 2
+    elif task == "stage1_wedge_triangle_edge_only":
+        res = _make_stage1_wedge_triangle_edge_only(args), 2
+    elif task == "stage1_wedge_triangle_twohop_only":
+        res = _make_stage1_wedge_triangle_twohop_only(args), 2
     elif task == "stage1_triangle_regression":
         res = _make_stage1_triangle_regression(args), 1
     elif task == "stage1_cycle_parity":
         res = _make_stage1_cycle_parity(args), 2
+    elif task == "stage1_cycle_parity_matched":
+        res = _make_stage1_cycle_parity_matched(args), 2
+    elif task == "stage1_cycle_parity_degree_only":
+        res = _make_stage1_cycle_parity_degree_only(args), 2
+    elif task == "stage1_cycle_parity_edge_only":
+        res = _make_stage1_cycle_parity_edge_only(args), 2
     elif task == "stage1_max3sat":
         res = _make_stage1_max3sat(args), 2
+    elif task == "stage1_max3sat_matched":
+        res = _make_stage1_max3sat_matched(args), 2
+    elif task == "stage1_max3sat_degree_only":
+        res = _make_stage1_max3sat_degree_only(args), 2
+    elif task == "stage1_max3sat_edge_only":
+        res = _make_stage1_max3sat_edge_only(args), 2
     elif task == "stage1_xorsat":
         res = _make_stage1_xorsat(args), 2
     elif task == "stage1_srg_discrimination":

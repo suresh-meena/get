@@ -33,6 +33,84 @@ def test_model_factory_accepts_pairwiseget_and_fullget():
         assert model is not None
 
 
+def test_protocol_runner_accepts_canonical_get_variants():
+    """Assert the protocol runner argparse accepts the canonical GET variant names."""
+    from experiments.run_protocol import build_arg_parser
+
+    parser = build_arg_parser()
+    for name in ("quadratic_only", "pairwise_only", "memory_only", "motif_only", "nomotif_local", "no_memory_local", "fullget_local", "nomotif_global", "no_memory_global", "fullget_global", "get_ham_full"):
+        ns = parser.parse_args(["--task", "stage1_wedge_triangle", "--model_name", name, "--epochs", "1"])
+        assert ns.model_name == name
+
+
+def test_model_factory_reports_canonical_get_metadata():
+    """Assert build_model reports the canonical GET lattice for aliases and canonical names."""
+    from get.models.factory import build_model
+    from omegaconf import DictConfig
+
+    cases = {
+        "quadratic_only": ("quadratic_only", [], {"quadratic": True, "pairwise": False, "motif": False, "memory": False, "global_attention": False}),
+        "pairwise_only": ("pairwise_only", ["pairwise"], {"quadratic": True, "pairwise": True, "motif": False, "memory": False, "global_attention": False}),
+        "memory_only": ("memory_only", ["memory"], {"quadratic": True, "pairwise": False, "motif": False, "memory": True, "global_attention": False}),
+        "motif_only": ("motif_only", ["motif"], {"quadratic": True, "pairwise": False, "motif": True, "memory": False, "global_attention": False}),
+        "nomotif_local": ("nomotif_local", ["pairwise", "memory"], {"quadratic": True, "pairwise": True, "motif": False, "memory": True, "global_attention": False}),
+        "no_memory_local": ("no_memory_local", ["pairwise", "motif"], {"quadratic": True, "pairwise": True, "motif": True, "memory": False, "global_attention": False}),
+        "fullget_local": ("fullget_local", ["pairwise", "motif", "memory"], {"quadratic": True, "pairwise": True, "motif": True, "memory": True, "global_attention": False}),
+        "nomotif_global": ("nomotif_global", ["pairwise", "memory", "global_attention"], {"quadratic": True, "pairwise": True, "motif": False, "memory": True, "global_attention": True}),
+        "no_memory_global": ("no_memory_global", ["pairwise", "motif", "global_attention"], {"quadratic": True, "pairwise": True, "motif": True, "memory": False, "global_attention": True}),
+        "fullget_global": ("fullget_global", ["pairwise", "motif", "memory", "global_attention"], {"quadratic": True, "pairwise": True, "motif": True, "memory": True, "global_attention": True}),
+        "pairwiseget": ("pairwise_only", ["pairwise"], {"quadratic": True, "pairwise": True, "motif": False, "memory": False, "global_attention": False}),
+        "fullget": ("fullget_local", ["pairwise", "motif", "memory"], {"quadratic": True, "pairwise": True, "motif": True, "memory": True, "global_attention": False}),
+        "get_ham_global": ("fullget_global", ["pairwise", "motif", "memory", "global_attention"], {"quadratic": True, "pairwise": True, "motif": True, "memory": True, "global_attention": True}),
+        "get_ham_full": ("fullget_global", ["pairwise", "motif", "memory", "global_attention"], {"quadratic": True, "pairwise": True, "motif": True, "memory": True, "global_attention": True}),
+    }
+
+    base_cfg = {"in_dim": 4, "hidden_dim": 64, "num_heads": 2, "head_dim": 32, "num_steps": 1, "num_classes": 1, "task_type": "binary"}
+    for name, (canonical, branches, enabled) in cases.items():
+        cfg = DictConfig({**base_cfg, "model_name": name})
+        model = build_model(cfg)
+        metadata = model.energy_metadata()
+        assert metadata["canonical_model_name"] == canonical
+        assert metadata["branch_names"] == branches
+        assert metadata["enabled_branches"] == enabled
+
+
+def test_fullget_global_backward_has_finite_gradients():
+    """Assert fullget_global stays numerically stable through one backward pass."""
+    from get.data import SyntheticGraphDataset, collate_graph_samples
+    from get.models.factory import build_model
+    from omegaconf import DictConfig
+
+    ds = SyntheticGraphDataset(
+        num_graphs=4,
+        min_nodes=5,
+        max_nodes=7,
+        edge_prob=0.2,
+        in_dim=8,
+        max_motifs_per_anchor=4,
+        seed=123,
+    )
+    batch = collate_graph_samples([ds[i] for i in range(4)])
+    cfg = DictConfig({
+        "model_name": "fullget_global",
+        "in_dim": 8,
+        "hidden_dim": 64,
+        "num_heads": 2,
+        "head_dim": 32,
+        "num_steps": 8,
+        "num_classes": 1,
+        "task_type": "binary",
+    })
+    model = build_model(cfg)
+    logits = model(batch)
+    loss = torch.nn.BCEWithLogitsLoss()(logits.view(-1), batch["y"].view(-1).float())
+    loss.backward()
+
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            assert torch.isfinite(param.grad).all(), f"non-finite gradient in {name}"
+
+
 # ---------------------------------------------------------------------------
 # 3. No dense adjacency conversion
 # ---------------------------------------------------------------------------
@@ -109,6 +187,13 @@ def test_result_schema_smoke(tmp_path):
     assert "loss" in result["test"]
     assert isinstance(result["history"], dict)
     assert "train" in result["history"] or "val" in result["history"]
+    assert "energy_diagnostics" in result
+    assert "val" in result["energy_diagnostics"]
+    assert "test" in result["energy_diagnostics"]
+    assert result["energy_diagnostics"]["val"]["batches"]
+    first_diag = result["energy_diagnostics"]["val"]["batches"][0]
+    for key in ("energy_initial", "energy_final", "energy_drop", "latent_displacement"):
+        assert key in first_diag
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +205,7 @@ def test_compile_scope_all_accepts_get_model(tmp_path):
     cmd = [
         sys.executable, str(ROOT / "main.py"),
         "dataset.name=stage1_wedge_triangle",
-        "model=pairwiseget",
+        "model=pairwise_only",
         "experiment.device=cpu",
         "trainer.epochs=1",
         "+dataset.max_graphs=8",
@@ -140,7 +225,7 @@ def test_compile_guard_eval_only_accepted(tmp_path):
     cmd = [
         sys.executable, str(ROOT / "main.py"),
         "dataset.name=stage1_wedge_triangle",
-        "model=pairwiseget",
+        "model=pairwise_only",
         "experiment.device=cpu",
         "trainer.epochs=1",
         "+dataset.max_graphs=8",
@@ -275,29 +360,17 @@ def test_prefetch_loader_smoke():
 # 8. GET-HAM branch registry
 # ---------------------------------------------------------------------------
 
-def test_branch_registry_pairwiseget_defaults_disable_global_and_cls():
-    """Assert PairwiseGET/FullGET defaults do not enable global attention, CLS, structural memory, or dynamic edges."""
-    from get.energy.branch import enabled_branches_from_config
+def test_global_attention_off_by_default():
+    """Assert canonical local GET variants do not enable global attention."""
+    from get.models.factory import build_model
+    from omegaconf import DictConfig
 
-    class _PairwiseCfg:
-        pairwise = True
-        motif = False
-        memory = False
-        global_attention = False
-
-    class _FullGETCfg:
-        pairwise = True
-        motif = True
-        memory = True
-        global_attention = False
-
-    pw = enabled_branches_from_config(_PairwiseCfg)
-    assert pw["global_attention"] is False
-
-    fg = enabled_branches_from_config(_FullGETCfg)
-    assert fg["global_attention"] is False
-    assert fg["pairwise"] is True
-    assert fg["motif"] is True
+    for name in ("pairwise_only", "fullget_local", "nomotif_local"):
+        cfg = DictConfig({"model_name": name, "in_dim": 4, "hidden_dim": 64, "num_heads": 2, "head_dim": 32, "num_steps": 1, "num_classes": 1, "task_type": "binary"})
+        model = build_model(cfg)
+        metadata = model.energy_metadata()
+        assert metadata["enabled_branches"]["global_attention"] is False, f"{name} should not have global attention"
+        assert metadata["energy_lambdas"]["lambda_g"] == 0.0, f"{name} lambda_g should be 0"
 
 
 def test_composed_energy_instantiates_requested_branches():

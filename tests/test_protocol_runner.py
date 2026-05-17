@@ -4,6 +4,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+CODE_ROOT = Path(__file__).resolve().parents[1]
+
 
 def test_main_runner_stage1_smoke(tmp_path: Path) -> None:
     # Test using main.py with Hydra overrides
@@ -11,7 +13,7 @@ def test_main_runner_stage1_smoke(tmp_path: Path) -> None:
         sys.executable,
         "main.py",
         "dataset.name=stage1_wedge_triangle",
-        "model=pairwiseget",
+        "model=pairwise_only",
         "experiment.device=cpu",
         "trainer.epochs=1",
         "+dataset.max_graphs=16",
@@ -19,7 +21,7 @@ def test_main_runner_stage1_smoke(tmp_path: Path) -> None:
         "trainer.eval_batch_size=8",
         f"+output_dir={tmp_path}",
     ]
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, cwd=str(CODE_ROOT))
     assert (tmp_path / "metrics_stage1_wedge_triangle.json").exists()
 
 
@@ -28,7 +30,7 @@ def test_main_runner_stage1_xorsat_smoke(tmp_path: Path) -> None:
         sys.executable,
         "main.py",
         "dataset.name=stage1_xorsat",
-        "model=pairwiseget",
+        "model=pairwise_only",
         "experiment.device=cpu",
         "trainer.epochs=1",
         "+dataset.max_graphs=16",
@@ -36,6 +38,6 @@ def test_main_runner_stage1_xorsat_smoke(tmp_path: Path) -> None:
         "trainer.eval_batch_size=8",
         f"+output_dir={tmp_path}",
     ]
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, cwd=str(CODE_ROOT))
     assert (tmp_path / "metrics_stage1_xorsat.json").exists()
 
