@@ -1,0 +1,1308 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[a4paper,margin=0.75in]{geometry}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage[numbers]{natbib}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newtheorem{remark}{Remark}
+\newtheorem{definition}{Definition}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+
+\title{Graph Energy Transformer with Explicit Motif Retrieval}
+\author{}
+\date{}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.5em}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We introduce the \emph{Graph Energy Transformer} (GET), a graph model whose
+scalar objective combines graph-local pairwise retrieval, sparse order-3 motif
+retrieval over anchored wedges and triangles, ET-style global attention, and a
+Hopfield/FFN memory term. GET is intended as an energy formulation of the main
+interaction modules of a modern graph transformer: local message passing,
+global mixing, higher-order motif retrieval, and tokenwise feed-forward memory.
+It reduces to continuous Modern Hopfield retrieval in a single-node memory-only
+limit and to a restricted ET attention-plus-HN energy in the complete-support
+limit. The log-sum-exp retrieval terms admit a standard entropy-regularized
+simplex lifting, so the softmax weights can be interpreted as auxiliary routing
+variables. This identity is not itself novel; its role is to make the update
+field precise. Differentiating one scalar energy gives both anchor-side
+aggregation and reverse-incidence terms, as in ET, rather than an arbitrary
+feed-forward message-passing rule. The motif branch uses a rank-$R$
+factorization that is not representable by the additive-separable pairwise
+score used by the local branch. Under fixed local, motif, and global supports
+and $\varepsilon$-stabilized LayerNorm, the energy is smooth and coercive,
+accepted Armijo steps decrease it monotonically, and strict local minima admit
+a local Lyapunov certificate. The empirical claim is deliberately narrow:
+FullGET should improve over a capacity-matched no-motif GET harness on tasks
+whose signal is local and motif-causal.
+\end{abstract}
+
+%----------------------------------------------------------------------
+\section{Introduction}
+%----------------------------------------------------------------------
+
+Energy-based models define inference by differentiating a scalar objective.
+That constraint is stronger than ordinary message passing: the update field
+must be an integrable gradient field, and a node receives terms both from
+queries it anchors and from other queries in which it appears as a key.
+Energy Transformer (ET) makes this distinction explicit for self-attention
+\citep{hoover2023energy}; Modern Hopfield Networks provide the associated
+log-sum-exp retrieval form \citep{ramsauer2021hopfield}.
+
+GET asks a narrower graph question. If a modern graph-transformer harness is
+written as a Hopfield/ET-style energy over graph states, can an explicit sparse
+order-3 motif term be isolated and tested against the same energy harness with
+the motif branch removed? This is not a claim that higher-order graph
+reasoning, graph attention, local/global graph transformers, or energy-based
+graph dynamics are new. Those are already covered by
+MPNNs and GATs \citep{gilmer2017neural,velickovic2018graph}, graph
+transformers \citep{ying2021graphormer,rampasek2022gps,ma2023grit,
+shirzad2023exphormer}, gradient-flow and diffusion views of GNNs
+\citep{digiovanni2023gnnflow,wu2025diffusion}, Graph Hopfield Networks
+\citep{rao2026graph}, and higher-order/substructure models
+\citep{morris2019weisfeiler,bouritsas2023subgraph,bodnar2021mpsn,
+hussain2024triplet}.
+
+The purpose of GET is therefore methodological and empirical: define one scalar
+graph energy with local, motif, global, and Hopfield/FFN retrieval terms;
+derive the full gradient update rather than postulate a feed-forward
+aggregator; and test whether the motif term matters under matched no-motif
+controls.
+
+\paragraph{Inheritance chain.}
+GET is built so that known ancestors appear as special cases by disabling
+inactive branches while keeping active couplings nonnegative
+(Table~\ref{tab:special-cases}). The two anchor limits are a Modern Hopfield
+memory-only case and a restricted complete-support ET-style attention-plus-HN
+case; the full model adds graph-local and sparse motif retrieval on top of the
+global ET-style harness.
+
+\begin{table}[htbp]
+\centering
+\caption{Special cases of GET. $\lambda_2$, $\lambda_3$, $\lambda_g$, and
+$\lambda_m$ are the local pairwise, motif, global attention, and HN/FFN memory
+couplings.}
+\label{tab:special-cases}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{lcccc l}
+\toprule
+Setting & $\lambda_2$ & $\lambda_3$ & $\lambda_g$ & $\lambda_m$ & Reduces to \\
+\midrule
+$|V|=1$, no edges & $0$ & $0$ & $0$ & $>0$ & Modern Hopfield Network \citep{ramsauer2021hopfield} \\
+Complete global support & $0$ & $0$ & $>0$ & $>0$ & restricted ET attention+HN \citep{hoover2023energy} \\
+Sparse graph only & $>0$ & $0$ & $0$ & $0$ & graph-local pairwise retrieval \\
+No-motif harness & $>0$ & $0$ & $>0$ & $>0$ & local/global/HN graph transformer \\
+Full model & $>0$ & $>0$ & $>0$ & $>0$ & GET \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Contributions.}
+\begin{enumerate}
+\item We define a scalar graph energy with local pairwise retrieval, explicit
+  sparse motif retrieval, ET-style global attention, and a Hopfield/FFN memory
+  branch. The motif score is an explicit sparse order-3 interaction that is
+  generically not representable by the additive-separable pairwise family used
+  by the graph-local branch.
+\item We verify the inheritance chain to Modern Hopfield retrieval and to a
+  restricted ET-style attention-plus-HN energy. We also make explicit the
+  entropy-regularized simplex lifting of the log-sum-exp terms; this identifies
+  the softmax weights as routing variables, not as Bethe or VMP beliefs.
+\item We show that full-gradient descent yields region-message dynamics with
+  both anchor-side and reverse-incidence terms over local edges, retained
+  motifs, global attention supports, and tokenwise memory. This is the main
+  structural difference from a plain feed-forward MPNN, GAT, or graph
+  transformer update.
+\item Under fixed local, motif, and global supports and
+  $\varepsilon$-stabilized LayerNorm, we show coercivity, local smoothness,
+  monotone decrease under accepted Armijo steps, and local Lyapunov stability
+  around strict local minima.
+\item We organize evaluation around mechanism identification first and transfer
+  second: motif-causal diagnostics, realized-expressivity tests such as BREC,
+  bounded-degree molecular graphs, and only then long-range or ET-style graph
+  benchmarks.
+\end{enumerate}
+
+%----------------------------------------------------------------------
+\section{Background and Special Cases}
+%----------------------------------------------------------------------
+
+\subsection{Modern Hopfield Networks}
+
+Given a query $\xi\in\mathbb{R}^d$ and stored patterns
+$\{b_a\}_{a=1}^K\subset\mathbb{R}^d$, the Modern Hopfield energy
+\citep{ramsauer2021hopfield} is
+\begin{equation}
+  E_{\mathrm{Hop}}(\xi)
+  = \frac{1}{2}\|\xi\|^2
+    - \frac{1}{\beta}\log\sum_{a=1}^K\exp\!\bigl(\beta\,\xi^\top b_a\bigr)
+    + C(\beta,\{b_a\}),
+  \label{eq:mhn-scalar}
+\end{equation}
+where $C$ is independent of $\xi$. Stationarity gives the retrieval fixed
+point
+\begin{equation}
+  \xi^* = B\,\mathrm{softmax}(\beta B^\top \xi^*),
+  \qquad B=[b_1,\ldots,b_K].
+  \label{eq:mhn-fixedpt}
+\end{equation}
+
+\subsection{Energy Transformer}
+
+For token states $X\in\mathbb{R}^{N\times d}$, the attention part of the ET
+energy \citep{hoover2023energy} is
+\begin{equation}
+  E_{\mathrm{ET}}^{\mathrm{ATT}}(X)
+  = \frac{1}{2}\|X\|_F^2
+    - \frac{1}{\beta}\sum_{i=1}^N
+      \log\sum_{j=1}^N\exp\!\bigl(\beta s_{ij}\bigr),
+  \qquad
+  s_{ij} = \frac{1}{\sqrt{d}}\,{(W_Q x_i)}^\top(W_K x_j).
+  \label{eq:et}
+\end{equation}
+GET recovers this restricted single-head score model in the complete-support
+global-attention limit with matched support, scaling, and normalization
+conventions.
+
+The published ET block also contains a Hopfield Network module
+$E_{\mathrm{ET}}^{\mathrm{HN}}$, applied in parallel with attention, whose
+weights act as memories and whose tied projection structure is the ET analogue
+of a transformer feed-forward network. GET adopts the same decomposition at
+the graph level: local graph attention, motif attention, global attention, and
+HN/FFN memory are separate additive terms in one scalar energy. This is a
+single-state ET-style graph energy, not a full hierarchical associative memory
+over all layers; the HAM viewpoint is useful lineage, but the guarantee here is
+descent of the implemented scalar energy \citep{hoover2022universal}.
+
+The important ET lesson for this paper is not only the scalar energy, but the
+gradient. Let
+$a_{ij}=\mathrm{softmax}_{j}(\beta s_{ij})$. Ignoring normalization constants
+and writing only the attention contribution, the negative gradient contains
+\begin{equation}
+  -\nabla_{x_i}E_{\mathrm{ET}}
+  \supset
+  W_Q^\top\sum_j a_{ij}W_Kx_j
+  +
+  W_K^\top\sum_u a_{ui}W_Qx_u .
+  \label{eq:et-two-term}
+\end{equation}
+The first term is query-side aggregation. The second appears because $x_i$ is
+also a key in other tokens' scores. A feed-forward attention layer may keep only
+the first effect; exact energy descent does not. The same two-term structure
+appears for GET's local and global attention branches.
+
+\subsection{Message Passing and Free Energy}
+
+Classical BP, GBP, and VMP already show that message passing can be tied to
+free-energy stationarity or variational coordinate optimization
+\citep{yedidia2005free,winn2005vmp}. This does not make GET a probabilistic
+inference algorithm. BP and GBP optimize constrained beliefs with marginal
+consistency; VMP optimizes a factorized posterior bound. GET instead optimizes
+continuous node states, while its auxiliary weights are routing distributions
+over graph supports. The overlap with graphical-model inference is algebraic,
+not semantic. Surveys of the GNN--PGM intersection make the same distinction
+between learned representation passing and probabilistic belief passing
+\citep{hua2022gnnpgm}.
+
+The only safe region-graph analogy is structural: local pairwise scores act on
+edge regions, motif scores act on retained triangle or wedge regions, global
+attention scores act on long-range node-pair regions, and memory scores act on
+node-to-prototype regions. GET does not introduce region beliefs, Möbius
+counting numbers, or marginal-consistency constraints, so it should not be
+identified with Kikuchi free energy or GBP.
+
+\subsection{Positioning}
+
+The narrow contribution is an ET-style graph energy harness with an explicit
+sparse motif term. Higher-order GNNs, substructure counting,
+simplicial message passing, relation-aware transformers, and Triplet Graph
+Transformer already cover motifs, tuples, and higher-order graph interactions
+\citep{morris2019weisfeiler,bouritsas2023subgraph,bodnar2021mpsn,
+diao2023relational,hussain2024triplet,burns2023simplicial}. GraphGPS,
+Graphormer, GRIT, Exphormer, GPSE, and related graph transformers cover
+structural encodings, local/global attention, and scalable transformer
+harnesses \citep{ying2021graphormer,rampasek2022gps,ma2023grit,
+shirzad2023exphormer,canturk2024gpse,airale2025spse,bao2025homomorphism}.
+Graph Hopfield Networks are especially close in lineage, but their graph term is
+closer to Hopfield retrieval coupled with graph smoothing for node
+classification; GET's distinctive term is learned motif-indexed retrieval inside
+the same local/global/HN energy harness.
+GET should be judged on the smaller question: does a motif term inside one
+scalar graph-transformer energy improve over the matched no-motif harness?
+
+%----------------------------------------------------------------------
+\section{Graph Energy Transformer}
+%----------------------------------------------------------------------
+
+\subsection{State Space and Support}
+
+Let $G=(V,E)$ be an undirected graph with hidden dimension $d\ge 2$. Each
+node $i\in V$ has raw state $x_i\in\mathbb{R}^d$ and normalized state
+\begin{equation}
+  g_i = \mathrm{LN}(x_i),
+  \label{eq:ln}
+\end{equation}
+where LayerNorm is stabilized with $\varepsilon>0$. Let $\mathcal{N}(i)$ be
+the pairwise support of node $i$ (optionally including a self-loop), and let
+$\mathcal{W}(i)$ be a retained set of anchored unordered neighbor pairs around
+$i$. We write $(j,k)\in\mathcal W(i)$ for a representative of the unordered pair
+and store each pair once. The intended motifs are sparse open wedges and
+triangles, though ordered or typed supports can be used when role-asymmetric
+patterns are required. Let $\mathcal S_g(i)$ be the global attention support
+of node $i$, such as all nodes, a CLS-mediated support, anchors, or a sparse
+long-range support. Finally, let $\mathcal{B}=\{b_a\}_{a=1}^{K}$ denote the
+HN/FFN memory bank.
+
+For theory, the key assumption is that all supports are fixed during one
+inference trajectory: $\mathcal{W}(i)$ and $\mathcal S_g(i)$ are chosen once by
+an invariant rule such as exact wedge/triangle support, a deterministic score
+threshold, a bounded motif budget, dense global support, or a fixed sparse
+long-range pattern. That assumption keeps the energy smooth between support
+changes and makes the descent results interpretable as properties of a fixed
+graph retrieval problem rather than of a changing support selector.
+
+\subsection{Local, Motif, Global, and HN/FFN Scores}
+
+The pairwise branch uses linear query--key maps $q_2,k_2$ and score
+\begin{equation}
+  s^{(2)}_{ij}
+  = \frac{1}{\sqrt d}\,q_2(g_i)^\top k_2(g_j) + a^{(2)}_{ij},
+  \qquad j\in\mathcal{N}(i),
+  \label{eq:s2}
+\end{equation}
+where $a^{(2)}_{ij}$ is an optional edge-feature bias.
+Unless $q_2=k_2$ and the biases are symmetric, $s^{(2)}_{ij}$ need not equal
+$s^{(2)}_{ji}$. Thus GET is not an undirected graphical-model energy on edges;
+it is an attention-style scalar energy over anchored retrieval problems.
+
+The motif branch uses a rank-$R$ factorization with motif type embedding
+$t_{\tau_{ijk}}^{(r)}\in\mathbb{R}^{d}$:
+\begin{equation}
+  s^{(3)}_{i,jk}
+  = \frac{1}{\sqrt{Rd}}\sum_{r=1}^{R}
+      {q_3^{(r)}(g_i)}^\top
+      \bigl(k_3^{(r)}(g_j)\odot k_3^{(r)}(g_k) + t_{\tau_{ijk}}^{(r)}\bigr),
+  \qquad (j,k)\in\mathcal{W}(i).
+  \label{eq:s3}
+\end{equation}
+Because the key term is multiplicative in $(g_j,g_k)$, this branch captures
+joint neighbor effects that additive pairwise scores cannot express in
+general. A triangle may contribute once for each anchor whose support retains
+the other two vertices; the motif energy is therefore anchor-local, not a single
+shared Kikuchi-style triangle potential.
+
+The global branch uses its own query--key maps $q_g,k_g$:
+\begin{equation}
+  s^{(g)}_{ij}
+  = \frac{1}{\sqrt d}\,q_g(g_i)^\top k_g(g_j) + a^{(g)}_{ij},
+  \qquad j\in\mathcal S_g(i).
+  \label{eq:sg}
+\end{equation}
+This is the ET-style graph-transformer mixing term. In small graphs
+$\mathcal S_g(i)=V$ gives dense attention; in larger graphs it can be a fixed
+anchor, expander, sampled, or CLS-mediated support. The scalar-energy gradient
+again includes both query-side and reverse key-side contributions.
+
+The HN/FFN branch follows the Modern Hopfield / ET pattern with linear maps
+$q_m$ and $k_m$:
+\begin{equation}
+  s^{(m)}_{i,a}
+  = \frac{1}{\sqrt d}\,q_m(g_i)^\top k_m(b_a),
+  \qquad a\in\{1,\dots,K\}.
+  \label{eq:sm}
+\end{equation}
+
+\subsection{Why the Motif Term Is Genuinely Higher-Order}
+
+The motif score in~\eqref{eq:s3} is not merely a rephrased pairwise model.
+Suppose one tries to represent the dependence on $(g_j,g_k)$ by an
+additive-separable family of the form
+$u(g_i,g_j)+v(g_i,g_k)+c_{\tau_{ijk}}$. Such a score has zero mixed second
+derivative with respect to any coordinate of $g_j$ and any coordinate of
+$g_k$. By contrast, the term
+${q_3^{(r)}(g_i)}^\top\bigl(k_3^{(r)}(g_j)\odot k_3^{(r)}(g_k)\bigr)$ has
+generically nonzero cross-dependence because the two neighbor states enter
+multiplicatively. Except in degenerate parameter settings, it therefore
+cannot be rewritten as a sum of independent edgewise contributions.
+
+This is the sense in which GET adds an explicit order-3 interaction rather
+than a richer pairwise scorer. The contribution of neighbor $j$ to anchor $i$
+depends on which other neighbor $k$ is paired with it, so the model can
+distinguish local configurations that match on degree and pairwise marginals
+but differ in wedge closure or triangle structure.
+This nonseparability claim is only relative to the additive edgewise score
+family in the no-motif local branch. It is not a theorem against arbitrary
+higher-order or pair-state architectures.
+
+\subsection{Block Energy and Inference}
+
+The attention energy combines the quadratic penalty with graph-local pairwise,
+motif, and global retrieval:
+\begin{equation}
+\begin{aligned}
+  E_{\mathrm{att}}(X)
+  ={}& \frac{1}{2}\sum_{i\in V}\|x_i\|^2
+     - \frac{\lambda_2}{\beta_2}\sum_{i\in V}
+       \log\sum_{j\in\mathcal{N}(i)} \exp\!\bigl(\beta_2 s^{(2)}_{ij}\bigr) \\
+    &- \frac{\lambda_3}{\beta_3}\sum_{i\in V}
+       \log\sum_{(j,k)\in\mathcal{W}(i)}
+         \exp\!\bigl(\beta_3 s^{(3)}_{i,jk}\bigr)\\
+    &- \frac{\lambda_g}{\beta_g}\sum_{i\in V}
+       \log\sum_{j\in\mathcal S_g(i)}
+         \exp\!\bigl(\beta_g s^{(g)}_{ij}\bigr),
+\end{aligned}
+  \label{eq:eatt}
+\end{equation}
+with the convention that empty supports contribute zero. The HN/FFN memory
+branch is
+\begin{equation}
+  E_{\mathrm{HN}}(X)
+  = -\frac{\lambda_m}{\beta_m}\sum_{i\in V}
+      \log\sum_{a=1}^{K}\exp\!\bigl(\beta_m s^{(m)}_{i,a}\bigr),
+  \label{eq:ehn}
+\end{equation}
+and the full block energy is
+\begin{equation}
+  E_{\mathrm{GET}}(X) = E_{\mathrm{att}}(X) + E_{\mathrm{HN}}(X).
+  \label{eq:fullenergy}
+\end{equation}
+
+\subsection{Energy-Induced Message Weights}
+
+The log-sum-exp form has a standard variational identity. It is useful here
+only because it fixes what the local ``messages'' are; by itself, this identity
+is not a novelty claim.
+
+\begin{proposition}[Entropy-regularized routing form]
+\label{prop:routing}
+For fixed $X$ and positive temperatures, $E_{\mathrm{GET}}(X)$ equals
+$\min_{\alpha,\gamma,\pi,\rho}\widetilde E(X,\alpha,\gamma,\pi,\rho)$ over
+local simplexes
+$\alpha_i\in\Delta_{\mathcal N(i)}$,
+$\gamma_i\in\Delta_{\mathcal W(i)}$,
+$\pi_i\in\Delta_{\mathcal S_g(i)}$, and
+$\rho_i\in\Delta_K$, where
+\begin{equation}
+\begin{aligned}
+\widetilde E
+={}& \frac12\sum_i\|x_i\|^2
+-\lambda_2\sum_i\sum_{j\in\mathcal N(i)}\alpha_{ij}s^{(2)}_{ij}
+-\frac{\lambda_2}{\beta_2}\sum_i H(\alpha_i)\\
+&-\lambda_3\sum_i\sum_{(j,k)\in\mathcal W(i)}
+  \gamma_{i,jk}s^{(3)}_{i,jk}
+-\frac{\lambda_3}{\beta_3}\sum_i H(\gamma_i)\\
+&-\lambda_g\sum_i\sum_{j\in\mathcal S_g(i)}\pi_{ij}s^{(g)}_{ij}
+-\frac{\lambda_g}{\beta_g}\sum_i H(\pi_i)\\
+&-\lambda_m\sum_i\sum_a\rho_{ia}s^{(m)}_{ia}
+-\frac{\lambda_m}{\beta_m}\sum_i H(\rho_i).
+\end{aligned}
+\label{eq:lifted-energy}
+\end{equation}
+The minimizers are the softmax weights
+\begin{equation}
+\begin{aligned}
+  \alpha_{ij}=\mathrm{softmax}_{j\in\mathcal N(i)}(\beta_2s^{(2)}_{ij}),
+  \qquad
+  \gamma_{i,jk}=\mathrm{softmax}_{(j,k)\in\mathcal W(i)}
+    (\beta_3s^{(3)}_{i,jk}),\\
+  \pi_{ij}=\mathrm{softmax}_{j\in\mathcal S_g(i)}(\beta_gs^{(g)}_{ij}),
+  \qquad
+  \rho_{ia}=\mathrm{softmax}_{a}(\beta_ms^{(m)}_{ia}).
+\end{aligned}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Use
+$(1/\beta)\log\sum_r e^{\beta s_r}
+=\max_{p\in\Delta}\{\sum_r p_rs_r+\beta^{-1}H(p)\}$ independently for the
+edge, motif, global, and memory supports, then multiply each term by its
+negative coupling.
+\end{proof}
+
+These variables are routing weights, not calibrated beliefs. The pairwise and
+motif branches can be viewed as learned neural factors on edge and motif
+regions, but GET inherits only the convex-analytic shape of free-energy message
+passing. It does not inherit BP, GBP, VMP, or Kikuchi semantics unless one adds
+belief variables, consistency constraints, region counting numbers, and an
+explicit probabilistic model.
+
+Inference minimizes $E_{\mathrm{GET}}$ over node states with parameters fixed:
+\begin{equation}
+  X^{t+1} = X^t - \eta_t\nabla_X E_{\mathrm{GET}}(X^t).
+  \label{eq:update}
+\end{equation}
+For monotone inference we choose $\eta_t$ by Armijo backtracking. Starting
+from $\eta_0$, shrink by $\gamma\in(0,1)$ until
+\begin{equation}
+  E_{\mathrm{GET}}(X^t - \eta_t G^t)
+  \le E_{\mathrm{GET}}(X^t) - c\eta_t\|G^t\|_F^2,
+  \qquad G^t = \nabla_X E_{\mathrm{GET}}(X^t),
+  \label{eq:armijo}
+\end{equation}
+with $c\in(0,1)$.
+
+\begin{minipage}{\textwidth}
+\begin{algorithm}[H]
+\caption{GET Inference by Monotone Armijo Descent}
+\label{alg:armijo}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} initial state $X^0$, energy $E(\cdot)$, $c,\gamma\in(0,1)$, initial step $\eta_0$, steps $T$
+\FOR{$t=0$ \textbf{to} $T-1$}
+  \STATE $G^t \gets \nabla_X E(X^t)$
+  \STATE $\eta \gets \eta_0$
+  \WHILE{$E(X^t-\eta G^t) > E(X^t) - c\eta\|G^t\|_F^2$}
+    \STATE $\eta \gets \gamma\eta$
+  \ENDWHILE
+  \STATE $X^{t+1} \gets X^t - \eta G^t$
+\ENDFOR
+\STATE \textbf{Return:} $X^T$
+\end{algorithmic}
+\end{algorithm}
+\end{minipage}
+
+The gradient derivation is given in Appendix~\ref{app:gradients}. As in
+ET~\eqref{eq:et-two-term}, the local and global attention branches give both
+anchor-side aggregation and reverse-incidence terms from other anchors for
+which the node is a key. The motif branch similarly gives anchor motif messages
+and reverse motif-incidence messages. This full-gradient field is the object
+being studied; an anchor-only attention approximation would no longer be exact
+descent on~\eqref{eq:fullenergy}. To keep the mechanism identifiable, score
+maps remain linear and nonlinear capacity is confined to the input encoder and
+task head.
+
+\subsection{Input Encoding, Readout, and Training}
+
+To keep the mechanism identifiable, the energy maps
+$q_2,k_2,q_3,k_3,q_g,k_g,q_m,k_m$ remain linear and nonlinear capacity is
+confined to the input encoder and task heads. Raw node attributes may be embedded or
+projected by a small MLP, with optional degree, Laplacian, or random-walk
+encodings when those same structural features are shared across all methods in
+a comparison. Edge attributes enter the pairwise branch through the scalar
+bias $a^{(2)}_{ij}$, while typed motifs use the embedding $t_{\tau_{ijk}}$.
+The global branch uses either dense support or a fixed sparse long-range
+support. The couplings $\lambda_2$, $\lambda_3$, $\lambda_g$, and $\lambda_m$
+act as nonnegative branch gates and should be learned without weight decay.
+For implementation, local pairwise and motif energies should be evaluated in
+sparse edge-index form with grouped segment/scatter log-sum-exp reductions,
+not with dense $N\times N$ attention masks. The global branch can use dense
+attention on small graphs and sparse/anchor support on large graphs.
+
+After $T$ inference steps, node-level tasks read out
+$z_i=\mathrm{LN}(x_i^{(T)})$ directly. Graph-level tasks may use a simple
+permutation-invariant pooled representation such as
+\begin{equation}
+  r_G = \Bigl[\tfrac{1}{|V|}\sum_i z_i\ ;\ \sum_i z_i\ ;\ \max_i z_i\Bigr],
+\end{equation}
+followed by an MLP head. When a benchmark genuinely rewards ET-style graph
+wrappers, a CLS state can be included as an additional token in the same global
+attention and HN/FFN energy and serve as the graph readout. Training should
+distinguish the inner inference loop from the outer parameter
+update:~\eqref{eq:update} refines latent states for fixed parameters, while
+AdamW or another stochastic optimizer updates the parameters of the encoder,
+score maps, memory bank, and task head through the unrolled solver. Fixed-step
+training is practical; Armijo backtracking is most important for
+evaluation-time inference and implementation checks.
+
+%----------------------------------------------------------------------
+\section{Theoretical Properties}
+%----------------------------------------------------------------------
+
+\subsection{Special-Case Reductions}
+
+\begin{proposition}[Single-node case: Modern Hopfield retrieval]
+\label{prop:single-node}
+Let $|V|=1$ and set $\lambda_2=\lambda_3=\lambda_g=0$, $K\ge 1$. Then
+\begin{equation}
+  E_{\mathrm{GET}}(x)
+  = \tfrac{1}{2}\|x\|^2
+    - \tfrac{\lambda_m}{\beta_m}\log\sum_{a=1}^{K}
+      \exp\!\bigl(\beta_m s^{(m)}_{1,a}\bigr).
+\end{equation}
+Setting $\nabla_x E_{\mathrm{GET}}=0$ gives
+\begin{equation}
+  x^* = \frac{\lambda_m}{\sqrt d}\,{J_{\mathrm{LN}}(x^*)}^\top
+        {J_{q_m}(g^*)}^\top\sum_{a=1}^{K}\rho_a(x^*)\,k_m(b_a),
+  \label{eq:single-node-fixedpt}
+\end{equation}
+where $g^*=\mathrm{LN}(x^*)$ and
+$\rho_a(x)=\mathrm{softmax}_a(\beta_m s^{(m)}_{1,\cdot})$. If
+$q_m=k_m=\mathrm{Id}$ and $\mathrm{LN}=\mathrm{Id}$, then choosing
+$\lambda_m=\sqrt d$ and $\beta_m=\beta\sqrt d$ recovers the standard Modern
+Hopfield retrieval rule
+$x^*=\sum_a \mathrm{softmax}_a(\beta x^{*\top}b_a)\,b_a$.
+\end{proposition}
+
+\begin{proof}
+Under the stated restrictions the energy contains only the quadratic term and
+the memory log-sum-exp term. Differentiating with respect to $x$ yields the
+stationarity equation above; the identity-map, no-LayerNorm limit then matches
+\eqref{eq:mhn-fixedpt} after the stated scaling choice.
+\end{proof}
+
+\begin{proposition}[Complete-support case: restricted ET-style attention+HN]
+\label{prop:et}
+Let $\mathcal S_g(i)=V$ for all $i$, and set
+$\lambda_2=\lambda_3=0$, $\lambda_g=1$, $q_g=W_Q$, and $k_g=W_K$. Then the
+global attention branch of $E_{\mathrm{GET}}$ coincides with the single-head
+complete-support ET attention energy in~\eqref{eq:et} up to the LayerNorm
+reparameterization used in this paper. Keeping $\lambda_m>0$ adds the softmax
+Modern Hopfield version of ET's HN/FFN memory term. This is still a restricted
+ET reduction: it omits multi-head details, ET's more general activation
+choices in $E_{\mathrm{ET}}^{\mathrm{HN}}$, and implementation-specific
+wrappers.
+\end{proposition}
+
+\begin{proof}
+With complete global support, $\mathcal S_g(i)=V$ for every node, so the
+global log-sum-exp ranges over all token pairs. With local and motif branches
+disabled, the global branch reduces exactly to the ET score model when
+$\mathrm{LN}=\mathrm{Id}$ and otherwise differs only by the normalized-state
+parameterization. The memory branch is the log-sum-exp Modern Hopfield
+specialization of the ET HN module.
+\end{proof}
+
+\begin{proposition}[Fixed-point self-consistency]
+\label{prop:fixedpt}
+A stationary point $X^*$ of $E_{\mathrm{GET}}$ satisfies, for every $i\in V$,
+\begin{equation}
+  x_i^* = -{J_{\mathrm{LN}}(x_i^*)}^\top
+           \nabla_{g_i} E_{\mathrm{GET}}(X^*).
+  \label{eq:fixedpt-full}
+\end{equation}
+Thus every fixed point is a self-consistent retrieval field over graph-local
+pairwise context, retained motifs, global attention context, and HN/FFN memory.
+\end{proposition}
+
+Because a node may also appear as a key in other nodes' local, motif, or global
+scores, differentiating the scalar energy produces reverse-incidence terms: a
+node receives gradient contributions from other nodes that attend to it. That
+reciprocal flow is a structural consequence of the scalar-energy formulation
+and is part of what distinguishes GET from a purely feed-forward attention
+block.
+
+\subsection{Descent and Stability}
+
+\begin{proposition}[Coercivity and existence of minimizers]
+\label{prop:coercive}
+Assume fixed local, motif, and global supports; finite $K$; finite support
+sizes; linear score maps; $d\ge 2$; and $\varepsilon$-stabilized LayerNorm. Then
+$E_{\mathrm{GET}}$ is coercive and attains a global minimizer.
+\end{proposition}
+
+\begin{proof}[Proof sketch]
+With $\varepsilon>0$, LayerNorm maps each raw state to a uniformly bounded
+normalized state. Without affine parameters, $\|\mathrm{LN}(x_i)\|\le\sqrt d$;
+with fixed affine scale $a$ and shift $b$,
+$\|\mathrm{LN}(x_i)\|\le \|a\|_\infty\sqrt d+\|b\|$. On fixed support, the
+local, motif, global, and memory scores are therefore uniformly bounded for
+fixed parameters. The negative log-sum-exp branches are bounded below by a
+constant, while the quadratic penalty
+$\frac{1}{2}\sum_i\|x_i\|^2$ diverges as $\|X\|_F\to\infty$. Hence
+$E_{\mathrm{GET}}(X)\to\infty$ as $\|X\|_F\to\infty$, and continuity yields
+existence of a minimizer on a large sublevel set.
+\end{proof}
+
+\begin{proposition}[Local Lipschitz continuity of the gradient]
+\label{prop:lipschitz}
+Assume $\varepsilon>0$ in LayerNorm and linear learnable maps. Then
+$\nabla_X E_{\mathrm{GET}}$ is locally Lipschitz on
+$\mathbb{R}^{|V|\times d}$.
+\end{proposition}
+
+\begin{proof}[Proof sketch]
+$E_{\mathrm{GET}}$ is built from smooth operations: linear maps,
+$\varepsilon$-stabilized LayerNorm, Hadamard products, dot products, and
+$\log\!\sum\exp$. Finite compositions of smooth maps are smooth, so the energy
+is $C^1$ and its gradient is locally Lipschitz.
+\end{proof}
+
+\begin{theorem}[Armijo steps exist; energy is monotone]
+\label{thm:monotone}
+Under the conditions of Proposition~\ref{prop:lipschitz}, for every iterate
+$X^t$ and every choice of $c\in(0,1)$, $\gamma\in(0,1)$, and $\eta_0>0$, the
+backtracking loop terminates at some $\eta_t>0$ satisfying~\eqref{eq:armijo}.
+Consequently,
+\begin{equation}
+  E_{\mathrm{GET}}(X^{t+1})
+  \le E_{\mathrm{GET}}(X^t) - c\eta_t\|\nabla_X E_{\mathrm{GET}}(X^t)\|_F^2
+  \le E_{\mathrm{GET}}(X^t).
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+By Proposition~\ref{prop:lipschitz}, the gradient is locally Lipschitz near
+$X^t$, so the standard descent lemma applies. For sufficiently small $\eta$,
+one has $E(X^t-\eta G^t)\le E(X^t)-c\eta\|G^t\|_F^2$. Backtracking reaches
+that regime after finitely many reductions by $\gamma$, which proves
+existence of an accepted step and monotone decrease.
+\end{proof}
+
+\begin{proposition}[Local Lyapunov stability of strict local minima]
+\label{prop:lyapunov}
+Assume the conditions of Propositions~\ref{prop:coercive}
+and~\ref{prop:lipschitz}, and let $X^*$ be a strict local minimizer of
+$E_{\mathrm{GET}}$. Define the shifted energy
+\begin{equation}
+  V(X)=E_{\mathrm{GET}}(X)-E_{\mathrm{GET}}(X^*).
+  \label{eq:lyapunov}
+\end{equation}
+Then $V$ is locally positive definite around $X^*$ and nonincreasing along
+both the gradient flow $\dot X=-\nabla_X E_{\mathrm{GET}}(X)$ and the accepted
+Armijo iteration. Hence $V$ is a local Lyapunov function for the inference
+dynamics, and $X^*$ is Lyapunov stable.
+\end{proposition}
+
+\begin{proof}[Proof sketch]
+Strict local minimality makes $V$ locally positive definite. Along gradient
+flow, $\dot V(X)=-\|\nabla_X E_{\mathrm{GET}}(X)\|_F^2\le 0$ by the chain
+rule. Along accepted Armijo steps, Theorem~\ref{thm:monotone} yields the
+analogous discrete decay inequality. The full invariant-neighborhood argument
+is recorded in Appendix~\ref{app:lyapunov}.
+\end{proof}
+
+\begin{remark}
+These guarantees concern deterministic inference with fixed parameters. They
+do not assert convergence to a global optimum of the supervised learning
+problem, nor do they imply that every fixed-step or noisy training update is
+monotone. Lyapunov stability at strict local minima is a standard property of
+smooth gradient systems; it does not identify which basin a given initialization
+enters, prove a convergence rate, or analyze the quality of the reached
+stationary point.
+\end{remark}
+
+\subsection{Complexity}
+
+\begin{proposition}[Complexity per inference step]
+\label{prop:complexity}
+Let $M=\sum_i |\mathcal{W}(i)|$ be the number of retained motifs and
+$S=\sum_i|\mathcal S_g(i)|$ the number of global-support pairs. One inference
+step with dense $d\times d$ local/global projections and dense
+$\mathbb{R}^{R\times d}$ motif projections costs
+\begin{equation}
+  O\bigl(|V|Rd^2 + |E|d + MRd + Sd + K|V|d\bigr).
+\end{equation}
+Under bounded degree $\deg(i)\le\Delta$, one has $M=O(|V|\Delta^2)$; if motif
+and global supports are capped by constant budgets per node, the cost is linear
+in $|V|$ for fixed $R$, $K$, and support budgets. Dense global support gives
+$S=O(|V|^2)$.
+\end{proposition}
+
+%----------------------------------------------------------------------
+\section{Experimental Protocol}
+%----------------------------------------------------------------------
+
+GET should not be evaluated first as a universal graph transformer. The first
+test is mechanistic: does FullGET beat a capacity-matched no-motif GET harness
+when the label is generated by wedges, triangles, or ternary factors represented
+in the motif support? The no-motif harness keeps local pairwise retrieval,
+global attention, and HN/FFN memory active while setting $\lambda_3=0$.
+Transfer benchmarks are secondary and should narrow the claim when the
+mechanism does not transfer.
+
+\paragraph{Protocol principle.}
+The core harness is held fixed and the main contrast is always FullGET versus a
+capacity-matched no-motif harness ($\lambda_3=0$). Local-only or global-only
+variants are ablations, not the primary control. Non-GET structural features,
+positional encodings, optimizer family, and wrapper choices are fixed within
+each comparison family, while train/validation/test splits are shared across
+runs. Later stages count as transfer evidence only if earlier mechanism-level
+gains are established.
+
+\paragraph{Stage-gates.}
+Stage~0 checks implementation correctness. Stage~1 is decisive for the motif
+claim. Stages~2--4 are transfer tests. No Stage~1 gain means no mechanism
+claim; no molecular gain means no molecular superiority claim.
+
+\paragraph{Task-conditioned wrappers.}
+The energy definition stays fixed. Synthetic and expressivity stages use the
+same local/global/HN harness, with global support budgeted if dense attention
+would make the diagnostic trivial or expensive. Molecular tasks may add
+bond-aware inputs. ET-style transfer may add CLS, LapPE, graph masking, or
+stacked blocks only when the comparison family requires them. Wrapper gains
+must not be attributed to the motif energy.
+
+\begin{table}[htbp]
+\centering
+\caption{Experiment families organized by task type, scale, and expected fit
+for GET. ``Best fit'' means the experiment can support the main motif-energy
+claim; ``diagnostic'' means it is useful but should not carry the headline
+claim alone; ``stress/transfer'' means failure narrows the scope rather than
+invalidating the mechanism.}
+\label{tab:get-task-fit}
+\renewcommand{\arraystretch}{1.08}
+\footnotesize
+\begin{tabularx}{\textwidth}{p{0.24\textwidth} p{0.27\textwidth} p{0.16\textwidth} Y}
+\toprule
+Family & Scale and signal & GET fit & Claim supported \\
+\midrule
+Motif-causal synthetic diagnostics
+& many small/medium controlled graphs; explicit wedges, triangles, or ternary clauses
+& best fit
+& isolates whether FullGET beats the no-motif harness because of the order-3 branch \\
+Realized expressivity benchmarks
+& small/medium structurally hard graphs; indirect local patterns plus symmetry breaking
+& diagnostic
+& tests whether the learned motif branch realizes useful structural
+  discrimination beyond hand-designed labels \\
+Bounded-degree molecular graphs
+& medium/large collections of small sparse graphs; rings, functional groups, local bond neighborhoods
+& best transfer fit
+& tests whether local motif gains survive on realistic sparse graph
+  prediction tasks \\
+Large sparse molecular/peptide graphs
+& larger collections or larger per-graph structures; mixed local motifs and longer-range effects
+& stress/transfer
+& measures scalability and whether motif support remains useful when global
+  context also matters \\
+TU-style graph classification
+& usually small/medium datasets; heterogeneous feature quality and weakly identified motif signal
+& secondary transfer
+& checks robustness, but gains may come from features, pooling, or wrappers
+  rather than motif retrieval \\
+Node anomaly graphs
+& one or few large graphs; node-level ego-network and homophily/heterophily signals
+& ET-adapter stress test
+& evaluates graph-domain competitiveness, not the clean higher-order mechanism \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{table}[htbp]
+\centering
+\caption{Stage overview for the compact main-paper protocol.}
+\label{tab:stage-wrapper-map}
+\renewcommand{\arraystretch}{1.15}
+\small
+\begin{tabularx}{\textwidth}{l Y Y Y}
+\toprule
+Stage & Core question & Default setup & Representative tasks \\
+\midrule
+0 & Is the energy implementation correct? & GET harness on toy graphs; no task-specific wrapper & finite differences, permutation equivariance, monotone Armijo checks \\
+1 & Does explicit motif retrieval help when labels are motif-causal? & local/global/HN GET harness with sparse motif support; small/medium controlled graphs & wedge/triangle diagnostics, triangle regression, Max-3-SAT, 3-XORSAT \\
+2 & Do Stage~1 gains persist on realized expressivity tests? & GET harness with fixed structural features per method; structurally hard small/medium graphs & BREC by category, CSL, SRG/cycle stress tests \\
+3 & Do local gains transfer to bounded-degree molecular graphs? & bond-aware 2D GET; ET-style positional encodings only when required; sparse molecular graph collections & ZINC, ogbg-molhiv, ogbg-molpcba; Peptides as stress test \\
+4 & Does an ET-matched wrapper remain competitive on ET-style tasks? & ET-style adapter with CLS/LapPE only when the comparison requires them; heterogeneous benchmark scale & TU-style graph classification, graph anomaly detection, LRGB only with global mixing \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Stage 1: Mechanism Identification}
+
+Stage~1 is the decisive test of the paper's central claim. We compare
+FullGET and a no-motif GET harness on independently sampled graphs drawn from
+the same size and degree ranges but differing in wedge or triangle structure,
+on triangle-count regression, and on clause-like ternary CSP instances. These
+are the best-fit tasks for GET because the support retained by the motif branch
+is aligned with the generative factor that determines the label. Difficult
+local-structure discrimination tasks such as strongly regular or cycle-parity
+style instances are useful stress tests, but they are less direct because
+success can depend on propagation depth, symmetry breaking, and structural
+encodings. If the motif branch does not beat the capacity-matched no-motif
+harness on the primary motif-causal diagnostics, the paper should not claim a
+mechanism-level advantage.
+
+Stage~1 should separate oracle support from selected support. Exact
+wedge/triangle support tests whether the motif energy can use the right local
+factor once supplied; thresholded or budgeted support tests whether the learned
+score maps can select useful motifs without giving the model the answer.
+
+\paragraph{Primary motif diagnostics.}
+The cleanest Stage~1 tasks are those where the label is generated from the
+same local structures represented in the motif support. In wedge
+discrimination, graphs are independently sampled under the same size and
+degree distribution but are labeled to differ in open-wedge versus
+closed-triangle density. In triangle-count regression, the target is a
+node-level or graph-level triangle count, with degree-controlled splits so the
+model cannot win by learning only a degree surrogate. These tasks directly
+test whether the order-3 branch extracts a signal that the no-motif harness lacks under
+the same node features, optimizer, inference budget, global support, memory
+bank, and readout.
+
+\paragraph{Structural stress tests.}
+Strongly regular graph discrimination and cycle-parity detection are useful
+stress tests, but they should be reported carefully. Success on a supervised
+SRG pair such as Shrikhande versus the $4\times4$ rook graph is evidence that
+the trained motif branch realizes a useful structural discriminator; it is not
+by itself a formal proof of a global WL-expressivity hierarchy. Cycle-parity
+is also a mixed local/global task: triangles are the shortest odd cycles, but
+odd-cycle detection in general requires propagation beyond one local motif.
+These tasks should therefore be Stage~2-style realized-expressivity
+diagnostics or secondary Stage~1 stress tests rather than the only mechanism
+evidence.
+
+\subsubsection{Ternary CSP reasoning}
+\label{sec:ternary-csp}
+
+Sparse ternary constraint satisfaction is a natural GET task because a
+3-clause is already a local order-3 factor. Represent a Max-3-SAT instance as
+a signed variable--clause factor graph, keep pairwise variable--clause
+incidences in the pairwise branch, and retain exactly three clause-centered
+motifs per clause. Let $z_{v_i}=\mathrm{LN}(x_{v_i}^{(T)})$ be the final
+variable state and decode a soft assignment by
+\begin{equation}
+  p_i = \sigma\!\bigl(w_{\mathrm{var}}^\top z_{v_i} + b_{\mathrm{var}}\bigr).
+  \label{eq:sat-variable-head}
+\end{equation}
+For each literal, use $p_i$ or $1-p_i$ according to its sign to obtain a truth
+probability $\pi_{ar}$, define clause satisfaction surrogate
+$\hat s_a = 1-\prod_{r=1}^{3}(1-\pi_{ar})$, and train with
+\begin{equation}
+  \mathcal{L}_{\mathrm{Max3SAT}}
+  = -\frac{1}{m}\sum_{a=1}^{m}\log(\hat s_a + \varepsilon_{\mathrm{task}}).
+  \label{eq:max3sat-loss}
+\end{equation}
+A 3-XORSAT variant is a useful harder control, but the clean primary
+comparison is still no-motif GET versus full GET on the same signed factor
+graph. Because the factor graph gives no-motif models the clause--variable
+incidences, and the harness retains global attention and HN/FFN memory, the
+claimed advantage is not access to clause membership or generic capacity; it is
+the explicit ternary interaction among the three variables in a clause.
+
+\paragraph{Rejected Stage~1 candidates.}
+Not every task involving triples is a clean test of the current GET core.
+Three-coloring is primarily an edge-constraint satisfaction problem; adding a
+monochromatic-triangle penalty would test a new hand-designed energy term
+rather than the retrieval branch in~\eqref{eq:s3}. Knowledge-graph link
+prediction is a relational learning problem with its own negative-sampling and
+ranking protocol, so it is better treated as a later relation-aware GET
+variant rather than as synthetic mechanism evidence. TSP or shortest-path
+tasks with triangle-inequality penalties similarly introduce algorithmic and
+metric-consistency objectives outside the present graph-local motif energy.
+These tasks may be reasonable extensions, but they should not be used to
+support the central Stage~1 claim.
+
+\subsection{Stages 2--4: Transfer}
+
+\paragraph{Stage 2: realized expressivity.}
+Use CSL and BREC to test whether gains from Stage~1 survive beyond synthetic
+motif-causal labels. The structural-encoding policy for GET should be fixed in
+advance; external baselines use their native wrappers, so any positional or
+structural features must be reported separately. These datasets are diagnostic
+rather than automatically best-fit: they are valuable precisely because they
+can expose when local motif retrieval is insufficient without additional
+positional or global mixing. BREC should be reported by category rather than
+as a single aggregate score. Basic and regular cases can support a
+realized-expressivity claim when FullGET improves over the no-motif harness; Extension
+and CFI-style failures should be reported as expected limitations of a local
+order-3 motif energy rather than hidden inside an average.
+
+\paragraph{Stage 3: bounded-degree molecular graphs.}
+Use bounded-degree 2D molecular tasks as the main transfer stage for the core
+model. ZINC tests small-graph regression, while ogbg-molhiv and ogbg-molpcba
+test whether any local motif benefit survives in more realistic molecular
+settings.
+Bond-aware inputs are part of the GET wrapper; stronger positional encodings
+are used only when the comparison family requires them, and they should be
+reported separately from motif retrieval. If the motif branch does not help on
+these tasks, the empirical claim should remain limited to mechanism and
+expressivity benchmarks. This is the most plausible real-data regime for GET
+because sparse molecular graphs contain many bounded local substructures, but
+the comparison must still separate gains from bond features, structural
+encodings, and motif retrieval itself. Peptides and other LRGB tasks are
+useful stress tests, but they should be marked as long-range benchmarks; poor
+performance there does not by itself refute the local motif mechanism, and
+strong performance should not be claimed without controlling for global mixing
+and positional encodings. In practice, this stage should be the default
+optimization target for systems work: molecule batches are often small enough
+for efficient sparse local energy kernels while still giving the clearest
+transfer signal for local higher-order terms.
+
+\paragraph{Stage 4: ET-style transfer.}
+ET-style anomaly detection and graph-classification benchmarks are reported as
+transfer tests rather than as the primary proof of the higher-order mechanism.
+When these comparisons are run, GET should inherit the same ET-matched wrapper
+components that the benchmark rewards---for example CLS readout, Laplacian
+positional encodings, or graph-aware masking---instead of attributing wrapper
+gains to the motif term itself. TU-style graph classification and node anomaly
+benchmarks are therefore useful for external validity and engineering
+readiness, but they are not the cleanest evidence for the proposed order-3
+energy because dataset size, feature quality, class imbalance, and wrapper
+choices can dominate the result.
+
+\paragraph{Closest external comparators.}
+The current repository implements pairwise controls such as GIN, GCN, GAT,
+GraphTransformer, and BWGNN, plus ET-style adapters. Higher-order baselines
+such as GSN/ESAN-style substructure methods, k-GNN/K-hop variants, simplicial
+message passing, and Triplet Graph Transformer are required external
+comparators for a submission-level motif claim. If they are not implemented, the
+evidence should be described only as a controlled no-motif GET ablation, not as
+competitiveness against higher-order graph models. Graphormer, GPS, GRIT, and
+Exphormer remain transfer comparators for graph-transformer harnesses.
+
+\paragraph{Baselines and ablations.}
+The compact ablation suite should include local-only GET, local+global GET,
+local+global+HN no-motif GET, Motif-only GET, FullGET, open-wedge versus
+open+closed support, rank-$1$ versus rank-$R$ motif factorization, fixed-step
+versus Armijo inference, global-support budget, and HN/FFN on/off. The primary
+comparison is always FullGET versus a capacity-matched no-motif GET harness;
+parameter counts should be matched to within a small tolerance so that raw
+width does not masquerade as a motif gain.
+
+\paragraph{ET comparison discipline.}
+ET-style models are pairwise in their attention energy, but the manuscript
+should not claim that ET ``cannot solve'' a synthetic task in an absolute
+sense. Dense attention, CLS tokens, positional encodings, node identifiers, or
+hand-crafted structural features can let a pairwise transformer fit many
+finite synthetic datasets. The fair claim is narrower: under matched inputs
+and without explicit triangle, clause, or motif features, an ET-style no-motif
+GET control lacks the local order-3 retrieval term that FullGET uses.
+The evidence for GET is therefore a controlled performance gap against that
+matched no-motif control, not a blanket impossibility statement about ET or
+graph transformers.
+
+\paragraph{Model selection and reporting.}
+Stage~0 should verify finite-difference gradients, permutation equivariance,
+and monotone decrease under accepted Armijo steps on random toy graphs.
+Hyperparameter tuning should be stage-gated and non-leaky: shortlist
+configurations on the primary Stage~1 diagnostics, carry them to later stages
+unchanged, and report mean and standard deviation across multiple seeds
+together with paired comparisons against the strongest matched baseline. Each
+Stage~1 task should include energy-decay curves, performance versus inference
+steps, and ablations over $\lambda_3$, motif rank $R$, motif budget,
+global-support budget, and motif-type vocabulary. Runnable baselines in this
+repository are pairwise controls such as GIN, GCN, GAT, and GraphTransformer,
+plus BWGNN and ET-style adapters when the benchmark is ET-like. Higher-order
+families such as GSN-style models, k-GNN/K-hop variants, simplicial message
+passing, Graphormer, GPS, GRIT, and Exphormer remain future comparison targets
+unless they are added explicitly. This makes it possible to separate
+improvements from higher-order energy terms, from global/HN harness capacity,
+from static motif features, from generic structural encodings, and from
+task-specific wrappers.
+
+%----------------------------------------------------------------------
+\section{Discussion}
+%----------------------------------------------------------------------
+
+\paragraph{What is and is not claimed.}
+The entropy-regularized lifting is a standard log-sum-exp identity. It is
+included to define the routing variables and expose the full-gradient update,
+not as a new variational inference method. GET is not BP, GBP, Kikuchi
+inference, VMP, the first energy-based GNN, or the first Hopfield model on
+graphs. The claim is narrower: explicit sparse motif retrieval is placed inside
+one local/global/HN Hopfield/ET-style graph energy and tested against the
+matched no-motif energy harness.
+
+\paragraph{Limitations.}
+The monotone-descent result concerns accepted inference steps with fixed
+parameters. It does not imply faster supervised training, global convergence,
+or better generalization. The base motif branch is symmetric in the two neighbor
+roles and may underspecify directed or role-asymmetric interactions. Strong
+structural encoders, persistent edge states, geometric supervision, or triplet
+transformer architectures may capture similar signals with better trade-offs on
+some tasks \citep{ying2021graphormer,rampasek2022gps,ma2023grit,
+shirzad2023exphormer,canturk2024gpse,airale2025spse,diao2023relational,
+hussain2024triplet}.
+
+\paragraph{Task-conditioned variants.}
+The core GET mechanism should be presented as a family of task-conditioned
+instantiations rather than as one frozen checkpoint. Synthetic tasks use the
+same local/global/HN energy harness with controlled support budgets;
+realized-expressivity tasks keep that harness but fix the structural-encoding
+policy explicitly; molecular tasks add bond-aware inputs when available; and
+ET-style transfer uses an ET-faithful adapter when CLS readout, LapPE,
+graph-aware masking, or stacked blocks are part of the comparison family. This
+separation helps keep wrapper choices from being conflated with the motif
+energy itself.
+
+\paragraph{Extensions.}
+The present model covers local retrieval, motif retrieval, global attention,
+and HN/FFN memory. Further extensions include dynamic edge states,
+task-conditioned readout attractors, typed role-asymmetric motifs, structural
+memory latents, and joint multi-layer HAM-style energies. Those additions
+should be named GET+X variants until implemented and ablated.
+
+%----------------------------------------------------------------------
+\section{Conclusion}
+%----------------------------------------------------------------------
+
+GET is a scalar-energy graph-transformer model with graph-local pairwise
+retrieval, explicit sparse motif retrieval, ET-style global attention, and
+HN/FFN memory. The log-sum-exp terms give entropy-regularized routing weights,
+while the full gradient gives ET-style anchor and reverse-incidence messages.
+The paper's test is narrow: establish whether the motif energy improves over a
+matched no-motif energy harness on motif-causal tasks, then report how far that
+mechanism transfers.
+
+\appendix
+%----------------------------------------------------------------------
+\section{LayerNorm Jacobian}
+\label{app:layernorm}
+%----------------------------------------------------------------------
+
+For $d\ge2$, standard $\varepsilon$-stabilized LayerNorm is
+$\mathrm{LN}(x) = a_{\mathrm{LN}} \odot \hat{x} + b_{\mathrm{LN}}$, where
+$\hat{x} = (x - \mu\mathbf{1})/\sigma$,
+$\mu = \frac{1}{d}\mathbf{1}^\top x$, and
+$\sigma = \sqrt{\frac{1}{d}\|x - \mu\mathbf{1}\|^2 + \varepsilon}$.
+For $\varepsilon > 0$, $\sigma > 0$ everywhere, so $\mathrm{LN}$ is
+$C^\infty$. The Jacobian is \citep{ba2016layer}:
+\begin{equation}
+  J_{\mathrm{LN}}(x)
+  = \frac{1}{\sigma}\mathrm{Diag}(a_{\mathrm{LN}})
+    \Bigl(I - \tfrac{1}{d}\mathbf{1}\mathbf{1}^\top
+           - \tfrac{1}{d}\hat{x}\hat{x}^\top\Bigr).
+\end{equation}
+
+%----------------------------------------------------------------------
+\section{Lyapunov Stability Derivation}
+\label{app:lyapunov}
+%----------------------------------------------------------------------
+
+We give the detailed derivation of Proposition~\ref{prop:lyapunov}. Let
+$X^*$ be a strict local minimizer of $E_{\mathrm{GET}}$ and define the shifted
+energy
+\begin{equation}
+  V(X) = E_{\mathrm{GET}}(X) - E_{\mathrm{GET}}(X^*).
+\end{equation}
+Then $V(X^*)=0$. Because $X^*$ is a strict local minimizer and
+$E_{\mathrm{GET}}$ is continuous, there exists $r_0>0$ such that
+\begin{equation}
+  0 < \|X-X^*\|_F \le r_0
+  \quad\Longrightarrow\quad
+  V(X) > 0.
+  \label{eq:lyapunov-local-positive}
+\end{equation}
+Thus $V$ is locally positive definite around $X^*$.
+
+To prove Lyapunov stability, fix any $\varepsilon\in(0,r_0)$. Since the
+sphere
+\begin{equation}
+  S_\varepsilon = \{X : \|X-X^*\|_F = \varepsilon\}
+\end{equation}
+is compact and $V$ is continuous and strictly positive on it by
+\eqref{eq:lyapunov-local-positive}, the minimum
+\begin{equation}
+  \alpha_\varepsilon
+  = \min_{X\in S_\varepsilon} V(X)
+  > 0
+  \label{eq:lyapunov-alpha}
+\end{equation}
+is attained and strictly positive. By continuity of $V$ at $X^*$, there
+exists $\delta\in(0,\varepsilon)$ such that
+\begin{equation}
+  \|X-X^*\|_F < \delta
+  \quad\Longrightarrow\quad
+  V(X) < \alpha_\varepsilon.
+  \label{eq:lyapunov-delta}
+\end{equation}
+Consequently, the local sublevel set
+\begin{equation}
+  \mathcal{S}_{\alpha_\varepsilon}
+  = \{X : V(X) < \alpha_\varepsilon\}
+  \label{eq:lyapunov-sublevel}
+\end{equation}
+is contained in the open ball $B_\varepsilon(X^*)$.
+
+\paragraph{Continuous-time gradient flow.}
+Consider the inference ODE
+\begin{equation}
+  \dot X = -\nabla_X E_{\mathrm{GET}}(X).
+\end{equation}
+Because $E_{\mathrm{GET}}$ is $C^1$, the chain rule gives
+\begin{equation}
+  \dot V(X)
+  = \bigl\langle \nabla_X V(X), \dot X \bigr\rangle
+  = -\|\nabla_X E_{\mathrm{GET}}(X)\|_F^2
+  \le 0.
+  \label{eq:lyapunov-flow-decay}
+\end{equation}
+Hence $V$ is nonincreasing along any gradient-flow trajectory.
+
+\paragraph{Discrete-time Armijo descent.}
+For the accepted Armijo step
+\begin{equation}
+  X^{t+1} = X^t - \eta_t\nabla_X E_{\mathrm{GET}}(X^t),
+\end{equation}
+Theorem~\ref{thm:monotone} gives
+\begin{equation}
+  V(X^{t+1})
+  \le V(X^t) - c\eta_t\|\nabla_X E_{\mathrm{GET}}(X^t)\|_F^2
+  \le V(X^t).
+  \label{eq:lyapunov-armijo-decay}
+\end{equation}
+
+\paragraph{Invariant-neighborhood argument.}
+If $\|X(0)-X^*\|_F<\delta$, then $V(X(0))<\alpha_\varepsilon$. Since $V$ is
+nonincreasing along gradient flow, the trajectory cannot reach
+$S_\varepsilon$, because every point on that sphere has
+$V\ge\alpha_\varepsilon$. Thus $\|X(t)-X^*\|_F<\varepsilon$ for all $t\ge0$.
+The same contradiction argument applies to Armijo iterates using
+\eqref{eq:lyapunov-armijo-decay}. Hence $X^*$ is Lyapunov stable for both
+dynamics.
+
+\begin{corollary}[Local asymptotic stability of the gradient flow]
+\label{cor:lyapunov-asymptotic}
+Assume the conditions of Proposition~\ref{prop:lyapunov}. Suppose in addition
+that there exists $r>0$ such that $X^*$ is the only stationary point of
+$E_{\mathrm{GET}}$ in the ball $B_r(X^*)$. Then $X^*$ is locally
+asymptotically stable for the continuous-time gradient flow
+$\dot X = -\nabla_X E_{\mathrm{GET}}(X)$.
+\end{corollary}
+
+\begin{proof}
+By Proposition~\ref{prop:lyapunov}, $X^*$ is Lyapunov stable. Choose
+$\varepsilon>0$ small enough that $B_\varepsilon(X^*)\subset B_r(X^*)$.
+Inside this ball, $\dot V=-\|\nabla_X E_{\mathrm{GET}}(X)\|_F^2$. The largest
+invariant subset of $\{\dot V=0\}$ is therefore the set of stationary points,
+which by assumption is $\{X^*\}$. The local invariance principle gives
+$X(t)\to X^*$ for all trajectories initialized sufficiently close to $X^*$.
+\end{proof}
+
+\begin{corollary}[Positive-definite Hessian as a sufficient condition]
+\label{cor:lyapunov-hessian}
+Assume the standing smoothness conditions of Proposition~\ref{prop:lipschitz},
+and suppose additionally that the Euclidean Hessian of $E_{\mathrm{GET}}$ with
+respect to $\operatorname{vec}(X)$ is positive definite at $X^*$:
+\begin{equation}
+  \nabla^2_{\operatorname{vec}(X)} E_{\mathrm{GET}}(X^*) \succ 0.
+\end{equation}
+Then $X^*$ is a strict local minimizer and an isolated stationary point.
+Consequently, $X^*$ is locally asymptotically stable for the continuous-time
+gradient flow.
+\end{corollary}
+
+\begin{proof}
+Positive definiteness of the Hessian gives the standard second-order
+sufficient condition for a strict local minimum and implies that stationary
+points cannot accumulate at $X^*$. Proposition~\ref{prop:lyapunov} gives
+Lyapunov stability, and Corollary~\ref{cor:lyapunov-asymptotic} gives local
+asymptotic stability for the gradient flow.
+\end{proof}
+
+\begin{remark}
+The asymptotic corollaries are stated only for the continuous-time gradient
+flow. A corresponding local asymptotic-stability statement for accepted
+Armijo iterates would require additional discrete-time assumptions, such as a
+uniform lower bound on accepted step sizes or a separate convergence theorem.
+\end{remark}
+
+%----------------------------------------------------------------------
+\section{Gradient Derivations}
+\label{app:gradients}
+%----------------------------------------------------------------------
+
+The following formulas differentiate the log-sum-exp terms directly. Equivalently,
+by Danskin's theorem applied to Proposition~\ref{prop:routing}, the derivative
+with respect to each score is the optimal routing weight; no additional
+softmax-Jacobian terms appear in the score gradient.
+
+Define softmax weights:
+\begin{equation}
+  \alpha_{ij}
+  =
+  \begin{cases}
+    \dfrac{\exp(\beta_2 s^{(2)}_{ij})}
+          {\sum_{\ell \in \mathcal{N}(i)} \exp(\beta_2 s^{(2)}_{i\ell})},
+      & \mathcal{N}(i)\neq\varnothing,\ j \in \mathcal{N}(i), \\[1em]
+    0, & \text{otherwise,}
+  \end{cases}
+\end{equation}
+\begin{equation}
+  \gamma_{i,jk}
+  =
+  \begin{cases}
+    \dfrac{\exp(\beta_3 s^{(3)}_{i,jk})}
+          {\sum_{(u,v) \in \mathcal{W}(i)} \exp(\beta_3 s^{(3)}_{i,uv})},
+      & \mathcal{W}(i)\neq\varnothing,\ (j,k)\in\mathcal{W}(i), \\[1em]
+    0, & \text{otherwise,}
+  \end{cases}
+\end{equation}
+\begin{equation}
+  \rho_{ia}
+  = \frac{\exp(\beta_m s^{(m)}_{i,a})}
+         {\sum_{c=1}^{K} \exp(\beta_m s^{(m)}_{i,c})}.
+\end{equation}
+\begin{equation}
+  \pi_{ij}
+  =
+  \begin{cases}
+    \dfrac{\exp(\beta_g s^{(g)}_{ij})}
+          {\sum_{\ell \in \mathcal{S}_g(i)} \exp(\beta_g s^{(g)}_{i\ell})},
+      & \mathcal{S}_g(i)\neq\varnothing,\ j \in \mathcal{S}_g(i), \\[1em]
+    0, & \text{otherwise.}
+  \end{cases}
+\end{equation}
+
+The full gradient with respect to the raw state $x_i$ is
+\begin{equation}
+  \nabla_{x_i} E_{\mathrm{GET}}(X)
+  = x_i + {J_{\mathrm{LN}}(x_i)}^\top
+    \bigl(\nabla_{g_i} E_{\mathrm{att}} + \nabla_{g_i} E_{\mathrm{HN}}\bigr).
+\end{equation}
+
+\paragraph{Attention branch.}
+Define the motif composite key
+\begin{equation}
+  \phi_{ijk}^{(r)}
+  = k_3^{(r)}(g_j) \odot k_3^{(r)}(g_k) + t_{\tau_{ijk}}^{(r)}.
+\end{equation}
+Suppressing the rank superscript in the Jacobian notation, the gradient is
+\begin{equation}
+\begin{aligned}
+  \nabla_{g_i} E_{\mathrm{att}}
+  ={} &
+  -\frac{\lambda_2}{\sqrt{d}}
+  \Bigl[
+    {J_{q_2}(g_i)}^\top \sum_{j \in \mathcal{N}(i)} \alpha_{ij}\,k_2(g_j)
+    + {J_{k_2}(g_i)}^\top \sum_{u:\,i \in \mathcal{N}(u)} \alpha_{ui}\,q_2(g_u)
+  \Bigr] \\
+  &-\frac{\lambda_3}{\sqrt{Rd}}
+  \Bigl[
+    \sum_{r=1}^R {J_{q_3^{(r)}}(g_i)}^\top
+      \sum_{(j,k)\in\mathcal{W}(i)} \gamma_{i,jk}\,\phi_{ijk}^{(r)}
+    + \sum_{r=1}^R {J_{k_3^{(r)}}(g_i)}^\top \Psi_i^{(r)}
+  \Bigr]\\
+  &-\frac{\lambda_g}{\sqrt{d}}
+  \Bigl[
+    {J_{q_g}(g_i)}^\top \sum_{j \in \mathcal{S}_g(i)} \pi_{ij}\,k_g(g_j)
+    + {J_{k_g}(g_i)}^\top \sum_{u:\,i \in \mathcal{S}_g(u)} \pi_{ui}\,q_g(g_u)
+  \Bigr],
+\end{aligned}
+\end{equation}
+where $\Psi_i^{(r)}$ collects motifs in which node $i$ appears as a key:
+\begin{equation}
+  \Psi_i^{(r)}
+  = \sum_{u \in V}\; \sum_{\substack{k:\,(i,k)\in\mathcal{W}(u)}}
+      \gamma_{u,ik}\bigl(q_3^{(r)}(g_u) \odot k_3^{(r)}(g_k)\bigr)
+  +
+    \sum_{u \in V}\; \sum_{\substack{j:\,(j,i)\in\mathcal{W}(u)}}
+      \gamma_{u,ji}\bigl(q_3^{(r)}(g_u) \odot k_3^{(r)}(g_j)\bigr).
+\end{equation}
+The two sums handle the cases where $i$ appears as the first or second element
+of the stored representative of an unordered retained pair; since
+$\mathcal W(u)$ stores each pair once, this does not double-count a motif.
+
+\paragraph{Memory branch.}
+\begin{equation}
+  \nabla_{g_i} E_{\mathrm{HN}}
+  = -\frac{\lambda_m}{\sqrt{d}}\,
+    {J_{q_m}(g_i)}^\top \sum_{a=1}^K \rho_{ia}\,k_m(b_a).
+\end{equation}
+
+If the memory vectors are trained, their gradients are
+\begin{equation}
+  \nabla_{b_a} E_{\mathrm{HN}}
+  = -\frac{\lambda_m}{\sqrt{d}}\,
+    {J_{k_m}(b_a)}^\top \sum_{i \in V} \rho_{ia}\,q_m(g_i).
+\end{equation}
+
+\bibliographystyle{plainnat}
+\bibliography{ref}
+
+\end{document}
