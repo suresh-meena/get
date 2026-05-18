@@ -61,7 +61,7 @@ def graph_statistics_dict(adj: torch.Tensor) -> Dict[str, float]:
         "node_count": float(compute_node_count(adj)),
         "edge_count": float(compute_edge_count(adj)),
         "two_hop_count": compute_two_hop_count(adj),
-        "avg_degree": float(adj.sum(1).mean().item()),
+        "avg_degree": float(adj.sum(1).float().mean().item()),
     }
 
 

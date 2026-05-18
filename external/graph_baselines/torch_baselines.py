@@ -25,7 +25,7 @@ class ExternalGraphBaseline(nn.Module):
             nn.Linear(hidden_dim, out_dim),
         )
 
-    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(self, batch: Dict[str, torch.Tensor], **kwargs) -> torch.Tensor:
         x = batch["x"]
         b = batch["batch"]
         num_graphs = int(batch["y"].shape[0])
@@ -69,7 +69,7 @@ class GCNGraphBaseline(_PyGGraphModelBase):
         self.c2 = GCNConv(hidden_dim, hidden_dim)
         self.head = nn.Linear(hidden_dim, out_dim)
 
-    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(self, batch: Dict[str, torch.Tensor], **kwargs) -> torch.Tensor:
         x, edge_index, b = self._graph_from_batch(batch)
         x = F.relu(self.c1(x, edge_index))
         x = F.relu(self.c2(x, edge_index))
@@ -85,7 +85,7 @@ class GATGraphBaseline(_PyGGraphModelBase):
         self.c2 = GATConv(hidden_dim, hidden_dim // heads, heads=heads)
         self.head = nn.Linear(hidden_dim, out_dim)
 
-    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(self, batch: Dict[str, torch.Tensor], **kwargs) -> torch.Tensor:
         x, edge_index, b = self._graph_from_batch(batch)
         x = F.elu(self.c1(x, edge_index))
         x = F.elu(self.c2(x, edge_index))
@@ -103,10 +103,12 @@ class GINGraphBaseline(_PyGGraphModelBase):
         self.c2 = GINConv(mlp2)
         self.head = nn.Linear(hidden_dim, out_dim)
 
-    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(self, batch: Dict[str, torch.Tensor], **kwargs) -> torch.Tensor:
         x, edge_index, b = self._graph_from_batch(batch)
         x = F.relu(self.c1(x, edge_index))
         x = F.relu(self.c2(x, edge_index))
         g = global_mean_pool(x, b)
         out = self.head(g)
         return out.squeeze(-1) if out.size(-1) == 1 else out
+
+

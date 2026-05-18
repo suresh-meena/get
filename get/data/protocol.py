@@ -1057,7 +1057,7 @@ def _apply_leakage_control(
             label = float(g.y[0].item())
             num_nodes = g.x.size(0)
             # Check for edge_index or c_2 (motif membership)
-            if hasattr(g, "edge_index"):
+            if hasattr(g, "edge_index") and g.edge_index is not None:
                 ei = g.edge_index.long()
                 adj = torch.zeros((num_nodes, num_nodes), dtype=torch.bool)
                 if ei.numel() > 0 and ei.size(1) > 0:

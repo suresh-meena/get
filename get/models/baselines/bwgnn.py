@@ -74,7 +74,7 @@ class BWGNNBaseline(nn.Module):
         self.linear4 = nn.Linear(hidden_dim, num_classes)
         self.act = nn.ReLU()
 
-    def forward(self, batch_data: dict[str, torch.Tensor]):
+    def forward(self, batch_data: dict[str, torch.Tensor], **kwargs):
         x = batch_data["x"]
         edge_index = torch.stack([batch_data["c_2"], batch_data["u_2"]], dim=0) if batch_data["c_2"].numel() > 0 else torch.empty((2, 0), dtype=torch.long, device=x.device)
         batch = batch_data["batch"]
